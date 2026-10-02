@@ -48,7 +48,7 @@ function fakeSidecar(port: number, ...lines: string[]) {
   const isUp = new Promise<void>(resolve => { up = resolve })
   const held = new Promise<void>(resolve => { release = resolve })
   const spawn = async function* () {
-    yield { stream: 'stdout' as const, text: `{"type":"ready","port":${port}}\n` }
+    yield { stream: 'stdout' as const, text: `{"type":"ready","port":${port},"token":"tok-${port}"}\n` }
     for (const line of lines) yield { stream: 'stdout' as const, text: `${line}\n` }
     yield { stream: 'stdout' as const, text: '{"type":"state","state":"listening"}\n' }
     up() // every line above has been handled once the loop pulls past them
@@ -107,12 +107,12 @@ test('live vibe: a delegate from the front becomes a prompt when Claude is idle'
 })
 
 test("live vibe: Claude's answer goes to the front's /event, never /speak", async ($, on) => {
-  const posts: { url: string; body?: string }[] = []
+  const posts: { url: string; body?: string; token?: string }[] = []
   const sidecar = fakeSidecar(4321)
   on('process.spawn', sidecar.spawn)
   on('turn.complete', (_$, e) => ({ text: e.answer }))
   const relayed = new Promise<void>(resolve => on('http.fetch', (_$, e) => {
-    posts.push({ url: e.url, body: e.init?.body })
+    posts.push({ url: e.url, body: e.init?.body, token: e.init?.headers?.['X-Live-Token'] })
     if (e.url.endsWith('/event')) resolve()
     return ok
   }))
@@ -122,7 +122,7 @@ test("live vibe: Claude's answer goes to the front's /event, never /speak", asyn
   await $.turn.complete({ answer: 'Fixed parser.py; all 41 tests pass.', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
   await relayed
 
-  expect(posts).toEqual([{ url: 'http://127.0.0.1:4321/event', body: 'Fixed parser.py; all 41 tests pass.' }])
+  expect(posts).toEqual([{ url: 'http://127.0.0.1:4321/event', body: 'Fixed parser.py; all 41 tests pass.', token: 'tok-4321' }])
   await $.command.run({ command: 'livevibe', ...typed })
   sidecar.release()
 })

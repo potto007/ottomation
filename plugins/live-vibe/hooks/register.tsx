@@ -4,7 +4,7 @@ import type { EngineInterface, PluginOptions, Register } from 'claude-code'
 import type { Live, LiveMode, LiveState } from '../types'
 
 const PLUGIN = 'live-vibe'
-const OFF: Live = { isOn: false, mode: 'live', state: 'off', port: 0, turnId: null, vibeBefore: false, gen: 0 }
+const OFF: Live = { isOn: false, mode: 'live', state: 'off', port: 0, token: '', turnId: null, vibeBefore: false, gen: 0 }
 const live = atom({ plugin: 'live-vibe', key: 'live' } as const, OFF)
 const isVibe = atom({ plugin: 'live-vibe', key: 'isVibe' } as const, false)
 
@@ -72,11 +72,12 @@ function switchModel($: EngineInterface, model: string, isBusy: boolean) {
 }
 
 // A sidecar that is gone (it quit, or never reached ready) is not an error worth more than a debug line.
+// The sidecar refuses a POST without the token it reported in `ready`, so no other local process can drive it.
 async function post($: EngineInterface, path: string, body = '') {
-  const { port } = await read($, live)
+  const { port, token } = await read($, live)
   if (!port) return
   try {
-    await $.http.fetch(`http://127.0.0.1:${port}${path}`, { method: 'POST', body })
+    await $.http.fetch(`http://127.0.0.1:${port}${path}`, { method: 'POST', body, headers: { 'X-Live-Token': token } })
   } catch (err) {
     $.ui.log(`live: POST ${path} failed: ${String(err).slice(0, 120)}`, { to: 'debug' })
   }
@@ -111,7 +112,7 @@ async function toClaude($: EngineInterface, text: string, steer: string) {
 async function onSidecar($: EngineInterface, msg: Record<string, unknown>) {
   switch (msg.type) {
     case 'ready':
-      await update($, live, l => ({ ...l, port: Number(msg.port) }))
+      await update($, live, l => ({ ...l, port: Number(msg.port), token: String(msg.token ?? '') }))
       $.ui.toast(`${(await read($, live)).mode === 'livevibe' ? 'live vibe' : 'live'}: listening (headphones recommended)`)
       break
     case 'state':
@@ -163,13 +164,15 @@ function startSidecar($: EngineInterface, options: PluginOptions, mode: LiveMode
     let gen = 0
     await update($, live, (l): Live => {
       gen = (l.gen || 0) + 1
-      return { isOn: true, mode, state: 'loading', port: 0, turnId: null, vibeBefore, gen }
+      return { isOn: true, mode, state: 'loading', port: 0, token: '', turnId: null, vibeBefore, gen }
     })
     await status($)
-    const argv = ['uv', 'run', '--script', `${$.plugin.root}/bin/live_sidecar.py`,
+    const argv = ['uv', 'run', '--script', `${$.plugin.root}/bin/sidecar/main.py`,
       '--mode', mode === 'livevibe' ? 'front' : 'live', '--stt', String(options.stt), '--asr', String(options.asr),
       '--tts', String(options.tts), '--end-silence-ms', String(options.endSilenceMs)]
     if (options.voice) argv.push('--voice', String(options.voice))
+    if (options.mic) argv.push('--mic', String(options.mic))
+    if (options.speaker) argv.push('--speaker', String(options.speaker))
     if (mode === 'livevibe') {
       argv.push('--front-backend', String(options.frontBackend), '--front-url', String(options.frontUrl),
         '--switch-pattern', SPOKEN_SWITCH.source)

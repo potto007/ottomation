@@ -14,7 +14,7 @@
     "stt": {
       "type": "string",
       "title": "Speech recognizer",
-      "description": "kyutai: Kyutai STT 1B on MLX (Apple silicon only; elsewhere whisper runs instead), streaming words that ends your turn on what you said rather than on a fixed pause; downloads about 2.4 GB on first use. whisper: Silero VAD plus faster-whisper on the CPU, sized by the next setting; also the automatic fallback.",
+      "description": "kyutai: Kyutai STT 1B on MLX (Apple silicon only; elsewhere whisper runs instead), streaming words that ends your turn on what you said rather than on a fixed pause; downloads about 2.4 GB on first use. whisper: Silero VAD plus faster-whisper (on an Nvidia GPU when CUDA works, else the CPU), sized by the next setting; also the automatic fallback.",
       "options": ["kyutai", "whisper"],
       "default": "kyutai"
     },
@@ -28,7 +28,7 @@
     "tts": {
       "type": "string",
       "title": "Speech synthesizer",
-      "description": "kokoro needs `brew install espeak-ng`; say is the zero-download macOS fallback.",
+      "description": "kokoro needs espeak-ng (`brew install espeak-ng`, `sudo apt install espeak-ng`); say is the zero-download macOS fallback.",
       "options": ["kokoro", "say"],
       "default": "kokoro"
     },
@@ -36,6 +36,18 @@
       "type": "string",
       "title": "Voice",
       "description": "A Kokoro voice (af_heart) or a macOS say voice (Samantha). Empty means the synthesizer's default.",
+      "default": ""
+    },
+    "mic": {
+      "type": "string",
+      "title": "Microphone",
+      "description": "An input device index or a part of its name (\"AirPods\"). Empty means the system default. `uv run --script bin/sidecar/main.py --list-devices` lists them.",
+      "default": ""
+    },
+    "speaker": {
+      "type": "string",
+      "title": "Speaker",
+      "description": "An output device index or a part of its name. Empty means the system default. A laptop's own speakers and mic together bleed your answers into the mic; headphones work best.",
       "default": ""
     },
     "endSilenceMs": {

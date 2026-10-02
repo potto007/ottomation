@@ -9,6 +9,8 @@ export type Live = {
   state: LiveState
   /** The sidecar's HTTP port on 127.0.0.1; 0 until it reports ready. */
   port: number
+  /** The sidecar's per-launch secret from `ready`, sent as X-Live-Token on every POST; '' until then. */
+  token: string
   /** The main loop's running turn, so a spoken interruption can steer it; null when idle. */
   turnId: string | null
   /** Vibe mode as it was before /livevibe turned it on, restored when live vibe ends. */
