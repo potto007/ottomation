@@ -22,11 +22,11 @@ from typing import Any, Callable
 import numpy as np
 
 from . import protocol
-from .audio import FRAME, SR, Player, SentenceSplitter, Tuning, TurnDetector, Voice, speakable
+from .audio import FRAME, SR, CannotStart, Player, check_devices, SentenceSplitter, Tuning, TurnDetector, Voice, speakable
 from .front import (EVENT, HISTORY_MAX, _FALLBACKS, _NO_EFFORT, Brain, Delegator, FrontSession, LlamaCppBrain,
                     make_brain, parse_sse, spoken_model, warm_up)
 from .session import LiveSession
-from .speech import BARGE_IN_WORDS, KYUTAI_BLOCK, KYUTAI_SR, KyutaiTurns, SilentTTS
+from .speech import BARGE_IN_WORDS, KYUTAI_BLOCK, KYUTAI_SR, KyutaiTurns, SilentTTS, check_tts
 
 MAIN = Path(__file__).with_name("main.py")
 # The mod's SPOKEN_SWITCH source, as register.tsx passes it in --switch-pattern.
@@ -157,6 +157,26 @@ def units() -> int:
     b.begin("last")
     check(len(b.history) <= HISTORY_MAX and b.history[0]["role"] == "user" and b.history[-1]["content"] == "last",
           f"front history capped at {HISTORY_MAX}, starting on a user turn")
+
+    class NoDevices:
+        def query_devices(self, device=None, kind=None):
+            raise ValueError("No input device matching -1")
+
+    def fatal(fn: Callable[[], None]) -> str:
+        try:
+            fn()
+        except CannotStart as e:
+            return str(e)
+        return ""
+
+    msg = fatal(lambda: check_devices(NoDevices(), None, None))
+    check("no input device" in msg and "microphone" in msg, f"no mic: one fatal message {msg!r}")
+    real, sys.platform = sys.platform, "linux"
+    try:
+        msg = fatal(lambda: check_tts("say"))
+    finally:
+        sys.platform = real
+    check("macOS only" in msg and "apt install espeak-ng" in msg, f"say off macOS: one fatal message naming the fix {msg!r}")
 
     print("UNIT: ALL PASS" if check.ok else "UNIT: SOME CHECKS FAILED", flush=True)
     return 0 if check.ok else 1

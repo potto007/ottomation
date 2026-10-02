@@ -36,6 +36,8 @@ stdout carries only these JSON lines (library output goes to stderr):
   {"type":"warn","text":"..."}                           something the user should see
   {"type":"log","text":"..."}
 HTTP on 127.0.0.1:N:  POST /speak <text> (live)   POST /event <text> (front)   POST /stop   POST /quit
+A missing system piece (PortAudio, a mic or speaker, espeak-ng off macOS, say off macOS) is one warn naming the
+fix and exit code 2; a backend that fails to load otherwise falls back with a warn.
 
   uv run --script bin/sidecar/main.py --unit        pure checks, a second, no models
   uv run --script bin/sidecar/main.py --selftest    both modes end to end: no mic, speaker or network
