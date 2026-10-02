@@ -1,0 +1,67 @@
+{
+  "name": "live-vibe",
+  "displayName": "Live Vibe",
+  "version": "0.1.0",
+  "description": "/live: full-duplex voice (Kyutai streaming STT with semantic end of turn, or Silero and Whisper; Kokoro TTS) through a sidecar; /vibe: director mode that delegates all work to subagents; /livevibe: talk with a fast voice front that hands the work to Claude as director.",
+  "author": {
+    "name": "Paul Otto",
+    "email": "potto007@gmail.com"
+  },
+  "repository": "https://github.com/ClearBridgeRIP/claude-plugins",
+  "keywords": ["clearbridge", "function-hooks", "voice", "vibe", "subagents"],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "stt": {
+      "type": "string",
+      "title": "Speech recognizer",
+      "description": "kyutai: Kyutai STT 1B on MLX (Apple silicon only; elsewhere whisper runs instead), streaming words that ends your turn on what you said rather than on a fixed pause; downloads about 2.4 GB on first use. whisper: Silero VAD plus faster-whisper on the CPU, sized by the next setting; also the automatic fallback.",
+      "options": ["kyutai", "whisper"],
+      "default": "kyutai"
+    },
+    "asr": {
+      "type": "string",
+      "title": "faster-whisper model",
+      "description": "For the whisper recognizer: tiny.en is fastest, small.en most accurate.",
+      "options": ["tiny.en", "base.en", "small.en"],
+      "default": "base.en"
+    },
+    "tts": {
+      "type": "string",
+      "title": "Speech synthesizer",
+      "description": "kokoro needs `brew install espeak-ng`; say is the zero-download macOS fallback.",
+      "options": ["kokoro", "say"],
+      "default": "kokoro"
+    },
+    "voice": {
+      "type": "string",
+      "title": "Voice",
+      "description": "A Kokoro voice (af_heart) or a macOS say voice (Samantha). Empty means the synthesizer's default.",
+      "default": ""
+    },
+    "endSilenceMs": {
+      "type": "number",
+      "title": "Pause that ends an utterance (ms)",
+      "description": "With kyutai, the model decides when you are done (about 0.8 s after you stop) and this only caps a pause between words. With whisper, it is the silence after speech before it is sent; raise it if you get cut off mid-sentence.",
+      "default": 1500
+    },
+    "frontBackend": {
+      "type": "string",
+      "title": "Live vibe: voice front backend",
+      "description": "llamacpp: any OpenAI-compatible chat server (llama-server started with --jinja). anthropic: Claude through the API; needs ANTHROPIC_API_KEY or `ant auth login`.",
+      "options": ["llamacpp", "anthropic"],
+      "default": "llamacpp"
+    },
+    "frontUrl": {
+      "type": "string",
+      "title": "Live vibe: front server URL",
+      "description": "Base URL of the OpenAI-compatible server for the llamacpp backend. May be another host, e.g. http://gpu-box:8080.",
+      "default": "http://127.0.0.1:8080"
+    },
+    "frontModel": {
+      "type": "string",
+      "title": "Live vibe: front model",
+      "description": "Empty: whatever the llamacpp server serves, or claude-haiku-4-5 for anthropic. Set it when the server hosts several models.",
+      "default": ""
+    }
+  }
+}
