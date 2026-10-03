@@ -475,9 +475,10 @@ def units() -> int:
     check([k for _, k, _ in ev] == ["speech_start", "discard"], "turn detector: under 250 ms of speech is discarded")
 
     words = [("▁open", 0.0), ("▁the", 0.0), ("▁file", 0.0)]
-    ev = run_kyutai([(None, 0.0)] * 3 + words + [(None, 0.9)] * 8)
-    check([k for _, k, _ in ev] == ["speech_start", "utterance"] and ev[0][0] == 3 and ev[1][2] == "open the file"
-          and ev[1][0] == 3 + 3 + 5, f"kyutai turns: first word starts, end-of-turn head held 6 steps ends {ev}")
+    pad = [(None, 0.0)] * 12  # the heads count from the 13th step after a reset
+    ev = run_kyutai(pad + words + [(None, 0.9)] * 8)
+    check([k for _, k, _ in ev] == ["speech_start", "utterance"] and ev[0][0] == 12 and ev[1][2] == "open the file"
+          and ev[1][0] == 12 + 3 + 5, f"kyutai turns: first word starts, end-of-turn heads held 6 steps end {ev}")
     ev = run_kyutai([("▁mm", 0.0), ("▁hm", 0.0), (None, 0.0), ("▁wait", 0.0)] + [(None, 0.9)] * 8, speaking=True)
     check([k for _, k, _ in ev][:1] == ["speech_start"] and ev[0][0] == 3,
           f"kyutai turns: {BARGE_IN_WORDS} words to barge in while speaking {ev[:1]}")

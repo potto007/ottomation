@@ -23,7 +23,7 @@ import numpy as np
 
 from . import gpu
 from .audio import JUNK_TRANSCRIPTS, SR, CannotStart, Detector, EnergyVAD, SileroVAD, Tuning, TurnDetector
-from .protocol import log, warn
+from .protocol import file_log, log, warn
 
 # Shared with the prototype, so the models it downloaded are reused.
 CACHE = Path(os.environ.get("LIVE_VIBE_CACHE") or Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "duplex_voice")
@@ -129,9 +129,12 @@ KYUTAI_STT_REPO = "kyutai/stt-1b-en_fr-candle"  # the -mlx repo drops the extra 
 KYUTAI_FILES = ("config.json", "model.safetensors", "mimi-pytorch-e351c8d8@125.safetensors", "tokenizer_en_fr_audio_8000.model")
 KYUTAI_SR, KYUTAI_BLOCK = 24_000, 1920  # 80 ms steps at 12.5 Hz
 BARGE_IN_WORDS = 3  # words the user must say over the assistant before it stops: bleed and "mm-hm" stay out
-END_OF_TURN = 0.5  # the end-of-turn head (extra head 2, class 0): measured ~0 in speech, <0.5 in mid-sentence pauses,
-# and above 0.5 from just before the last word on; it runs ahead of the words, which trail the audio by the model's
-# audio delay, so a turn ends only once it has stayed above for that delay (0.5 s) and the last words are out
+END_OF_TURN = 0.6  # pause-head threshold, as in Kyutai's Unmute. Extra heads 0..3 forecast "no new word within
+# 0.5 / 1 / 2 / 3 s" (lower index: more aggressive); they are not silence detectors, so the 2 s head alone rises
+# before the user stops and cut turns mid-sentence, the trailing pieces (text trails audio by ~0.5 s) arriving as a
+# second utterance. A semantic end needs the 2 s and the 0.5 s heads both above this for delay_steps steps in a row
+# with no new piece (each piece restarts the count) and eot_drain_ms since the last piece; see KyutaiTurns.
+HEADS_IGNORE_STEPS = 12  # the heads jitter for the first steps after a model reset (Unmute ignores these too)
 
 
 def kyutai_cached() -> bool:
@@ -242,10 +245,18 @@ class KyutaiSTT:
 class KyutaiTurns:
     """TurnDetector's interface over KyutaiSTT: feed() takes 16 kHz, 32 ms frames and returns ('speech_start', p) /
     ('utterance', text) / ('discard', None). A turn starts on the first word, or while the assistant speaks on
-    BARGE_IN_WORDS words; it ends on the model's end-of-turn head (see END_OF_TURN), or after end_silence_ms
-    without a new word (a cap only), or at max_utterance_s."""
+    BARGE_IN_WORDS words. It ends on one of three triggers:
+    - semantic: the 2 s pause head (s2) and the 0.5 s head (s05) both above END_OF_TURN for delay_steps
+      consecutive steps (6 = 480 ms), counted from the last word piece, and no piece for eot_drain_ms. The 2 s head
+      forecasts the end; the 0.5 s head confirms a pause is under way now (Kyutai's advice for mid-sentence
+      cutoffs, delayed-streams-modeling issue 23); the drain keeps trailing pieces in the same utterance. The
+      heads count for nothing in the first HEADS_IGNORE_STEPS steps after a model reset.
+    - silence: end_silence_ms without a new piece (a cap only).
+    - max: max_utterance_s.
+    Each end writes one 'kyutai turn end' line to the log file (trigger, length, heads; no text)."""
 
     IN_BLOCK = KYUTAI_BLOCK * SR // KYUTAI_SR  # 1280 input samples per 80 ms step
+    MS_PER_STEP = 1000 * KYUTAI_BLOCK / KYUTAI_SR  # 80
 
     def __init__(self, stt, tune: Tuning, speaking: Callable[[], bool]):
         self.stt, self.t, self.speaking = stt, tune, speaking
@@ -256,6 +267,7 @@ class KyutaiTurns:
 
     def _clear(self) -> None:
         self.text, self.words, self.ends, self.started_at, self.last_word = "", 0, 0, None, 0
+        self.peak = Pauses()
 
     def _resample(self, block: np.ndarray) -> np.ndarray:
         x = np.concatenate([[self.prev], block])  # 16 kHz -> 24 kHz, linear, continuous across blocks
@@ -275,8 +287,9 @@ class KyutaiTurns:
         if self.stt.steps >= self.stt.MAX_STEPS - 1 or (self.started_at is None and self.stt.steps > 3000):
             self.stt.reset()
         piece, pauses = self.stt.step(block)
-        p_end = pauses.s2
         step = self.stt.steps
+        if step <= HEADS_IGNORE_STEPS:
+            pauses = Pauses()
         events: list[tuple[str, Any]] = []
         if piece is not None:
             if self.started_at is None:
@@ -286,19 +299,33 @@ class KyutaiTurns:
             self.last_word = step
             if not self.active and (self.words >= BARGE_IN_WORDS or not self.speaking()):
                 self.active = True
-                events.append(("speech_start", 1.0 - p_end))
+                events.append(("speech_start", 1.0 - pauses.s2))
         if self.started_at is None:
             return events
-        self.ends = self.ends + 1 if p_end > END_OF_TURN else 0
-        quiet_ms = (step - self.last_word) * 1000 * KYUTAI_BLOCK / KYUTAI_SR
-        long = (step - self.started_at) * KYUTAI_BLOCK / KYUTAI_SR >= self.t.max_utterance_s
-        if self.ends >= self.stt.delay_steps or quiet_ms >= self.t.end_silence_ms or long:
-            text = self.text.strip()
-            if self.active:
-                ok = text.lower() not in JUNK_TRANSCRIPTS
-                events.append(("utterance", text) if ok else ("discard", None))
-            self.active = False
-            self._clear()
+        self.peak = Pauses(*map(max, self.peak, pauses))
+        high = pauses.s2 > END_OF_TURN and pauses.s05 > END_OF_TURN
+        self.ends = self.ends + 1 if high and piece is None else 0  # a new piece restarts the count
+        quiet_ms = (step - self.last_word) * self.MS_PER_STEP
+        if self.ends >= self.stt.delay_steps and quiet_ms >= self.t.eot_drain_ms:
+            trigger = "semantic"
+        elif quiet_ms >= self.t.end_silence_ms:
+            trigger = "silence"
+        elif (step - self.started_at) * self.MS_PER_STEP >= self.t.max_utterance_s * 1000:
+            trigger = "max"
+        else:
+            return events
+        text = self.text.strip()
+        sent = "none"
+        if self.active:
+            ok = text.lower() not in JUNK_TRANSCRIPTS
+            events.append(("utterance", text) if ok else ("discard", None))
+            sent = events[-1][0]
+        heads = " ".join(f"{k}={pk:.2f}/{v:.2f}" for k, pk, v in zip(Pauses._fields, self.peak, pauses))
+        file_log("INFO", f"kyutai turn end: trigger={trigger} sent={sent} "
+                         f"len_ms={(step - self.started_at + 1) * self.MS_PER_STEP:.0f} quiet_ms={quiet_ms:.0f} "
+                         f"words={self.words} peak/final {heads}")
+        self.active = False
+        self._clear()
         return events
 
 

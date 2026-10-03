@@ -131,6 +131,8 @@ class Tuning:
     min_speech_ms: int = 250  # shorter utterances are dropped (clicks, coughs)
     pre_roll_ms: int = 320  # audio kept from before the trigger
     max_utterance_s: float = 30.0
+    eot_drain_ms: int = 400  # Kyutai: no new word piece for this long before a semantic end of turn, so the
+    # pieces that trail the audio (~0.5 s) land in the same utterance
 
 
 class Detector(Protocol):
