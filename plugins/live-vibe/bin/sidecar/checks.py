@@ -29,9 +29,9 @@ from .checks_front_server import front_server_units
 from .checks_winplayer import winplayer_units
 from .audio import FRAME, SR, CannotStart, Player, check_devices, SentenceSplitter, Tuning, TurnDetector, Voice, speakable
 from .echo import EchoCanceller, EchoGuard, EchoReference
-from .front import (EVENT, EVENT_CHARS, HISTORY_MAX, INTERRUPTED, RETELL, _FALLBACKS, _NO_EFFORT, Brain, Delegator,
-                    FrontSession, LlamaCppBrain, SpeechFilter, TurnStream, event_message, is_turn_start, make_brain,
-                    parse_sse, report_brief, spoken_model, warm_up)
+from .front import (ACK, EVENT, EVENT_CHARS, HISTORY_MAX, INTERRUPTED, RETELL, _FALLBACKS, _NO_EFFORT, Brain,
+                    Delegator, FrontSession, LlamaCppBrain, SpeechFilter, TurnStream, acknowledgement, event_message,
+                    is_turn_start, make_brain, parse_sse, report_brief, spoken_model, warm_up)
 from .session import LiveSession
 from .speech import BARGE_IN_WORDS, KYUTAI_BLOCK, KYUTAI_SR, KyutaiTurns, SilentTTS, check_tts
 
@@ -378,6 +378,11 @@ def front_history(check: Checker) -> None:
           and contents[4] == f"{INTERRUPTED} next",
           f"json turn: a delegation landing after its turn was cut joins that turn's place in history {contents}")
     report_units(check)
+    acks = [acknowledgement(s) for s in ("On it.", "Sure, I'll ask. Back soon.", "It's still running, I'll check.",
+                                         "I don't have information about how the fix was done.", "",
+                                         "Okay, I will go and look through every single file in the repo now.")]
+    check(acks == ["On it.", "Sure, I'll ask.", ACK, ACK, ACK, ACK],
+          f"acknowledgement: a short first sentence with no claim about the work, else {ACK!r} {acks}")
 
 
 def report_units(check: Checker) -> None:
@@ -664,8 +669,11 @@ def fake_front() -> tuple[str, list[dict[str, Any]]]:
     malformed line on 'garbled', a broken JSON turn on 'badargs', plain text on 'plaintext'."""
     seen: list[dict[str, Any]] = []
 
-    def turn(say: str, delegate: str = "", lead: str = "", cut: int = 0) -> list[dict[str, Any]]:
-        text = lead + json.dumps({"say": say, "delegate": delegate})
+    def turn(say: str, delegate: str = "", lead: str = "", cut: int = 0,
+             say_first: bool = False) -> list[dict[str, Any]]:
+        """The JSON turn in the schema's order (delegate first), or say first as a server that ignores the order."""
+        fields = {"say": say, "delegate": delegate} if say_first else {"delegate": delegate, "say": say}
+        text = lead + json.dumps(fields)
         text = text[:-cut] if cut else text
         return [{"content": text[i:i + 7]} for i in range(0, len(text), 7)]
 
@@ -706,12 +714,16 @@ def fake_front() -> tuple[str, list[dict[str, Any]]]:
             elif "garbled" in text:
                 raw, deltas = ["data: {not json"], turn("Still here.")
             elif "badargs" in text:
-                deltas = turn("I'll let you know.", "Never sent", cut=8)
+                deltas = turn("I'll let you know.", "Never sent", cut=8, say_first=True)
             elif "plaintext" in text:
                 deltas = [{"content": "Plain words. "}, {"content": "No JSON here."}]
             elif "slow work" in text:  # a long "on it", then the delegate field: cut while it is spoken
-                deltas = turn("".join(f"Working on part {i} of it now. " for i in range(8)), "Rebuild the cache")
+                deltas = turn("".join(f"Working on part {i} of it now. " for i in range(8)), "Rebuild the cache",
+                              say_first=True)
                 delay = 0.03
+            elif "explain it" in text:  # a delegating turn whose say answers from memory
+                deltas = turn("I don't have information about how it was done. The steps are not recorded.",
+                              "Review the changes and explain how the static was fixed")
             elif "fix" in text:
                 deltas = turn("On it.", "Fix the failing test in parser.py")
             else:
@@ -786,7 +798,8 @@ async def selftest_sessions(check: Checker) -> None:
     check(await warm_up(brain), "front: warm-up reaches the server")
     w = seen[-1]
     schema = w["response_format"]["json_schema"]["schema"]
-    check("tools" not in w and schema["required"] == ["say", "delegate"]
+    check("tools" not in w and schema["required"] == ["delegate", "say"]
+          and list(schema["properties"]) == ["delegate", "say"]
           and w["chat_template_kwargs"] == {"enable_thinking": False} and w["max_tokens"] == 1 and "one assistant" in w["messages"][0]["content"]
           and '"delegate"' in w["messages"][0]["content"],
           "front: warm-up sends the front prompt with the JSON turn's schema, no tools, thinking off")
@@ -937,6 +950,14 @@ async def selftest_sessions(check: Checker) -> None:
     await turn_done()
     check(not emitted("delegate") and said() == "I'll let you know." and not delegated(),
           "front: a JSON turn cut short still speaks, and an unfinished delegate field hands off nothing")
+
+    out.clear()
+    utter("explain it to me")
+    await until(lambda: emitted("delegate"), 5)
+    await turn_done()
+    check(sess.turn_spoken == [ACK] and said() == ACK
+          and delegated() == "Review the changes and explain how the static was fixed",
+          f"front: a delegating turn speaks only an acknowledgement, not its answer from memory {sess.turn_spoken}")
 
     out.clear()
     utter("plaintext")

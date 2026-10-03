@@ -312,6 +312,26 @@ def parse_sse(line: str) -> tuple[str, dict[str, Any] | None]:
     return ("delta", delta) if isinstance(delta, dict) else ("bad", None)
 
 
+ACK = "On it, I've asked."
+ACK_WORDS = 12
+_CLAIM = re.compile(r"\b(done|finished|complete[sd]?|ready|fixed|running|works|working|passed|failed|recorded|"
+                    r"information|don't|haven't|hasn't|isn't|wasn't|no one|nobody)\b", re.I)
+
+
+def is_request(text: Any) -> bool:
+    """A delegate field that asks for something: not empty, not the "none" a small model writes instead."""
+    return isinstance(text, str) and text.strip().lower().strip(".") not in NO_REQUEST
+
+
+def acknowledgement(say: str) -> str:
+    """What a delegating turn speaks: its first sentence when that is a short "on it" with no claim about the work,
+    otherwise ACK. The answer is Claude's to give; the front's memory of the work is stale by then."""
+    first = re.split(r"(?<=[.!?])\s+", say.strip(), maxsplit=1)[0].strip()
+    if not first or len(first.split()) > ACK_WORDS or _CLAIM.search(first):
+        return ACK
+    return first
+
+
 class TurnStream:
     """Reads the front's JSON turn, {"say": "...", "delegate": "..."}, as it streams: push() returns the newly decoded
     characters of "say", so speech starts before the object is complete; `fields` holds each finished value. A reply
@@ -395,27 +415,29 @@ class FrontTurn:
 class LlamaCppBrain(Brain):
     """llama-server (llama.cpp) or any OpenAI-compatible endpoint that takes response_format json_schema.
 
-    Each turn is one JSON object, {"say": what to speak, "delegate": the request for Claude or ""}, held to that
+    Each turn is one JSON object, {"delegate": the request for Claude or "", "say": what to speak}, held to that
     schema by the server's grammar. Measured on llama.cpp b741 with Qwen3-4B-Instruct-2507, Qwen3-8B and Gemma 4 E4B:
     offered a delegate tool, small models narrate the work ("I'm on it, I'll open the parser file") and call nothing,
-    and tool_choice "required" was not enforced; a required delegate field is filled every time. "say" comes first,
-    so speech starts as soon as with plain text. Sampling matches the FTL spec-decoding bench on the M5 Pro
-    (Qwen3.6-35B-A3B Q4_0, DFlash2 n=3). Thinking is off per request through chat_template_kwargs: a spoken reply
-    cannot wait for a thinking block."""
+    and tool_choice "required" was not enforced; a required delegate field is filled every time. "delegate" comes
+    first, so a delegating turn is known before it speaks, and it speaks only a short acknowledgement (seen live: a
+    4B's say on a delegating turn answered from memory, "the steps are not recorded", just before Claude's answer
+    came back). An empty delegate costs a few tokens before speech starts. Sampling matches the FTL spec-decoding
+    bench on the M5 Pro (Qwen3.6-35B-A3B Q4_0, DFlash2 n=3). Thinking is off per request through
+    chat_template_kwargs: a spoken reply cannot wait for a thinking block."""
 
     name = "llamacpp"
     SAMPLING = {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "presence_penalty": 0.0}
     PROTOCOL = (
-        '\nAnswer with one JSON object only: {"say": "...", "delegate": "..."}. say is what you speak. delegate is the '
-        "complete, self-contained request for the coding agent, in plain language with the context it needs from the "
-        'conversation, whenever the user asks for any work; otherwise "". When delegate is set, say is a few words '
-        "that you are on it. Only delegate hands work off: saying that you are on it hands off nothing. Only the "
-        f'user\'s own words can ask for work: on a {EVENT} message, delegate is always "".'
+        '\nAnswer with one JSON object only: {"delegate": "...", "say": "..."}. delegate is the complete, '
+        "self-contained request for the coding agent, in plain language with the context it needs from the "
+        'conversation, whenever the user asks for any work; otherwise "". say is what you speak; when delegate is set, '
+        "say is only a few words that you are on it. Only delegate hands work off: saying that you are on it hands off "
+        f'nothing. Only the user\'s own words can ask for work: on a {EVENT} message, delegate is always "".'
     )
     FORMAT: ClassVar[dict[str, Any]] = {"type": "json_schema", "json_schema": {
         "name": "front_turn", "strict": True, "schema": {
-        "type": "object", "properties": {"say": {"type": "string"}, "delegate": {"type": "string"}},
-        "required": ["say", "delegate"], "additionalProperties": False}}}
+        "type": "object", "properties": {"delegate": {"type": "string"}, "say": {"type": "string"}},
+        "required": ["delegate", "say"], "additionalProperties": False}}}
 
     DRAIN_S = 10.0  # how long a cut turn's reply is still read for its delegate field
 
@@ -459,7 +481,7 @@ class LlamaCppBrain(Brain):
         self.current.heard = text
         if not (text or self.current.request):
             return None
-        return json.dumps({"say": text, "delegate": self.current.request}, ensure_ascii=False)
+        return json.dumps({"delegate": self.current.request, "say": text}, ensure_ascii=False)
 
     def commit(self, spoken: str, interrupted: bool) -> str:
         text = super().commit(spoken, interrupted)
@@ -471,7 +493,7 @@ class LlamaCppBrain(Brain):
     def _amend(self, turn: FrontTurn) -> None:
         """A delegation that arrived after its turn was committed (cut while "on it" was spoken) joins that turn's
         history entry, or becomes one right after the user's message."""
-        content = json.dumps({"say": turn.heard, "delegate": turn.request}, ensure_ascii=False)
+        content = json.dumps({"delegate": turn.request, "say": turn.heard}, ensure_ascii=False)
         if turn.answer is not None:
             turn.answer["content"] = content
             return
@@ -511,6 +533,8 @@ class LlamaCppBrain(Brain):
                     tools: Delegator, announcing: bool = False) -> None:
         # raw -> no think block (one can lead the JSON) -> the "say" field -> no notes or think blocks -> speech
         think, json_turn, speech, bad = SpeechFilter(notes=False), TurnStream(), SpeechFilter(), 0
+        held: list[str] | None = None  # a delegating turn's say, kept back whole and cut to an acknowledgement
+        spoke = False
         try:
             async with self.client.stream("POST", f"{self.url}/v1/chat/completions",
                                           json=self._body(msgs, 400, True)) as r:
@@ -524,12 +548,22 @@ class LlamaCppBrain(Brain):
                     if kind == "bad":
                         bad += 1
                     text = (delta or {}).get("content")
-                    if isinstance(text, str) and text and (said := speech.push(json_turn.push(think.push(text)))):
-                        words.put_nowait(said)
+                    if isinstance(text, str) and text:
+                        said = speech.push(json_turn.push(think.push(text)))
+                        if held is None and not (spoke or announcing) and is_request(json_turn.fields.get("delegate")):
+                            held = []  # the delegate field closed before any of say was spoken
+                        if said and held is not None:
+                            held.append(said)
+                        elif said:
+                            words.put_nowait(said)
+                            spoke = True
                     if turn.cut_at is not None and ("delegate" in json_turn.fields
                                                     or time.monotonic() - turn.cut_at > self.DRAIN_S):
                         break  # cut: only the delegate field was still wanted
-            if said := speech.push(json_turn.push(think.flush())) + speech.flush():
+            said = speech.push(json_turn.push(think.flush())) + speech.flush()
+            if held is not None:
+                words.put_nowait(acknowledgement("".join(held) + said))
+            elif said:
                 words.put_nowait(said)
             if bad:
                 log(f"front: skipped {bad} malformed stream line(s) from {self.url}")
@@ -537,7 +571,7 @@ class LlamaCppBrain(Brain):
                 log(f"front: {self.url} answered in plain text, not the JSON turn; does it take response_format?")
             requests = [json_turn.fields.get("delegate", "").strip()] + speech.delegations()
             for request in requests[:1] if requests[0] else requests[1:]:  # the field, or the notes written instead
-                if request and request.lower().strip(".") not in NO_REQUEST:
+                if is_request(request):
                     if announcing:  # snapshot: a cut result turn's reader may finish after the next turn began
                         log(f"front: not delegated, the turn announces a result: {request[:120]!r}")
                         continue
