@@ -15,8 +15,10 @@ Each fixture is the conversation so far, then the turn under test:
                  said_verbatim: a delegation carries the user's words unchanged
                  note: the emitted note has these fields; answer_or_delegation: a note with answer=true, or a
                  delegation carrying the user's words verbatim; note_record: record the note kind, unscored
-                 hold: a turn that delegates nothing speaks only HOLD and sends Claude an ask note
-                 plain_note: a plain note (no ask, no answer) and a reply of one sentence
+                 hold: the speech is only HOLD, and Claude gets the question: an ask note, or a delegation
+                 carrying the user's words verbatim
+                 hold_or_delegation: a turn that delegates nothing speaks only HOLD and sends an ask note
+                 idle_ask: an ask note, and the speech is HOLD or one sentence of 12 words or fewer
   extra          checks added after a fixture's first results, scored apart so its own score stays comparable
 
 Global checks on every fixture:
@@ -29,6 +31,7 @@ runs with the Delegator's work-in-session flag set, as the live session would ha
 """
 
 HOLD = "Let me check."  # front.HOLD: all a question the front does not delegate hears from it
+WORK_CLAIM = [r"\b(done|finished|complete[sd]?|ready|fixed|running|working|passed|failed|recorded)\b"]
 INVENTED = [r"\bI(?:'ll| will| am going to|'m going to) (?!be\b|report\b|let you\b|tell you\b|pass\b|share\b)\w+",
             r"\blet me (?!know\b)(?!check\.(?:\s|$))\w+"]  # "I'll let you know / pass it on / report" are kept promises
 DOUBLED = r"\basked\b.*\basked\b"
@@ -93,7 +96,7 @@ F = [
         prior=[START, ("report", R2, R2_SAY), CONFIRMED],
         waiting=[], user="Yeah, so did you get that? Because you haven't really followed up.",
         rubric=dict(keep=[r"."], forbid=[r"still (running|reading)", r"\bfixed it\b", r"\bI fixed\b"],
-                    delegate="any", hold=True),
+                    delegate="any", hold_or_delegation=True),
     ),
     dict(
         id="C_stale_status",
@@ -187,15 +190,17 @@ F = [
     # -- the context gate (0.5.3) -----------------------------------------------------------------------------------
     dict(
         id="G1_how_doing",
-        criteria="'how are we doing?' after a delegation: Claude gets it as ask, the front says only the holding line",
+        criteria="'how are we doing?' after a delegation: the front says only the holding line, and Claude gets the "
+                 "question (an ask, or a delegation carrying the user's words)",
         prior=[START], waiting=[], user="How are we doing?",
-        rubric=dict(keep=[r"."], forbid=[], delegate="no", hold=True),
+        rubric=dict(keep=[r"."], forbid=[], delegate="any", hold=True),
     ),
     dict(
         id="G2_hows_it_going",
-        criteria="'how's it going?' after a delegation: Claude gets it as ask, the front says only the holding line",
+        criteria="'how's it going?' after a delegation: the front says only the holding line, and Claude gets the "
+                 "question (an ask, or a delegation carrying the user's words)",
         prior=[START], waiting=[], user="How's it going?",
-        rubric=dict(keep=[r"."], forbid=[], delegate="no", hold=True),
+        rubric=dict(keep=[r"."], forbid=[], delegate="any", hold=True),
     ),
     dict(
         id="G3_got_that_work",
@@ -206,15 +211,18 @@ F = [
     ),
     dict(
         id="G4_how_are_you_idle",
-        criteria="'how are you?' with no work in session: a plain one-sentence answer kept local (a note, no ask)",
+        criteria="'how are you?' with no work in session: one short claim-free sentence or the holding line, no "
+                 "self-answer about work, and Claude gets it as ask",
         prior=[HELLO], waiting=[], user="How are you?",
-        rubric=dict(keep=[r"\b(good|well|great|fine|doing)\b"], forbid=[], delegate="no", plain_note=True),
+        rubric=dict(keep=[r"\b(good|well|great|fine|doing)\b", r"^let me check\.$"], forbid=WORK_CLAIM,
+                    delegate="no", idle_ask=True),
     ),
     dict(
         id="G5_got_that_idle",
-        criteria="'did you get that?' with no work in session: a plain one-sentence answer kept local (a note, no ask)",
+        criteria="'did you get that?' with no work in session: one short claim-free sentence or the holding line, no "
+                 "self-answer about work, and Claude gets it as ask",
         prior=[HELLO, ("I'm going to test the microphone now.", "", "Okay, go ahead.")], waiting=[],
         user="Did you get that?",
-        rubric=dict(keep=[r"\b(yes|yeah|got|hear|heard)\b"], forbid=[], delegate="no", plain_note=True),
+        rubric=dict(keep=[r"."], forbid=WORK_CLAIM, delegate="no", idle_ask=True),
     ),
 ]

@@ -172,11 +172,17 @@ def check(fx: dict, r: dict) -> list[str]:
     if k.get("answer_or_delegation") and not (note.get("answer") is True
                                               or (r["delegate"] and r.get("said") == fx["user"])):
         why.append("neither an answer note nor a delegation with the user's words")
-    if k.get("hold") and not r["delegate"] and (r["spoken"] != HOLD or note.get("ask") is not True):
+    if k.get("hold") and r["spoken"] != HOLD:
+        why.append(f"not only {HOLD!r}")
+    if k.get("hold") and not (r.get("said") == fx["user"] if r["delegate"] else note.get("ask") is True):
+        why.append(f"Claude did not get the question (delegation said {r.get('said')!r}, note {note or 'none'})")
+    if k.get("hold_or_delegation") and not r["delegate"] and (r["spoken"] != HOLD or note.get("ask") is not True):
         why.append(f"not only {HOLD!r} with an ask (said {r['spoken']!r}, note {note or 'none'})")
-    if k.get("plain_note") and (not note or note.get("ask") or note.get("answer")
-                                or len([s for s in SENT.split(r["spoken"]) if s]) != 1):
-        why.append(f"not a one-sentence plain note (note {note or 'none'})")
+    if k.get("idle_ask") and note.get("ask") is not True:
+        why.append(f"no ask (note {note or 'none'})")
+    if k.get("idle_ask") and r["spoken"] != HOLD and (len([s for s in SENT.split(r["spoken"]) if s]) != 1
+                                                       or len(r["spoken"].split()) > 12):
+        why.append("neither the holding line nor one sentence of 12 words or fewer")
     return why
 
 
