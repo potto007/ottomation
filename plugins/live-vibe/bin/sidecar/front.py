@@ -329,13 +329,27 @@ def is_request(text: Any) -> bool:
     return isinstance(text, str) and text.strip().lower().strip(".") not in NO_REQUEST
 
 
+ASKED = "I've asked for the details."
+
+
+def short_first(say: str) -> str:
+    """say's first sentence when it is short and makes no claim about the work, else ""."""
+    first = re.split(r"(?<=[.!?])\s+", say.strip(), maxsplit=1)[0].strip()
+    return "" if len(first.split()) > ACK_WORDS or _CLAIM.search(first) else first
+
+
 def acknowledgement(say: str) -> str:
     """What a delegating turn speaks: its first sentence when that is a short "on it" with no claim about the work,
     otherwise ACK. The answer is Claude's to give; the front's memory of the work is stale by then."""
-    first = re.split(r"(?<=[.!?])\s+", say.strip(), maxsplit=1)[0].strip()
-    if not first or len(first.split()) > ACK_WORDS or _CLAIM.search(first):
-        return ACK
-    return first
+    return short_first(say) or ACK
+
+
+def asked(say: str) -> str:
+    """What a user's question the front answered itself speaks: the same short first sentence, then ASKED. Claude
+    gets the question (an `ask` note) and gives the real answer; seen with Qwen3-4B on "so what was the fix?" with
+    only a log report to go on, every reply guessed a cause after its first sentence."""
+    first = short_first(say)
+    return f"{first} {ASKED}" if first else ASKED
 
 
 class TurnStream:
@@ -559,8 +573,9 @@ class LlamaCppBrain(Brain):
                         if not handed and "delegate" in json_turn.fields:  # handed off before a word is spoken,
                             handed = True  # so a turn cut while it speaks has already delegated, or never will
                             await self._hand_off(json_turn.fields["delegate"].strip(), turn, tools, announcing)
-                        if held is None and not (spoke or announcing) and is_request(json_turn.fields.get("delegate")):
-                            held = []  # the delegate field closed before any of say was spoken
+                        if held is None and not (spoke or announcing) and "delegate" in json_turn.fields and (
+                                is_request(json_turn.fields["delegate"]) or "?" in turn.said):
+                            held = []  # a delegation or a user's question, known before any of say was spoken
                         if said and held is not None:
                             held.append(said)
                         elif said:
@@ -570,10 +585,6 @@ class LlamaCppBrain(Brain):
                                                     or time.monotonic() - turn.cut_at > self.DRAIN_S):
                         break  # cut: only the delegate field was still wanted
             said = speech.push(json_turn.push(think.flush())) + speech.flush()
-            if held is not None:
-                words.put_nowait(acknowledgement("".join(held) + said))
-            elif said:
-                words.put_nowait(said)
             if bad:
                 log(f"front: skipped {bad} malformed stream line(s) from {self.url}")
             if json_turn.plain:
@@ -581,6 +592,10 @@ class LlamaCppBrain(Brain):
             field = json_turn.fields.get("delegate", "").strip()
             for request in speech.delegations() if not field else [] if handed else [field]:  # or the notes instead
                 await self._hand_off(request, turn, tools, announcing)
+            if held is not None:  # handed off: an acknowledgement; a question kept: ASKED, Claude gets it as `ask`
+                words.put_nowait((acknowledgement if turn.request else asked)("".join(held) + said))
+            elif said:
+                words.put_nowait(said)
         finally:
             words.put_nowait(None)
 

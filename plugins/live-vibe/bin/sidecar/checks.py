@@ -29,9 +29,10 @@ from .checks_front_server import front_server_units
 from .checks_winplayer import winplayer_units
 from .audio import FRAME, SR, CannotStart, Player, check_devices, SentenceSplitter, Tuning, TurnDetector, Voice, speakable
 from .echo import EchoCanceller, EchoGuard, EchoReference
-from .front import (ACK, EVENT, EVENT_CHARS, HISTORY_MAX, INTERRUPTED, RETELL, WAITING, _FALLBACKS, _NO_EFFORT, Brain,
-                    Delegator, FrontSession, LlamaCppBrain, SpeechFilter, TurnStream, acknowledgement, event_message,
-                    is_turn_start, make_brain, parse_sse, report_brief, spoken_model, warm_up)
+from .front import (ACK, ASKED, EVENT, EVENT_CHARS, HISTORY_MAX, INTERRUPTED, RETELL, WAITING, _FALLBACKS,
+                    _NO_EFFORT, Brain, Delegator, FrontSession, LlamaCppBrain, SpeechFilter, TurnStream,
+                    acknowledgement, asked, event_message, is_turn_start, make_brain, parse_sse, report_brief,
+                    spoken_model, warm_up)
 from .session import LiveSession
 from .speech import BARGE_IN_WORDS, KYUTAI_BLOCK, KYUTAI_SR, KyutaiTurns, SilentTTS, check_tts
 
@@ -383,6 +384,8 @@ def front_history(check: Checker) -> None:
                                          "Okay, I will go and look through every single file in the repo now.")]
     check(acks == ["On it.", "Sure, I'll ask.", ACK, ACK, ACK, ACK],
           f"acknowledgement: a short first sentence with no claim about the work, else {ACK!r} {acks}")
+    got = [asked("Good question. It was likely the routing."), asked("It was fixed in the audio pipeline config.")]
+    check(got == [f"Good question. {ASKED}", ASKED], f"asked: the short first sentence, then {ASKED!r} {got}")
 
 
 def report_units(check: Checker) -> None:
@@ -707,6 +710,10 @@ def fake_front() -> tuple[str, list[dict[str, Any]]]:
                 deltas = turn("".join(f"Report sentence {i} goes on for a while here. " for i in range(10)))
             elif text.startswith(EVENT):
                 deltas = turn("All the tests pass now.")
+            elif "what was the fix" in text:  # a guess after a short first sentence
+                deltas = turn("The logs look clean. It was likely the audio routing.")
+            elif "how did that happen" in text:  # a long first sentence with a claim in it
+                deltas = turn("I don't have information on that, since the logs say nothing about the change.")
             elif "perfect" in text:
                 deltas = turn("Great, glad it works.")
             elif "what happened" in text:
@@ -924,9 +931,22 @@ async def selftest_sessions(check: Checker) -> None:
     utter("Is it perfect now?")
     await until(lambda: emitted("note"), 5)
     await turn_done()
-    note = {"type": "note", "said": "Is it perfect now?", "reply": "Great, glad it works.", "ask": True}
+    note = {"type": "note", "said": "Is it perfect now?", "reply": ASKED, "ask": True}  # "works" is a claim
     check(emitted("note") == [note] and not emitted("delegate"),
           f"front: a question the front answered itself goes to Claude marked ask {emitted('note')}")
+    out.clear()
+    utter("So what was the fix?")
+    await until(lambda: emitted("note"), 5)
+    await turn_done()
+    first = list(sess.turn_spoken)
+    out.clear()
+    utter("And how did that happen?")
+    await until(lambda: emitted("note"), 5)
+    await turn_done()
+    check(first == ["The logs look clean.", ASKED] and sess.turn_spoken == [ASKED] and not emitted("delegate")
+          and emitted("note")[0].get("ask") is True and emitted("note")[0]["reply"] == ASKED,
+          f"front: a question it keeps speaks only a short first sentence, then {ASKED!r}, never its guess "
+          f"{first} {sess.turn_spoken}")
 
     def events_since(n: int) -> list[str]:
         """The [task finished] messages the front was asked to announce since request n."""
