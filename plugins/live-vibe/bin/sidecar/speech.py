@@ -145,6 +145,10 @@ S2_EMA_KEEP = 0.5  # the cap tier reads the 2 s head through an EMA (about 3 ste
 CONTINUE_WORDS = frozenset(("and", "but", "or", "so", "because", "yet", "the", "a", "an", "to", "of", "in", "on",
                             "with", "like", "um", "uh"))  # a transcript ending on one of these is unfinished
 TERMINAL = {".": "period", "?": "question", "!": "exclaim"}
+# Tuning.eot_continuous: the shaped end-of-turn probability p behind the one wait (KyutaiTurns._p).
+P_UNFINISHED = 0.3  # an unfinished tail (comma, CONTINUE_WORDS) caps p here
+P_TERMINAL = 0.7  # terminal punctuation floors p here
+P_NO_HEADS = 0.5  # a model without pause heads: neither "more coming" nor "done"; the text alone moves p
 
 
 def turn_tail(text: str) -> str:
@@ -292,7 +296,12 @@ class KyutaiTurns:
     - backchannel: a turn that cut the assistant and is only backchannel words so far (audio.is_backchannel) ends
       after backchannel_quiet_ms without a new piece, so the paused voice can resume.
     Each end writes one 'kyutai turn end' line to the log file (trigger, cap tier, tail token, length, heads; no
-    other text)."""
+    other text).
+
+    Tuning.eot_continuous (experimental) replaces the three silence tiers with one wait, re-read every step:
+    wait_ms = eot_wait_base_ms + (1 - p) * eot_wait_span_ms, at most max_utterance_s; the turn ends (trigger
+    silence, cap continuous) once quiet_ms >= wait_ms. p is the s2 EMA clamped to [0, 1] (P_NO_HEADS without
+    heads), shaped by the text and the 0.5 s head (_p). The semantic trigger stays as the early exit."""
 
     IN_BLOCK = KYUTAI_BLOCK * SR // KYUTAI_SR  # 1280 input samples per 80 ms step
     MS_PER_STEP = 1000 * KYUTAI_BLOCK / KYUTAI_SR  # 80
@@ -321,6 +330,23 @@ class KyutaiTurns:
         if tail in TERMINAL.values():
             return "short", min(t.end_silence_short_ms, t.end_silence_ms), tail
         return "normal", t.end_silence_ms, tail
+
+    def _p(self, s05: float) -> float:
+        """The end-of-turn probability for the continuous wait: the s2 EMA clamped to [0, 1]; an unfinished tail
+        caps it at P_UNFINISHED, terminal punctuation floors it at P_TERMINAL; above END_OF_TURN it also needs the
+        0.5 s head above END_OF_TURN, else it reads END_OF_TURN."""
+        p = min(1.0, max(0.0, self.s2_ema)) if any(self.peak) and self.s2_ema is not None else P_NO_HEADS
+        tail = turn_tail(self.text)
+        if tail == "comma" or tail in CONTINUE_WORDS:
+            p = min(p, P_UNFINISHED)
+        elif tail in TERMINAL.values():
+            p = max(p, P_TERMINAL)
+        return END_OF_TURN if p > END_OF_TURN and s05 <= END_OF_TURN else p
+
+    def _wait(self, p: float) -> int:
+        """The continuous wait in ms for end-of-turn probability p, never above max_utterance_s."""
+        t = self.t
+        return min(round(t.eot_wait_base_ms + (1 - p) * t.eot_wait_span_ms), round(t.max_utterance_s * 1000))
 
     def _resample(self, block: np.ndarray) -> np.ndarray:
         x = np.concatenate([[self.prev], block])  # 16 kHz -> 24 kHz, linear, continuous across blocks
@@ -363,6 +389,11 @@ class KyutaiTurns:
         self.ends = self.ends + 1 if high and piece is None else 0  # a new piece restarts the count
         quiet_ms = (step - self.last_word) * self.MS_PER_STEP
         cap, cap_ms, tail = self._cap()
+        p = wait_ms = None
+        if self.t.eot_continuous:
+            p = self._p(pauses.s05)
+            wait_ms = self._wait(p)
+            cap, cap_ms = "continuous", wait_ms
         if self.ends >= self.stt.delay_steps and quiet_ms >= self.t.eot_drain_ms:
             trigger, cap = "semantic", "semantic"
         elif self.barged and quiet_ms >= self.t.backchannel_quiet_ms and is_backchannel(self.text):
@@ -380,7 +411,8 @@ class KyutaiTurns:
             events.append(("utterance", text) if ok else ("discard", text or None))  # a session may want "okay."
             sent = events[-1][0]
         heads = " ".join(f"{k}={pk:.2f}/{v:.2f}" for k, pk, v in zip(Pauses._fields, self.peak, pauses))
-        file_log("INFO", f"kyutai turn end: trigger={trigger} cap={cap} tail={tail} sent={sent} "
+        cont = f" wait_ms={wait_ms} p={p:.2f}" if p is not None else ""
+        file_log("INFO", f"kyutai turn end: trigger={trigger} cap={cap}{cont} tail={tail} sent={sent} "
                          f"len_ms={(step - self.started_at + 1) * self.MS_PER_STEP:.0f} quiet_ms={quiet_ms:.0f} "
                          f"words={self.words} peak/final {heads}")
         self.active = False

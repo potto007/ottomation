@@ -139,6 +139,13 @@ class Tuning:
     # 3 restores the old rule everywhere
     backchannel_quiet_ms: int = 560  # a barge-in that is only backchannel words ends after this long without a
     # new word, so the paused voice can resume (Kyutai's text trails the audio by ~0.5 s)
+    max_utterance_extend_s: int = 120  # Kyutai: at max_utterance_s a turn the model forecasts more speech for
+    # (end-of-turn p < 0.6) runs on in 10 s steps up to this length, then ends regardless
+    # Experimental (KyutaiTurns), off by default:
+    eot_continuous: bool = False  # one probability-scaled wait instead of the tiered silence caps
+    eot_wait_base_ms: int = 400  # continuous wait = base + (1 - p) * span: p 1.0 -> 400 ms, p 0.0 -> 4000 ms
+    eot_wait_span_ms: int = 3600
+    stt_flush: bool = False  # step the STT through delay_steps + 1 silent blocks when the end of turn looks likely
 
 
 BARGE_FALLBACK_WORDS = 3  # without a working echo canceller, a cut needs this many words: bleed and "mm-hm" stay out
