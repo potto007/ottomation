@@ -920,6 +920,13 @@ async def selftest_sessions(check: Checker) -> None:
     await turn_done()
     check(answered and answered[0].get("answer") is True and emitted("note") and "answer" not in emitted("note")[0],
           f"front: the reply to a report's question is marked as its answer, once {answered} {emitted('note')}")
+    out.clear()
+    utter("Is it perfect now?")
+    await until(lambda: emitted("note"), 5)
+    await turn_done()
+    note = {"type": "note", "said": "Is it perfect now?", "reply": "Great, glad it works.", "ask": True}
+    check(emitted("note") == [note] and not emitted("delegate"),
+          f"front: a question the front answered itself goes to Claude marked ask {emitted('note')}")
 
     def events_since(n: int) -> list[str]:
         """The [task finished] messages the front was asked to announce since request n."""

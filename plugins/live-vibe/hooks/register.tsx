@@ -143,7 +143,8 @@ async function onSidecar($: EngineInterface, msg: Record<string, unknown>) {
       break
     }
     // A user turn the front answered itself: a confirmation, a correction or a decision is still Claude's to know.
-    // It joins the conversation without starting a turn; a reply to the question Claude's last answer asked is a prompt.
+    // It joins the conversation without starting a turn. Two kinds are prompts: a reply to the question Claude's last
+    // answer asked (`answer`), and a question the front answered on its own (`ask`), which Claude answers for real.
     case 'note': {
       const said = typeof msg.said === 'string' ? msg.said.trim() : ''
       if (!said) break
@@ -151,6 +152,11 @@ async function onSidecar($: EngineInterface, msg: Record<string, unknown>) {
       if (msg.answer === true) {
         await toClaude($, `User said, answering your last question: "${said}"`,
           `[The user, by voice, answers your last question: "${said}"${reply}. Take it into account now.]`)
+        break
+      }
+      if (msg.ask === true) {
+        await toClaude($, `User asked by voice: "${said}"${reply}\nThe voice front answered on its own. Give the real answer, and correct it if it was wrong.`,
+          `[The user, by voice, asks while you work: "${said}"${reply}. Answer it in your next reply, and correct the voice front if it was wrong.]`)
         break
       }
       await $.session.append({ message: { type: 'user', content: [{

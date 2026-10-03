@@ -837,12 +837,15 @@ class FrontSession(Duplex):
     def pass_on(self, user_text: str, said: str, handed: int) -> None:
         """A user turn that delegated nothing still reaches Claude, as a note: a confirmation ("it sounds perfect, the
         static is gone"), a correction or a decision is information Claude needs (seen live: said three times, never
-        passed on, while Claude kept saying nobody had confirmed by ear). `answer` marks a reply to a question the last
-        report asked, which the mod hands to Claude as a prompt rather than a note."""
+        passed on, while Claude kept saying nobody had confirmed by ear). The mod hands two kinds to Claude as a
+        prompt rather than a note: `answer`, a reply to a question the last report asked, and `ask`, a question the
+        front answered itself (Qwen3-4B, asked "so what was the fix?" with only a log report to go on, invented a
+        cause and delegated nothing, even when told to delegate what the report does not answer)."""
         answer, self.question_open = self.question_open, False
         if self.tools.handed != handed:
             return
-        emit(type="note", said=user_text, reply=said, **({"answer": True} if answer else {}))
+        kind = {"answer": True} if answer else {"ask": True} if "?" in user_text else {}
+        emit(type="note", said=user_text, reply=said, **kind)
 
     async def front_down(self, text: str, is_event: bool) -> None:
         """Without a front model the request still reaches Claude, and Claude's answer is read out (its first two
