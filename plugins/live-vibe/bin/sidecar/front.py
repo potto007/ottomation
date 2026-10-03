@@ -321,7 +321,8 @@ def parse_sse(line: str) -> tuple[str, dict[str, Any] | None]:
 ACK = "On it, I've asked."
 ACK_WORDS = 12
 _CLAIM = re.compile(r"\b(done|finished|complete[sd]?|ready|fixed|running|works|working|passed|failed|recorded|"
-                    r"information|don't|haven't|hasn't|isn't|wasn't|no one|nobody)\b", re.I)
+                    r"information|don't|haven't|hasn't|isn't|wasn't|no one|nobody|"
+                    r"was in|likely|probably|because|due to)\b", re.I)  # the last: a short guessed cause
 
 
 def is_request(text: Any) -> bool:
