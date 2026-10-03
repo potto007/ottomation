@@ -261,6 +261,13 @@ async function onSidecar($: EngineInterface, msg: Record<string, unknown>) {
     case 'note': {
       const said = typeof msg.said === 'string' ? msg.said.trim() : ''
       if (!said) break
+      // "mm-hm" over the voice: it paused, then played on. Claude learns the user was listening, nothing more.
+      if (msg.backchannel === true) {
+        await $.session.append({ message: { type: 'user', content: [{
+          type: 'text', text: `[The user, by voice, said "${said}" while listening; the voice played on (no task asked)]`,
+        }] } })
+        break
+      }
       const reply = typeof msg.reply === 'string' && msg.reply.trim() ? ` (the voice front answered: "${msg.reply.trim()}")` : ''
       if (msg.answer === true) {
         await toClaude($, `User said, answering your last question: "${said}"`,
@@ -275,6 +282,16 @@ async function onSidecar($: EngineInterface, msg: Record<string, unknown>) {
       await $.session.append({ message: { type: 'user', content: [{
         type: 'text', text: `[The user, by voice, to the voice front (no task asked): "${said}"${reply}]`,
       }] } })
+      break
+    }
+    // The user cut the front's retelling of Claude's answer: Claude hears where it stopped, so it does not assume the
+    // rest was heard.
+    case 'cut': {
+      const heard = typeof msg.heard === 'string' ? msg.heard.trim() : ''
+      const text = heard
+        ? `[The user cut off the voice front's retelling of your last answer; it was spoken up to: "...${heard}"]`
+        : "[The user cut off the voice front before it retold your last answer; they did not hear it]"
+      await $.session.append({ message: { type: 'user', content: [{ type: 'text', text }] } })
       break
     }
     case 'switch_model':

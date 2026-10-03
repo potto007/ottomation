@@ -825,6 +825,13 @@ def spoken_model(pattern: re.Pattern[str] | None, text: str) -> str | None:
 
 
 _GOODBYE = re.compile(r"\b(goodbye|bye bye)\b")
+UPTO_WORDS = 12  # the most of a cut retelling Claude is told: where it stopped, not what it said
+
+
+def spoken_upto(heard: str) -> str:
+    """The last UPTO_WORDS words heard of a cut reply, without its '...': '' when nothing was heard."""
+    words = heard.strip().removesuffix("...").split()
+    return " ".join(words[-UPTO_WORDS:])
 
 
 # -- the session ------------------------------------------------------------------------------------------
@@ -867,17 +874,26 @@ class FrontSession(Duplex):
             self.user_talking = True
             if self.fragment_due is not None:  # the rest of a held utterance is coming: wait for it
                 self.fragment_due.cancel()
-            await self.interrupt()
+            if not self.barge_in():  # over the voice: paused until the words say backchannel or cut
+                await self.interrupt()
             self.set_state("user_speaking")
+        elif kind == "barge_due":
+            await self.barge_due(payload)
         elif kind == "transcribing":
             self.set_state("transcribing")
         elif kind == "discard":
             self.user_talking = False
+            await self.barge_verdict(payload, discarded=True)
             if self.fragment:
                 self.arm_fragment()
             self.settle()
         elif kind == "utterance":
             self.user_talking = False
+            if await self.barge_verdict(payload):
+                emit(type="transcript", role="user", text=payload)
+                self.backchannel(payload)
+                self.settle()
+                return
             await self.on_utterance(payload)
         elif kind == "fragment_due" and payload == self.fragment_gen and self.fragment and not self.user_talking:
             text, self.fragment = " ".join(self.fragment), []
@@ -943,6 +959,9 @@ class FrontSession(Duplex):
         if self.turn_running():
             await cancel_and_wait(self.turn)
             self.settle()
+
+    async def cut(self) -> None:
+        await self.interrupt()
 
     async def run_turn(self, user_text: str, is_event: bool = False, brain: Brain | None = None,
                        report: str = "", waiting: list[str] | None = None) -> None:
@@ -1019,6 +1038,8 @@ class FrontSession(Duplex):
             said = brain.commit(" ".join(self.turn_spoken), interrupted)
             if not shown and said:  # cut before the reply was whole, or failed: what was heard
                 show(said)
+            if is_event and interrupted:  # Claude's answer was retold only in part: Claude hears where it stopped
+                emit(type="cut", heard=spoken_upto(said))
             if not (is_event or failed) and brain is self.brain:  # also when a barge-in cut the reply: the user's
                 self.pass_on(user_text, said, handed)  # words were heard whole, the reply maybe not
             # A barge-in cut the reply: unless two whole sentences of it were heard (most of a retelling), the
