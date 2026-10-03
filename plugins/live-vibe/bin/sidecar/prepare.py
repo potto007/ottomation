@@ -48,6 +48,8 @@ def run(args: argparse.Namespace) -> int:
     emit(type="check", name="python", status="ok",
          text=f"Python {sys.version.split()[0]} with the sidecar's packages (uv installed them)")
 
+    log_path = getattr(args, "log_path", None)
+    check("log", "ok" if log_path else "warn", f"sidecar log: {log_path}" if log_path else "sidecar log file unavailable")
     sd, mic, speaker = audio_devices(check, args)
     from . import gpu, speech
 

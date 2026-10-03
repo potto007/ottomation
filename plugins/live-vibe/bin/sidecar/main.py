@@ -71,10 +71,14 @@ else:
 
 import argparse  # noqa: E402
 import asyncio  # noqa: E402
+import json  # noqa: E402
+import platform  # noqa: E402
 import re  # noqa: E402
 import secrets  # noqa: E402
 import threading  # noqa: E402
 import time  # noqa: E402
+
+from pathlib import Path  # noqa: E402
 
 from sidecar import protocol  # noqa: E402
 from sidecar.protocol import emit, log, warn  # noqa: E402
@@ -96,6 +100,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--front-url", default="http://127.0.0.1:8080", help="OpenAI-compatible server (llama-server)")
     ap.add_argument("--front-model", default="", help="empty: the server's model, or claude-haiku-4-5 for anthropic")
     ap.add_argument("--switch-pattern", default="", help="regex whose group 1 is a model a spoken switch names")
+    ap.add_argument("--log-file", default="", help="persistent sidecar log; empty: <cache dir>/sidecar.log")
     ap.add_argument("--list-devices", action="store_true")
     ap.add_argument("--setup", action="store_true", help="check the system, fetch the models, test the voice")
     ap.add_argument("--unit", action="store_true", help="pure unit checks")
@@ -191,7 +196,21 @@ async def serve(args, life: protocol.Lifecycle, listener, voice, sd, mic, t0: fl
     return 0
 
 
+def plugin_version() -> str:
+    try:
+        manifest = Path(__file__).resolve().parents[2] / ".claude-plugin" / "plugin.json"
+        return str(json.loads(manifest.read_text(encoding="utf-8")).get("version", "unknown"))
+    except Exception:  # noqa: BLE001 - the header is a convenience
+        return "unknown"
+
+
+def session_header(argv: list[str]) -> str:
+    return (f"session start: live-vibe {plugin_version()} argv={argv!r} platform={platform.platform()} "
+            f"python={platform.python_version()}")
+
+
 def main() -> int:
+    argv_in = sys.argv[1:]
     args = parse_args()
     if args.unit:
         from sidecar import checks
@@ -207,6 +226,7 @@ def main() -> int:
         print(audio.load_sounddevice().query_devices())
         return 0
     protocol.claim_stdout()
+    args.log_path = protocol.start_file_log(args.log_file, session_header(argv_in))
     if args.setup:
         from sidecar import prepare
 
@@ -232,5 +252,6 @@ if __name__ == "__main__":
     code = main()
     sys.stdout.flush()
     sys.stderr.flush()
+    protocol.stop_file_log()
     # Skip interpreter teardown: a daemon thread may still sit in MLX or PortAudio, and every stream is closed.
     os._exit(code)

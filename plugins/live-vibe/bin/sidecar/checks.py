@@ -427,10 +427,59 @@ def units() -> int:
     check("macOS only" in msg and "apt install espeak-ng" in msg, f"say off macOS: one fatal message naming the fix {msg!r}")
     kyutai_choice(check)
     gpu_budget(check)
+    file_log_units(check)
 
     echo_units(check)
     print("UNIT: ALL PASS" if check.ok else "UNIT: SOME CHECKS FAILED", flush=True)
     return 0 if check.ok else 1
+
+
+def file_log_units(check: Checker) -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "sub" / "sidecar.log"
+        code = ("import os, sys; sys.path.insert(0, sys.argv[1]); from sidecar import protocol; protocol.claim_stdout(); "
+                "protocol.start_file_log(sys.argv[2], 'session start: test'); protocol.log('hello'); protocol.warn('two\\nlines'); "
+                "print('lib noise'); os.write(2, b'c noise\\n'); protocol.stop_file_log()")
+        r = subprocess.run([sys.executable, "-c", code, str(MAIN.parent.parent), str(path)], capture_output=True, text=True, timeout=30)
+        text = path.read_text(encoding="utf-8") if path.exists() else ""
+        rec = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}[+-]\d\d:\d\d (\w+) pid=(\d+) (.*)$")
+        rows = [m.groups() for m in map(rec.match, text.splitlines()) if m]
+        check(len(rows) == len(text.splitlines()) == 6 and len({pid for _, pid, _ in rows}) == 1,
+              f"file log: every line is ISO time, level, pid, text ({text!r})")
+        check([(lv, t.split(" argv")[0]) for lv, _, t in rows][:3] == [("INFO", "session start: test"), ("INFO", "hello"), ("WARNING", "two")]
+              and ("STDERR", "lib noise") in [(lv, t) for lv, _, t in rows] and ("STDERR", "c noise") in [(lv, t) for lv, _, t in rows],
+              "file log: header, log, warn (split per line) and library stderr all land in the file")
+        check('"type":"log","text":"hello"' in r.stdout and "lib noise" in r.stderr and "c noise" in r.stderr,
+              f"file log: the mod channel is unchanged (stdout {r.stdout!r}, stderr {r.stderr!r})")
+
+        small = Path(d) / "rot" / "s.log"
+        protocol.stop_file_log()
+        h = protocol.start_file_log(str(small), "h")
+        try:
+            for _ in range(2):
+                protocol.file_log("INFO", "x" * 1000 * 1000)
+                protocol.file_log("INFO", "y" * 1000 * 1000)
+                protocol.file_log("INFO", "z" * 1000 * 1000)
+            check(h == small and small.with_name("s.log.1").exists() and small.stat().st_size <= protocol.LOG_MAX_BYTES,
+                  "file log: rotates at the size cap, keeping one previous file")
+        finally:
+            protocol.stop_file_log()
+            protocol._file_logger = None
+
+        blocked = Path(d) / "afile"
+        blocked.write_text("x")
+        warned: list[dict[str, Any]] = []
+        protocol.capture(warned)
+        try:
+            got = protocol.start_file_log(str(blocked / "x.log"), "h")
+        finally:
+            protocol.capture(None)
+            protocol.stop_file_log()
+        check(got is None and len(warned) == 1 and warned[0]["type"] == "warn" and protocol._file_logger is None,
+              f"file log: an unwritable path warns once and the sidecar goes on {warned}")
+        protocol.file_log("INFO", "after failure")  # must not raise
 
 
 class _Status:

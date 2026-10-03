@@ -34,6 +34,17 @@ itself, `espeak-ng`, `libportaudio2`). Change a setting, run it again.
 Without setup, the first `/live` or `/livevibe` downloads the models, and the status line shows `loading` until they are ready:
 Kyutai STT about 2.4 GB (Apple silicon, or Linux with an Nvidia GPU), the Whisper model (75 to 500 MB), Kokoro about 330 MB, and Silero VAD about 2 MB. Later starts take a few seconds. Kokoro and Silero are cached in `~/.cache/duplex_voice` (`LIVE_VIBE_CACHE` overrides it); Kyutai and Whisper use the Hugging Face cache.
 
+## Sidecar log
+
+Everything the sidecar says (startup, which recognizer and synthesizer ran or fell back, whether the echo canceller loaded, front warm-up failures, warnings, and library output on stderr) is also appended to `~/.cache/duplex_voice/sidecar.log` (`LIVE_VIBE_CACHE` or `XDG_CACHE_HOME` move it; the `logFile` setting sets the exact path). `/live setup` reports the path. Each session starts with a header line (plugin version, arguments, platform, Python), and each line is `ISO-time LEVEL pid=<sidecar pid> text`, with LEVEL one of INFO, WARNING or STDERR:
+
+```
+2026-10-02T23:14:42.826-06:00 INFO pid=786551 session start: live-vibe 0.3.1 argv=[...] platform=Linux-... python=3.12.3
+2026-10-02T23:14:50.101-06:00 WARNING pid=786551 Kyutai STT on CUDA unavailable (...); using Whisper.
+```
+
+The file rotates at 5 MB and keeps one previous copy (`sidecar.log.1`). If the path cannot be written, the sidecar warns once and carries on without it.
+
 ## Settings (`/config`)
 
 | Field | Default | Meaning |
@@ -44,6 +55,7 @@ Kyutai STT about 2.4 GB (Apple silicon, or Linux with an Nvidia GPU), the Whispe
 | `voice` | empty | A Kokoro voice (`af_heart`) or a macOS `say` voice. |
 | `mic` | empty | Input device: an index or part of its name (`AirPods`). Empty means the system default. |
 | `speaker` | empty | Output device, the same way. |
+| `logFile` | empty | Sidecar log path; empty means `~/.cache/duplex_voice/sidecar.log`. |
 | `endSilenceMs` | 1500 | Whisper: the pause that ends your turn. Kyutai: only a cap on a pause between words. |
 | `frontBackend` | `llamacpp` | `llamacpp` (any OpenAI-compatible server) or `anthropic` (needs `ANTHROPIC_API_KEY` or `ant auth login`). |
 | `frontUrl` | `http://127.0.0.1:8080` | The front's server. It can be another host, such as a GPU box. |

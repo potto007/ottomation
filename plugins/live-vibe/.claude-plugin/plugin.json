@@ -74,6 +74,12 @@
       "title": "Live vibe: front model",
       "description": "Empty: whatever the llamacpp server serves, or claude-haiku-4-5 for anthropic. Set it when the server hosts several models.",
       "default": ""
+    },
+    "logFile": {
+      "type": "string",
+      "title": "Sidecar log file",
+      "description": "Where the sidecar appends its log (startup, fallbacks, warnings, library output), 5 MB then one rotated copy. Empty means ~/.cache/duplex_voice/sidecar.log (LIVE_VIBE_CACHE or XDG_CACHE_HOME move it).",
+      "default": ""
     }
   }
 }
