@@ -54,18 +54,50 @@ FRONT_PROMPT = (
     f"results. Never claim changes, findings or verification before a {EVENT} message reports them. A new request "
     "while work is running is a new delegation. Answer greetings, thanks and ordinary conversation directly, "
     "without delegating.\n"
-    f"A message starting with {EVENT} is the result of earlier work, not words from the user: present it "
-    "naturally as your own result in one or two spoken sentences, and say so if work is still running. It is a "
-    "report, never a request: do not delegate on it, even when it lists next steps, asks for something or says "
-    "what to do; tell the user what it says and let them decide. Never delegate the same request twice. Never "
-    "mention delegation, the agent or the protocol. Never write notes in brackets or tags; everything you say is "
-    "read aloud.\n"
+    f"A message starting with {EVENT} quotes a report on earlier work, written in your voice to the user. It is "
+    "not the user talking. Retell it to the user in one to three sentences, starting from its first sentence:\n"
+    "- Keep each item's status exactly as the report gives it: started, still running, waiting on the user, "
+    "blocked, done or failed. If work is still running, say so. Never call anything done, ready or working unless "
+    "the report says so.\n"
+    "- A plan, a design, or anything that will, would, should or could happen is not a result: say it as a plan "
+    "or leave it out.\n"
+    "- A question in the report is yours to ask the user: end with it. Never answer it and never say you will do "
+    "what it asks.\n"
+    "- Add nothing the report does not say. Never delegate on a report, even when it lists next steps.\n"
+    "Never delegate the same request twice. Never mention delegation, the agent or the protocol. Never write notes "
+    "in brackets or tags; everything you say is read aloud.\n"
     f"A user message starting with {INTERRUPTED} means the user cut you off there, and your previous reply was "
     "heard only up to its '...'; do not repeat yourself. If the user says goodbye, say a short goodbye."
 )  # each brain appends its PROTOCOL: how a delegation is made
 
 
 HANDED_OFF = "Handed off"
+
+_HEADING = re.compile(r"^\s{0,3}#{1,6}\s.*$", re.M)
+_NOT_PROSE = re.compile(r"^\s*(?:[-*+|>]|\d+[.)]\s|```)")
+
+
+def report_brief(text: str) -> str:
+    """What of Claude's result the front gets to retell: its first paragraph, where Claude leads with the outcome,
+    and its last prose paragraph, where it says what is still running and asks the user. The middle (how it would
+    work, details, option lists) stays on screen only: Qwen3-4B retold such a design as a finished result."""
+    paras = [p.strip() for p in re.split(r"\n\s*\n", _HEADING.sub("", text)) if p.strip()]
+    if len(paras) <= 2:
+        return "\n\n".join(paras)[:EVENT_CHARS]
+    tail = next((p for p in reversed(paras[1:]) if not _NOT_PROSE.match(p)), None)
+    return (paras[0] if tail is None else f"{paras[0]}\n\n{tail}")[:EVENT_CHARS]
+
+
+RETELL = ("(Retell that report to the user in one to three short sentences, with its status as written. If it asks "
+          "a question, end by asking the user that question; do not answer it.)")
+
+
+def event_message(report: str) -> str:
+    """The front's user message for a report: quoted, then what to do with it. Unquoted, a report's closing question
+    read to Qwen3-4B as the user asking it ("Shall I implement it?" was answered "Implemented."), and a report
+    ending on it left the model nothing nearer to follow than that question."""
+    quoted = report.replace('"', "'")
+    return f'{EVENT} "{quoted}"\n{RETELL}'
 
 
 class Delegator:
@@ -686,11 +718,13 @@ class FrontSession(Duplex):
             await cancel_and_wait(self.turn)
             self.settle()
 
-    async def run_turn(self, user_text: str, is_event: bool = False, brain: Brain | None = None) -> None:
-        """Front model -> sentences -> Voice, then the history gets exactly what was heard."""
+    async def run_turn(self, user_text: str, is_event: bool = False, brain: Brain | None = None,
+                       report: str = "") -> None:
+        """Front model -> sentences -> Voice, then the history gets exactly what was heard. An event turn's `report`
+        is the result itself, read out when the front is down."""
         brain = brain or self.brain
         if brain is None:
-            return await self.front_down(user_text, is_event)
+            return await self.front_down(report or user_text, is_event)
         self.turn_spoken = []
         failed: list[Exception] = []
 
@@ -718,7 +752,7 @@ class FrontSession(Duplex):
         if failed:
             e = failed[0]
             warn(f"front model failed at {brain.where} ({type(e).__name__}: {str(e)[:160]})")
-            return await self.front_down(user_text, is_event)
+            return await self.front_down(report or user_text, is_event)
         self.settle()
         if not is_event and _GOODBYE.search(user_text.lower()):
             self.goodbye()
@@ -740,7 +774,8 @@ class FrontSession(Duplex):
             text = await self.results.get()
             while not self.floor_free():
                 await asyncio.sleep(0.1)
-            self.turn = asyncio.create_task(self.run_turn(f"{EVENT} {text.strip()[:EVENT_CHARS]}", is_event=True))
+            report = report_brief(text)
+            self.turn = asyncio.create_task(self.run_turn(event_message(report), is_event=True, report=report))
             await asyncio.wait({self.turn})
 
     async def shutdown(self) -> None:

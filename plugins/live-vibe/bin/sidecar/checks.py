@@ -28,9 +28,9 @@ from . import gpu, protocol
 from .checks_front_server import front_server_units
 from .audio import FRAME, SR, CannotStart, Player, check_devices, SentenceSplitter, Tuning, TurnDetector, Voice, speakable
 from .echo import EchoCanceller, EchoGuard, EchoReference
-from .front import (EVENT, HISTORY_MAX, INTERRUPTED, _FALLBACKS, _NO_EFFORT, Brain, Delegator, FrontSession,
-                    LlamaCppBrain, SpeechFilter, TurnStream, is_turn_start, make_brain, parse_sse, spoken_model,
-                    warm_up)
+from .front import (EVENT, EVENT_CHARS, HISTORY_MAX, INTERRUPTED, RETELL, _FALLBACKS, _NO_EFFORT, Brain, Delegator,
+                    FrontSession, LlamaCppBrain, SpeechFilter, TurnStream, event_message, is_turn_start, make_brain,
+                    parse_sse, report_brief, spoken_model, warm_up)
 from .session import LiveSession
 from .speech import BARGE_IN_WORDS, KYUTAI_BLOCK, KYUTAI_SR, KyutaiTurns, SilentTTS, check_tts
 
@@ -376,6 +376,27 @@ def front_history(check: Checker) -> None:
           and json.loads(contents[3]) == {"say": "", "delegate": "Wait for it"}
           and contents[4] == f"{INTERRUPTED} next",
           f"json turn: a delegation landing after its turn was cut joins that turn's place in history {contents}")
+    report_units(check)
+
+
+def report_units(check: Checker) -> None:
+    """What of a Claude result the front retells, and how it is framed."""
+    short = "Fixed parser.py; all 41 tests pass.\n\nNot pushed. Want me to push it?"
+    check(report_brief(f"  {short}\n") == short, "report brief: two paragraphs or fewer stay whole")
+    long_ = ("## Summary\n\nI've started a worker on the Windows player.\n\nHow it would work:\n- streams PCM to "
+             "Windows\n- which should eliminate the static\n\n## Next\n\n"
+             "Nothing is pushed. I'll report when it's done.")
+    got = report_brief(long_)
+    check(got == "I've started a worker on the Windows player.\n\nNothing is pushed. I'll report when it's done.",
+          f"report brief: the lead and the closing paragraph, not the design between them or the headings {got!r}")
+    got = report_brief("All 12 pass.\n\nDetails:\n\n- a.py\n- b.py\n\n| file | lines |\n|---|---|\n| a | 3 |")
+    check(got == "All 12 pass.\n\nDetails:", f"report brief: a trailing list or table is not the tail {got!r}")
+    check(report_brief("Lead.\n\n1. one\n\n2. two") == "Lead.",
+          "report brief: only the lead when nothing after it is prose")
+    check(len(report_brief("x" * (EVENT_CHARS + 50))) == EVENT_CHARS, "report brief: cut at EVENT_CHARS")
+    msg = event_message('Done. Want me to run "make test" now?')
+    check(msg == f"{EVENT} \"Done. Want me to run 'make test' now?\"\n{RETELL}" and "do not answer" in RETELL,
+          f"event message: the report quoted, then the retell reminder, so its question is not the last word {msg!r}")
 
 
 def units() -> int:
@@ -827,7 +848,7 @@ async def selftest_sessions(check: Checker) -> None:
     hearing["on"] = False
     await until(lambda: said() == "All the tests pass now.")
     check(r == 204 and held, "announcer: a result waits while the user talks and while speech is transcribed")
-    check(brain.history[-2]["content"].startswith(f"{EVENT} Fixed parser.py") and said() == "All the tests pass now.",
+    check(brain.history[-2]["content"].startswith(f'{EVENT} "Fixed parser.py') and said() == "All the tests pass now.",
           "announcer: then the front relays it as a [task finished] turn")
 
     out.clear()
@@ -933,9 +954,11 @@ async def selftest_sessions(check: Checker) -> None:
     await turn_done()
     check(emitted("delegate") == [{"type": "delegate", "text": "what time is it"}] and emitted("warn"),
           "front down: the utterance goes straight to Claude")
-    r = await asyncio.to_thread(post, port, "/event", "It is noon. The clock is in the corner. More.", token)
+    body = "It is noon.\n\n- a\n- b\n\nThe clock is in the corner. More."
+    r = await asyncio.to_thread(post, port, "/event", body, token)
     await until(lambda: sess.turn_spoken == ["It is noon.", "The clock is in the corner."], 5)
-    check(sess.turn_spoken == ["It is noon.", "The clock is in the corner."], f"front down: Claude's answer read out {sess.turn_spoken}")
+    check(sess.turn_spoken == ["It is noon.", "The clock is in the corner."],
+          f"front down: Claude's answer read out (its brief, not the retell framing) {sess.turn_spoken}")
     await dead.aclose()
     sess.brain = brain
 
