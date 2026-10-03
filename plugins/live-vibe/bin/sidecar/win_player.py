@@ -5,9 +5,11 @@
 #   "sounddevice>=0.5",
 # ]
 # ///
-"""The sidecar's speaker on Windows, for WSL: the sidecar (winplayer.py) starts this through WSL interop with uv.exe
-and streams the synthesized speech over its stdin, so playback goes straight to WASAPI instead of through WSLg's RDP
-audio, which crackles. Standalone on purpose: it imports nothing from the sidecar and runs on Windows Python.
+"""The sidecar's speaker on Windows, for WSL, in Python: the fallback for win_player.exe (../../win_player, the same
+player in Rust, which the sidecar runs whenever the plugin ships it). The sidecar (winplayer.py) starts this through
+WSL interop with uv.exe and streams the synthesized speech over its stdin, so playback goes straight to WASAPI
+instead of through WSLg's RDP audio, which crackles. Standalone on purpose: it imports nothing from the sidecar and
+runs on Windows Python. The wire below is the exe's too; keep the two in step.
 
 stdin, binary frames: a header "<cI" (kind, payload length), then the payload.
   J  JSON control: {"op":"open","rate":24000}  {"op":"cancel","id":n}  {"op":"ping","t":x}  {"op":"quit"}
@@ -23,7 +25,8 @@ stdout, one JSON object per line ("t" names it):
   error   text; bye  why, frames, xruns
 Times are time.perf_counter() (QueryPerformanceCounter on Windows): the sidecar maps them to its clock with ping and
 pong. The process exits on stdin EOF (the sidecar closed it, exited or crashed), on quit, and when no frame arrives
-for --watchdog seconds (the sidecar sends a ping every second), so it cannot outlive the sidecar.
+for --watchdog seconds (the sidecar sends a ping every second), so it cannot outlive the sidecar. The watchdog does
+not count the device open, which blocks this loop (a cold PortAudio scan has taken over 10 s).
 
   uv run --script win_player.py [--speaker NAME] [--latency S] [--watchdog S] [--list] [--fake]
 --fake drives the same engine from a timer instead of a device: the sidecar's unit checks run it on Linux."""
@@ -279,6 +282,7 @@ def main() -> int:
     out = Out(sys.stdout.buffer)
     out.send(t="hello", pid=os.getpid(), python=sys.version.split()[0])
     last_rx = [time.monotonic()]
+    opening = [False]  # the device open blocks the frame loop: the watchdog waits for it
     stream: Any = None
     engine: Engine | None = None
     why = "stdin closed"
@@ -286,7 +290,7 @@ def main() -> int:
     def watchdog() -> None:
         while True:
             time.sleep(0.5)
-            if time.monotonic() - last_rx[0] > args.watchdog:
+            if not opening[0] and time.monotonic() - last_rx[0] > args.watchdog:
                 out.send(t="bye", why="watchdog: the sidecar went quiet", frames=engine.frames if engine else 0,
                          xruns=engine.xruns if engine else 0)
                 out.close()
@@ -319,6 +323,7 @@ def main() -> int:
                 out.send(t="pong", t0=msg.get("t"), w=time.perf_counter())
             elif op == "open" and engine is None:
                 engine = Engine(out, int(msg["rate"]))
+                opening[0] = True
                 try:
                     if args.fake:
                         stream = FakeStream(engine, out)
@@ -330,6 +335,9 @@ def main() -> int:
                     out.send(t="error", text=f"cannot open the speaker: {type(e).__name__}: {e}")
                     why = "no speaker"
                     break
+                finally:
+                    last_rx[0] = time.monotonic()
+                    opening[0] = False
             elif op == "cancel" and engine is not None:
                 cid = int(msg["id"])
                 t = time.perf_counter()
