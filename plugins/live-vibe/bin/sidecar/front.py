@@ -55,7 +55,8 @@ FRONT_PROMPT = (
     "report says how work stands: never say on your own that work is running, finished or fixed; if you handed "
     "something off and no report has come since, say you have asked. A new request is a new delegation. Answer "
     "greetings, thanks and ordinary conversation directly, without delegating: what the user tells you reaches the "
-    "coding agent anyway.\n"
+    "coding agent anyway. If the user asks how things are going, where things stand, or whether something was "
+    "received, say only 'Let me check.'; the coding agent answers.\n"
     f"A message starting with {EVENT} quotes a report on earlier work, written in your voice to the user. It is "
     "not the user talking. Retell it to the user in one to three sentences, starting from its first sentence:\n"
     "- Keep each item's status exactly as the report gives it: started, still running, waiting on the user, "
@@ -90,6 +91,14 @@ def report_brief(text: str) -> str:
     return (paras[0] if tail is None else f"{paras[0]}\n\n{tail}")[:EVENT_CHARS]
 
 
+_ASIDE = re.compile(r"\[[^\]]*\]|\([^)]*\)")
+
+
+def retellable(report: str) -> bool:
+    """A report with something to retell: not empty, not only bracketed asides such as Claude's "(nothing to add)"."""
+    return bool(re.search(r"\w", _ASIDE.sub("", report)))
+
+
 RETELL = ("(Retell that report to the user in one to three short sentences, with its status as written. If it asks "
           "a question, end by asking the user that question; do not answer it.)")
 
@@ -121,6 +130,13 @@ class Delegator:
         self.announcing = False  # a [task finished] turn: results are reported, not acted on
         self.sent: list[tuple[float, str]] = []
         self.handed = 0  # delegations sent so far: a user turn that adds none is passed on as a note
+        self.results_seen = False  # a result was announced or taken into a user turn
+
+    @property
+    def work_in_session(self) -> bool:
+        """Something was handed off or reported this session: a user's question may be about it, so the front never
+        answers one itself (see HOLD)."""
+        return self.handed > 0 or self.results_seen
 
     @staticmethod
     def _norm(text: str) -> str:
@@ -241,7 +257,7 @@ class Brain:
 
     name = "base"
     model = ""
-    trimmed = False  # the last reply was cut to an acknowledgement or ASKED: the user did not hear what it said
+    trimmed = False  # the last reply was cut to an acknowledgement or HOLD: the user did not hear what it said
     plain = False  # the last reply to a question stood as the model wrote it: a short answer, no claim
 
     def __init__(self, system: str = ""):
@@ -332,7 +348,7 @@ def is_request(text: Any) -> bool:
     return isinstance(text, str) and text.strip().lower().strip(".") not in NO_REQUEST
 
 
-ASKED = "I've asked for the details."
+HOLD = "Let me check."  # all a question the front does not delegate hears from it; Claude gets it as `ask`
 
 
 def short_first(say: str) -> str:
@@ -348,20 +364,11 @@ def acknowledgement(say: str) -> str:
 
 
 def plain_answer(say: str) -> bool:
-    """A reply that can stand as the answer to a user's question: one sentence, short, no claim about the work
-    ("I'm doing well, thanks!"). A guess was never that: every recorded one sat in a second sentence."""
+    """A reply that can stand as the answer to a user's question while no work is in session: one sentence, short,
+    no claim about the work ("I'm doing well, thanks!"). A guess was never that: every recorded one sat in a second
+    sentence."""
     say = say.strip()
     return bool(say) and len(re.split(r"(?<=[.!?])\s+", say)) == 1 and short_first(say) == say
-
-
-def asked(say: str) -> str:
-    """What a user's question the front answered itself speaks: the same short first sentence, then ASKED. Claude
-    gets the question (an `ask` note) and gives the real answer; seen with Qwen3-4B on "so what was the fix?" with
-    only a log report to go on, every reply guessed a cause after its first sentence."""
-    first = short_first(say)
-    if re.search(r"\basked\b", first, re.I):  # "I have asked." then ASKED was said twice (seen with Qwen3.6-35B)
-        return first
-    return f"{first} {ASKED}" if first else ASKED
 
 
 class TurnStream:
@@ -442,8 +449,9 @@ class FrontTurn:
     heard: str = ""  # what of "say" was heard
     cut_at: float | None = None  # when the turn was cut while its reply was still streaming
     committed: bool = False
-    trimmed: bool = False  # the reply was held back and cut to an acknowledgement or ASKED
+    trimmed: bool = False  # the reply was held back and cut to an acknowledgement or HOLD
     plain: bool = False  # a question's reply was held back and spoken whole: one short sentence, no claim
+    worked: bool = False  # work was in session when the turn began: a question hears HOLD, never the model's answer
 
 
 class LlamaCppBrain(Brain):
@@ -552,6 +560,7 @@ class LlamaCppBrain(Brain):
         turn = self.current
         words: asyncio.Queue[str | None] = asyncio.Queue()
         announcing = bool(getattr(tools, "announcing", False))
+        turn.worked = bool(getattr(tools, "work_in_session", False))
         reader = asyncio.create_task(self._read(msgs, turn, words, tools, announcing))
         finished = False
         try:
@@ -614,11 +623,11 @@ class LlamaCppBrain(Brain):
             field = json_turn.fields.get("delegate", "").strip()
             for request in speech.delegations() if not field else [] if handed else [field]:  # or the notes instead
                 await self._hand_off(request, turn, tools, announcing)
-            if held is not None:  # handed off: an acknowledgement; a question kept: ASKED, Claude gets it as `ask`
+            if held is not None:  # handed off: an acknowledgement; a question kept: HOLD, Claude gets it as `ask`
                 whole = "".join(held) + said
-                turn.plain = not turn.request and plain_answer(whole)
-                spoken = whole.strip() if turn.plain else (acknowledgement if turn.request else asked)(whole)
-                turn.trimmed = spoken != whole.strip()
+                turn.plain = not (turn.request or turn.worked) and plain_answer(whole)
+                spoken = whole.strip() if turn.plain else acknowledgement(whole) if turn.request else HOLD
+                turn.trimmed = not turn.plain
                 words.put_nowait(spoken)
             elif said:
                 words.put_nowait(said)
@@ -813,10 +822,11 @@ class FrontSession(Duplex):
         self.turn = asyncio.create_task(self.run_turn(text, waiting=waiting))
 
     def take_results(self) -> list[str]:
-        """Every result waiting for the floor, oldest first."""
+        """Every result waiting for the floor, oldest first. Once one is taken, work is in session."""
         texts: list[str] = []
         while not self.results.empty():
             texts.append(self.results.get_nowait())
+        self.tools.results_seen = self.tools.results_seen or bool(texts)
         return texts
 
     async def interrupt(self) -> None:
@@ -879,7 +889,7 @@ class FrontSession(Duplex):
             warn(f"front model failed at {brain.where} ({type(e).__name__}: {str(e)[:160]})")
             self.requeue(waiting or [])  # never heard: the announcer reads them out
             return await self.front_down(report or user_text, is_event)
-        # A held reply (cut to "I've asked", or one short plain sentence) told the user nothing of the waiting results
+        # A held reply (cut to HOLD, or one short plain sentence) told the user nothing of the waiting results
         # (eval: a waiting report, then "what time is it in Tokyo?", then only "I've asked"): the announcer reads them.
         if waiting and (brain.trimmed or brain.plain):
             log(f"front: the reply was held short; {len(waiting)} waiting result(s) go back to the announcer")
@@ -899,9 +909,10 @@ class FrontSession(Duplex):
         static is gone"), a correction or a decision is information Claude needs (seen live: said three times, never
         passed on, while Claude kept saying nobody had confirmed by ear). The mod hands two kinds to Claude as a
         prompt rather than a note: `answer`, a reply to a question the last report asked, and `ask`, a question the
-        front answered itself (Qwen3-4B, asked "so what was the fix?" with only a log report to go on, invented a
-        cause and delegated nothing, even when told to delegate what the report does not answer). A question the front
-        answered plainly (`plain`: one short sentence with no claim, "I'm doing well, thanks!") is a note."""
+        front did not delegate (Qwen3-4B, asked "so what was the fix?" with only a log report to go on, invented a
+        cause and delegated nothing, even when told to delegate what the report does not answer); the front says only
+        HOLD. With no work in session, a question the front answered plainly (`plain`: one short sentence with no
+        claim, "I'm doing well, thanks!") is a note."""
         answer, self.question_open = self.question_open, False
         if self.tools.handed != handed:
             return
@@ -929,7 +940,10 @@ class FrontSession(Duplex):
             texts = self.take_results()
             if len(texts) > 1:
                 log(f"front: {len(texts)} results waited together; announcing them as one")
-            report = "\n\n".join(report_brief(t) for t in texts)[:EVENT_CHARS]
+            report = "\n\n".join(b for t in texts if retellable(b := report_brief(t)))[:EVENT_CHARS]
+            if not report:  # "(nothing to add)", or nothing at all: a turn on it would only invent something to say
+                log(f"front: {len(texts)} result(s) with nothing to say; not announced")
+                continue
             self.question_open = "?" in report
             self.turn = asyncio.create_task(self.run_turn(event_message(report), is_event=True, report=report))
             await asyncio.wait({self.turn})

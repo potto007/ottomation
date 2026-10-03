@@ -57,6 +57,13 @@ function spokenModel(text: string): string | undefined {
   return SPOKEN_SWITCH.exec(text.toLowerCase().replace(/[^a-z ]+/g, ' ').replace(/\s+/g, ' ').trim())?.[1]
 }
 
+// Claude's whole answer to a voice question when the front's own holding line already says enough: never posted.
+const NOTHING_TO_ADD = '(nothing to add)'
+
+function nothingToAdd(answer: string) {
+  return answer.trim().toLowerCase().replace(/\./g, '') === NOTHING_TO_ADD
+}
+
 // Where Claude's words go: read aloud as they are (/live), or through the front's announcer (/livevibe).
 function replyPath(l: Live) {
   return l.mode === 'livevibe' ? '/event' : '/speak'
@@ -144,7 +151,8 @@ async function onSidecar($: EngineInterface, msg: Record<string, unknown>) {
     }
     // A user turn the front answered itself: a confirmation, a correction or a decision is still Claude's to know.
     // It joins the conversation without starting a turn. Two kinds are prompts: a reply to the question Claude's last
-    // answer asked (`answer`), and a question the front answered on its own (`ask`), which Claude answers for real.
+    // answer asked (`answer`), and a question the front did not delegate (`ask`): it said only a holding line, and
+    // Claude gives the real answer, or NOTHING_TO_ADD, which turn.complete keeps from the front.
     case 'note': {
       const said = typeof msg.said === 'string' ? msg.said.trim() : ''
       if (!said) break
@@ -155,8 +163,8 @@ async function onSidecar($: EngineInterface, msg: Record<string, unknown>) {
         break
       }
       if (msg.ask === true) {
-        await toClaude($, `User asked by voice: "${said}"${reply}\nThe voice front answered on its own. Give the real answer, and correct it if it was wrong.`,
-          `[The user, by voice, asks while you work: "${said}"${reply}. Answer it in your next reply, and correct the voice front if it was wrong.]`)
+        await toClaude($, `User asked by voice: "${said}"${reply}\nThe voice front did not answer it. Give the real answer. If you have nothing to add beyond the voice front's line, reply with exactly: ${NOTHING_TO_ADD}`,
+          `[The user, by voice, asks while you work: "${said}"${reply}. The voice front did not answer it: answer it in your next reply.]`)
         break
       }
       await $.session.append({ message: { type: 'user', content: [{
@@ -439,7 +447,9 @@ export const register: Register = (on, options) => {
     const l = await read($, live)
     if (!l.isOn || e.agentId) return next(e)
     await update($, live, x => ({ ...x, turnId: null }))
-    if (e.reason === 'answer' && e.answer.trim()) void post($, replyPath(l), e.answer)
+    if (e.reason === 'answer' && e.answer.trim()) {
+      if (!nothingToAdd(e.answer)) void post($, replyPath(l), e.answer)
+    }
     // The front is waiting on a result; tell it the work stopped rather than leave it silent.
     else if (l.mode === 'livevibe' && (e.reason === 'error' || e.reason === 'refusal')) {
       void post($, '/event', e.reason === 'error' ? 'The work stopped on an error before it finished.' : 'That request was declined.')

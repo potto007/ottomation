@@ -124,7 +124,7 @@ test('live vibe: a note joins the conversation without a turn; an answer or a qu
   const sidecar = fakeSidecar(4321,
     '{"type":"note","said":"It sounds perfect. It is fixed.","reply":"Great, the static is gone."}',
     '{"type":"note","said":"Yes, delete it.","reply":"Okay.","answer":true}',
-    '{"type":"note","said":"So what was the fix?","reply":"There was no fix.","ask":true}')
+    '{"type":"note","said":"So what was the fix?","reply":"Let me check.","ask":true}')
   on('process.spawn', sidecar.spawn)
   on('http.fetch', () => ok)
   const appended: string[] = []
@@ -142,8 +142,9 @@ test('live vibe: a note joins the conversation without a turn; an answer or a qu
   expect(appended).toEqual(['[The user, by voice, to the voice front (no task asked): "It sounds perfect. It is fixed." '
     + '(the voice front answered: "Great, the static is gone.")]'])
   expect(prompted).toEqual(['User said, answering your last question: "Yes, delete it."',
-    'User asked by voice: "So what was the fix?" (the voice front answered: "There was no fix.")\n'
-    + 'The voice front answered on its own. Give the real answer, and correct it if it was wrong.'])
+    'User asked by voice: "So what was the fix?" (the voice front answered: "Let me check.")\n'
+    + "The voice front did not answer it. Give the real answer. If you have nothing to add beyond the voice front's "
+    + 'line, reply with exactly: (nothing to add)'])
   await $.command.run({ command: 'livevibe', ...typed })
   sidecar.release()
 })
@@ -165,6 +166,29 @@ test("live vibe: Claude's answer goes to the front's /event, never /speak", asyn
   await relayed
 
   expect(posts).toEqual([{ url: 'http://127.0.0.1:4321/event', body: 'Fixed parser.py; all 41 tests pass.', token: 'tok-4321' }])
+  await $.command.run({ command: 'livevibe', ...typed })
+  sidecar.release()
+})
+
+test("live vibe: Claude's '(nothing to add)' never reaches the front", async ($, on) => {
+  const posts: { url: string; body?: string }[] = []
+  const sidecar = fakeSidecar(4321)
+  on('process.spawn', sidecar.spawn)
+  on('turn.complete', (_$, e) => ({ text: e.answer }))
+  const relayed = new Promise<void>(resolve => on('http.fetch', (_$, e) => {
+    posts.push({ url: e.url, body: e.init?.body })
+    if (e.url.endsWith('/event')) resolve()
+    return ok
+  }))
+
+  await $.command.run({ command: 'livevibe', ...typed })
+  await sidecar.isUp
+  await $.turn.complete({ answer: ' (nothing to add) ', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
+  await $.turn.complete({ answer: '(Nothing to add.)', durationMs: 1, isAborted: false, turnId: 't2', reason: 'answer' })
+  await $.turn.complete({ answer: 'Still running; nothing to add yet.', durationMs: 1, isAborted: false, turnId: 't3', reason: 'answer' })
+  await relayed
+
+  expect(posts).toEqual([{ url: 'http://127.0.0.1:4321/event', body: 'Still running; nothing to add yet.' }])
   await $.command.run({ command: 'livevibe', ...typed })
   sidecar.release()
 })

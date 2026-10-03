@@ -29,10 +29,10 @@ from .checks_front_server import front_server_units
 from .checks_winplayer import winplayer_units
 from .audio import FRAME, SR, CannotStart, Player, check_devices, SentenceSplitter, Tuning, TurnDetector, Voice, speakable
 from .echo import EchoCanceller, EchoGuard, EchoReference
-from .front import (ACK, ASKED, EVENT, EVENT_CHARS, HISTORY_MAX, INTERRUPTED, RETELL, WAITING, _FALLBACKS,
+from .front import (ACK, EVENT, EVENT_CHARS, HISTORY_MAX, HOLD, INTERRUPTED, RETELL, WAITING, _FALLBACKS,
                     _NO_EFFORT, Brain, Delegator, FrontSession, LlamaCppBrain, SpeechFilter, TurnStream,
-                    acknowledgement, asked, event_message, is_turn_start, make_brain, parse_sse, plain_answer,
-                    report_brief, spoken_model, warm_up)
+                    acknowledgement, event_message, is_turn_start, make_brain, parse_sse, plain_answer,
+                    report_brief, retellable, spoken_model, warm_up)
 from .session import LiveSession
 from .speech import BARGE_IN_WORDS, KYUTAI_BLOCK, KYUTAI_SR, KyutaiTurns, SilentTTS, check_tts
 
@@ -384,16 +384,14 @@ def front_history(check: Checker) -> None:
                                          "Okay, I will go and look through every single file in the repo now.")]
     check(acks == ["On it.", "Sure, I'll ask.", ACK, ACK, ACK, ACK],
           f"acknowledgement: a short first sentence with no claim about the work, else {ACK!r} {acks}")
-    got = [asked("Good question. It was likely the routing."), asked("It was fixed in the audio pipeline config.")]
-    check(got == [f"Good question. {ASKED}", ASKED], f"asked: the short first sentence, then {ASKED!r} {got}")
-    got = [asked("I have asked. More later."), asked("I've asked about the review."), acknowledgement("I've asked.")]
-    check(got == ["I have asked.", "I've asked about the review.", "I've asked."],
-          f"asked: a first sentence that already says it asked gets no second 'asked' {got}")
     guesses = ["The fix was in the audio pipeline config.", "It was likely the routing.", "Probably the new player.",
                "It stopped because of the buffer.", "That was due to WSLg."]
-    got = [asked(g) for g in guesses] + [acknowledgement(g) for g in guesses]
-    check(got == [ASKED] * len(guesses) + [ACK] * len(guesses),
-          f"asked, acknowledgement: a short guessed cause is never spoken {got}")
+    got = [acknowledgement(g) for g in guesses] + [plain_answer(g) for g in guesses]
+    check(got == [ACK] * len(guesses) + [False] * len(guesses),
+          f"acknowledgement, plain answer: a short guessed cause is never spoken {got}")
+    got = [retellable(t) for t in ("", "  ", "(nothing to add)", "[done]\n\n(nothing to add)", "Fixed it (finally).")]
+    check(got == [False, False, False, False, True],
+          f"retellable: an empty or bracket-only report has nothing to announce {got}")
     plain = [plain_answer(t) for t in ("I'm doing well, thanks!", "It's sunny here.", "Yes. Then the rest.",
                                         "It finished with no errors.", "")]
     check(plain == [True, True, False, False, False],
@@ -409,9 +407,8 @@ def front_history(check: Checker) -> None:
         "The logs showed no errors or warnings that affected anything. "
         "The fix seems to have resolved the static issue.",
     ]
-    got = [(plain_answer(g), asked(g)) for g in recorded]
-    check(all(not p and a.endswith(ASKED) and "fix" not in a.lower() for p, a in got),
-          f"plain answer: every recorded guess at 'what was the fix?' is still cut to ASKED {[a for _, a in got]}")
+    got = [plain_answer(g) for g in recorded]
+    check(not any(got), f"plain answer: no recorded guess at 'what was the fix?' stands as an answer {got}")
 
 
 def report_units(check: Checker) -> None:
@@ -746,6 +743,8 @@ def fake_front() -> tuple[str, list[dict[str, Any]]]:
                 deltas = turn("It finished with no errors.")
             elif "how are you" in text.lower():
                 deltas = turn("I'm doing well, thanks!")
+            elif "did you get that" in text.lower():
+                deltas = turn("Yes, I got it.")
             elif "goodbye" in text.lower():
                 deltas = turn("Goodbye.")
             elif "thinking leak" in text:
@@ -959,9 +958,9 @@ async def selftest_sessions(check: Checker) -> None:
     utter("Is it perfect now?")
     await until(lambda: emitted("note"), 5)
     await turn_done()
-    note = {"type": "note", "said": "Is it perfect now?", "reply": ASKED, "ask": True}  # "works" is a claim
+    note = {"type": "note", "said": "Is it perfect now?", "reply": HOLD, "ask": True}
     check(emitted("note") == [note] and not emitted("delegate"),
-          f"front: a question the front answered itself goes to Claude marked ask {emitted('note')}")
+          f"front: a question the front did not delegate goes to Claude marked ask {emitted('note')}")
     out.clear()
     utter("So what was the fix?")
     await until(lambda: emitted("note"), 5)
@@ -971,10 +970,9 @@ async def selftest_sessions(check: Checker) -> None:
     utter("And how did that happen?")
     await until(lambda: emitted("note"), 5)
     await turn_done()
-    check(first == ["The logs look clean.", ASKED] and sess.turn_spoken == [ASKED] and not emitted("delegate")
-          and emitted("note")[0].get("ask") is True and emitted("note")[0]["reply"] == ASKED,
-          f"front: a question it keeps speaks only a short first sentence, then {ASKED!r}, never its guess "
-          f"{first} {sess.turn_spoken}")
+    check(first == [HOLD] and sess.turn_spoken == [HOLD] and not emitted("delegate")
+          and emitted("note")[0].get("ask") is True and emitted("note")[0]["reply"] == HOLD,
+          f"front: a question it keeps speaks only {HOLD!r}, never its guess {first} {sess.turn_spoken}")
 
     def events_since(n: int) -> list[str]:
         """The [task finished] messages the front was asked to announce since request n."""
@@ -997,7 +995,7 @@ async def selftest_sessions(check: Checker) -> None:
           and not events_since(n) and sess.results.empty(),
           "announcer: a result that came in while the user talked goes into the user's turn, not a later announcement")
 
-    sess.post("speech_start", 1.0)  # again, but the user asks a question and the reply is cut to ASKED
+    sess.post("speech_start", 1.0)  # again, but the user asks a question and the reply is cut to HOLD
     await until(lambda: sess.user_talking)
     n = len(seen)
     await asyncio.to_thread(post, port, "/event", "The second worker finished: two warnings, both harmless.", token)
@@ -1010,7 +1008,7 @@ async def selftest_sessions(check: Checker) -> None:
     asked_turn = seen[n]["messages"] if len(seen) > n else [{"content": ""}]
     check(asked_turn[-1]["content"] == "so what happened?" and len(events) == 1 and "The second worker finished" in
           events[0] and sess.results.empty(),
-          f"announcer: a waiting result whose user turn was cut to {ASKED!r} is announced after it, once {events}")
+          f"announcer: a waiting result whose user turn was cut to {HOLD!r} is announced after it, once {events}")
 
     async def barge_with_waiting(report: str, whole_heard: int) -> list[str]:
         """A result waits while the user talks; the user's turn starts a long reply; the user barges in once
@@ -1039,13 +1037,28 @@ async def selftest_sessions(check: Checker) -> None:
           f"announcer: once two whole sentences of the reply were heard, a cut turn's waiting result is not announced "
           f"again {[e[:60] for e in events]}")
 
-    out.clear()
-    utter("How are you?")
-    await until(lambda: emitted("note"), 5)
-    await turn_done()
-    check(sess.turn_spoken == ["I'm doing well, thanks!"] and emitted("note") == [
-              {"type": "note", "said": "How are you?", "reply": "I'm doing well, thanks!"}],
-          f"front: a short plain answer to a question is spoken whole, and is a note, not an ask {emitted('note')}")
+    async def question(text: str) -> tuple[list[str], list[dict[str, Any]]]:
+        out.clear()
+        utter(text)
+        await until(lambda: emitted("note"), 5)
+        await turn_done()
+        return list(sess.turn_spoken), emitted("note")
+
+    check(sess.tools.work_in_session, "front: work is in session once something was handed off or reported")
+    got = [await question("How are you?"), await question("Did you get that?")]
+    check(got == [([HOLD], [{"type": "note", "said": "How are you?", "reply": HOLD, "ask": True}]),
+                  ([HOLD], [{"type": "note", "said": "Did you get that?", "reply": HOLD, "ask": True}])],
+          f"front: with work in session, even small talk hears only {HOLD!r} and goes to Claude as ask {got}")
+    worked, sess.tools = sess.tools, Delegator()  # as in a new session: nothing handed off or reported yet
+    got = [await question("How are you?"), await question("Did you get that?"), await question("So what was the fix?")]
+    fine = "I'm doing well, thanks!"
+    check(got == [([fine], [{"type": "note", "said": "How are you?", "reply": fine}]),
+                  (["Yes, I got it."], [{"type": "note", "said": "Did you get that?", "reply": "Yes, I got it."}]),
+                  ([HOLD], [{"type": "note", "said": "So what was the fix?", "reply": HOLD, "ask": True}])]
+          and not sess.tools.work_in_session,
+          f"front: with no work in session, a short plain answer is spoken whole as a note, anything else is {HOLD!r} "
+          f"and an ask {got}")
+    sess.tools = worked
 
     sess.post("speech_start", 1.0)  # two results wait for the floor together
     await until(lambda: sess.user_talking)
@@ -1070,6 +1083,15 @@ async def selftest_sessions(check: Checker) -> None:
     await asyncio.sleep(0.6)
     check(len(events_since(n)) == 1 and said().endswith("...") and sess.results.empty(),
           f"announcer: an announcement cut by a barge-in is not announced again {len(events_since(n))}")
+
+    out.clear()
+    n = len(seen)
+    r = await asyncio.to_thread(post, port, "/event", "(nothing to add)", token)
+    await asyncio.sleep(0.5)
+    await turn_done()
+    check(r == 204 and len(seen) == n and sess.results.empty() and said().endswith("...")
+          and any("nothing to say" in o["text"] for o in emitted("log")),
+          f"announcer: a bracket-only result is dropped, never a silent or invented turn {len(seen) - n}")
 
     out.clear()
     tts.started.clear()
