@@ -2,14 +2,19 @@
 server on 127.0.0.1, and the process lifecycle (signals, parent death, a hard deadline on shutdown)."""
 from __future__ import annotations
 
+import datetime
 import hmac
 import json
+import logging
+import logging.handlers
 import os
+import platform
 import signal
 import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import IO, Any, Callable
 
 TOKEN_HEADER = "X-Live-Token"
@@ -62,11 +67,140 @@ def emit(**obj: Any) -> None:
 
 
 def log(text: str) -> None:
+    file_log("INFO", text)
     emit(type="log", text=text)
 
 
 def warn(text: str) -> None:
+    file_log("WARNING", text)
     emit(type="warn", text=text)
+
+
+# =============================================================================================================
+# The persistent log: log(), warn() and everything that reaches stderr (library prints, tracebacks) are also
+# appended to one file, one record per line: ISO time, level, sidecar PID, text. Best effort: it never raises.
+# =============================================================================================================
+LOG_MAX_BYTES = 5 * 1024 * 1024  # one previous file (sidecar.log.1) is kept
+_file_logger: logging.Logger | None = None
+_file_broken = False
+_tee: dict[str, Any] = {}
+logging.addLevelName(25, "STDERR")  # library and C-level output that reached stderr
+_LEVELS = {"INFO": logging.INFO, "WARNING": logging.WARNING, "STDERR": 25}
+
+
+def default_log_path() -> Path:
+    """Next to the model cache (speech.CACHE): LIVE_VIBE_CACHE, else $XDG_CACHE_HOME or ~/.cache, then duplex_voice."""
+    base = os.environ.get("LIVE_VIBE_CACHE") or Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "duplex_voice"
+    return Path(base) / "sidecar.log"
+
+
+class _Formatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        when = datetime.datetime.fromtimestamp(record.created).astimezone().isoformat(timespec="milliseconds")
+        return f"{when} {record.levelname} pid={os.getpid()} {record.getMessage()}"
+
+
+class _Handler(logging.handlers.RotatingFileHandler):
+    def handleError(self, record: logging.LogRecord) -> None:  # noqa: N802 - the logging API's name
+        _disable_file_log("a write failed")
+
+
+def _disable_file_log(why: str) -> None:
+    global _file_broken
+    if _file_broken:
+        return
+    _file_broken = True
+    warn(f"sidecar log file disabled ({why}); the log and warn lines still reach the mod.")
+
+
+def file_log(level: str, text: str) -> None:
+    """Append text to the log file, one record per line. Silent when no file is open or it failed."""
+    lg = _file_logger
+    if lg is None or _file_broken:
+        return
+    try:
+        for line in str(text).splitlines() or [""]:
+            lg.log(_LEVELS.get(level, logging.INFO), line)
+    except Exception:  # noqa: BLE001 - logging must never break the sidecar
+        pass
+
+
+def start_file_log(path: str, header: str) -> Path | None:
+    """Open the log file (empty path: default_log_path()), write the session header and tee stderr into it.
+    Returns the path, or None after one warn() when the file cannot be used."""
+    global _file_logger
+    target = Path(path).expanduser() if path else default_log_path()
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        handler = _Handler(target, maxBytes=LOG_MAX_BYTES, backupCount=1, encoding="utf-8")
+        handler.setFormatter(_Formatter())
+        lg = logging.Logger("live-vibe-sidecar", logging.DEBUG)  # not in the root hierarchy: no other handler sees it
+        lg.addHandler(handler)
+        lg.propagate = False
+        _file_logger = lg
+        file_log("INFO", header)
+        if _file_broken:
+            return None
+    except Exception as e:  # noqa: BLE001 - an unwritable path must not stop the voice
+        _file_logger = None
+        warn(f"sidecar log file {target} is not writable ({type(e).__name__}: {str(e)[:120]}); not logging to a file.")
+        return None
+    _tee_stderr()
+    return target
+
+
+def _tee_stderr() -> None:
+    """Route fd 1 and 2 through a pipe that a thread copies to the original stderr and to the log file, so a
+    library's output reaches the mod exactly as before and the file too. Any failure leaves stderr untouched."""
+    try:
+        sys.stderr.flush()
+        r, w = os.pipe()
+        orig = os.dup(2)
+    except OSError:
+        return
+    os.dup2(w, 2)
+    os.dup2(w, 1)
+    _tee.update(orig=orig, w=w)
+
+    def pump() -> None:
+        pending = b""
+        while True:
+            try:
+                chunk = os.read(r, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            try:
+                os.write(orig, chunk)
+            except OSError:
+                pass  # the mod stopped reading stderr; the file still gets the line
+            pending += chunk
+            *lines, pending = pending.split(b"\n")
+            for ln in lines:
+                file_log("STDERR", ln.decode("utf-8", "replace").rstrip("\r"))
+        if pending:
+            file_log("STDERR", pending.decode("utf-8", "replace"))
+        os.close(r)
+
+    t = threading.Thread(target=pump, name="stderr-tee", daemon=True)
+    t.start()
+    _tee["thread"] = t
+
+
+def stop_file_log() -> None:
+    """Flush the tee before the process ends (the entry point exits with os._exit, which would drop what sits in the pipe)."""
+    t = _tee.pop("thread", None)
+    if t is None:
+        return
+    try:
+        sys.stderr.flush()
+        os.dup2(_tee["orig"], 2)
+        os.dup2(_tee["orig"], 1)
+        os.close(_tee["w"])  # the last write end: the pump sees EOF
+        t.join(2.0)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # -- HTTP control server ----------------------------------------------------------------------------
