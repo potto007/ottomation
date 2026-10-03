@@ -26,26 +26,36 @@ stdout and a loopback HTTP port guarded by a per-run token.
 
 Under WSL2, WSLg carries audio over RDP, and that leg crackles: the speech leaves WSL clean (PulseAudio's
 `RDPSink.monitor` matches a fresh Kokoro render) yet sounds full of static on Windows. With `speakerBackend` on
-`auto` (the default) the sidecar plays speech on Windows instead: it runs `bin/sidecar/win_player.py` with `uv.exe`
-through WSL interop and streams the PCM over the player's stdin, which plays it through WASAPI on the Windows default
-output (or the one whose name contains the `speaker` setting). No network, port or firewall rule is involved, and the
-mic stays on WSLg.
+`auto` (the default) the sidecar plays speech on Windows instead: it runs `win_player.exe`, a small native player
+(Rust, in `win_player/`, shipped prebuilt as `bin/sidecar/win_player.exe`), through WSL interop and streams the PCM
+over its stdin, and the player plays it through WASAPI shared mode on the Windows default output (or the one whose
+name contains the `speaker` setting). No network, port or firewall rule is involved, and the mic stays on WSLg.
 
-- Everything lives in `%LOCALAPPDATA%\live-vibe`: a pinned `uv.exe` (0.10.8, sha256-checked) when none is on the
-  PATH, uv's own cache, a Python if uv must download one, and a copy of the player. Nothing is installed globally.
-  `/live setup` prepares it (about 60 MB the first time) and reports
-  `speaker: Windows player via WASAPI on <device>, <rate> Hz, <latency> ms`.
-- A barge-in cuts within a pipe round trip: the player drops its queue and the device buffer (measured: play()
-  returns 5-6 ms after the cancel, the device restart takes 2 ms).
-- The echo canceller still gets a time-aligned reference: the player reports which samples each device callback
-  took and their DAC time on Windows' clock, ping/pong maps that clock onto the sidecar's (the lowest round trip of
+- Everything lives in `%LOCALAPPDATA%\live-vibe`: a copy of the exe named by its content (`win_player-<sha>.exe`,
+  so an update never overwrites one another session is running). Nothing is installed globally. `/live setup`
+  stages it and reports `speaker: Windows player via WASAPI on <device>, <rate> Hz, <latency> ms`.
+- The exe answers `hello` in about 30 ms and opens the device in about 20 ms (measured through interop). The sidecar
+  pings it from `hello` on, gives the open 30 s, and logs both timings and the player's `opening` progress, so a
+  slow start shows which side stalled.
+- When the exe is missing from the plugin, the sidecar logs that and falls back to `bin/sidecar/win_player.py`, the
+  same player in Python, run by `uv.exe` (a pinned 0.10.8, sha256-checked, when none is on the PATH; uv's cache and
+  any Python it downloads also live in `%LOCALAPPDATA%\live-vibe`, about 60 MB the first time).
+- A barge-in cuts within a pipe round trip: the player drops its queue and the device buffer (measured: the
+  stop, reset and restart of the device takes under 1 ms).
+- The echo canceller still gets a time-aligned reference: the player reports which samples each device period
+  took and their DAC time on Windows' clock (IAudioClock's position), ping/pong maps that clock onto the sidecar's (the lowest round trip of
   the last 32, measured 0.24 ms, so within about 0.1 ms), and the reference lands on the mic stream's clock. What
   stays unmeasured (latency past WASAPI such as a Bluetooth link, the room, and the RDP leg of the mic) only makes the
   reference lead the echo, which AEC3's delay estimator absorbs.
 - The player exits on stdin EOF, which covers the sidecar exiting, crashing or being killed, and after 15 s without
-  the sidecar's once-a-second ping. If it cannot start, one warning says why and the WSLg speaker plays; if it dies
-  mid-session, the WSLg speaker takes over. The sidecar log records the device, rate, latency and any fallback.
+  the sidecar's once-a-second ping (not counting the device open). If it cannot start, one warning says why and the
+  WSLg speaker plays; if it dies mid-session, the WSLg speaker takes over. Either way the sidecar retries the Windows
+  player once in the background and switches back between sentences if it comes up. The sidecar log records the
+  device, rate, latency, the timings and any fallback or retry.
 - `speakerBackend`: `local` keeps the old path (WSLg), `windows` insists on Windows (still falling back with a warning).
+- Rebuilding the exe: `win_player/build.sh` (needs `rustup target add x86_64-pc-windows-gnu` and
+  `sudo apt install gcc-mingw-w64-x86-64`) runs the crate's tests, builds the host binary the `--unit` checks drive
+  with `--fake`, cross-compiles the exe and copies it to `bin/sidecar/win_player.exe`; commit that file.
 
 ## First run
 

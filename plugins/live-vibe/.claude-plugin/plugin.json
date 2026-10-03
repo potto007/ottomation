@@ -53,7 +53,7 @@
     "speakerBackend": {
       "type": "string",
       "title": "Speaker backend",
-      "description": "auto: under WSL, play speech on Windows directly (WASAPI, through a small player uv.exe runs; /live setup prepares it in %LOCALAPPDATA%\\live-vibe), since WSLg's audio adds crackle; elsewhere the local speaker. local: always the local speaker (WSLg under WSL). windows: the Windows player, falling back to local with a warning when it cannot start.",
+      "description": "auto: under WSL, play speech on Windows directly (WASAPI, through win_player.exe, a small native player the plugin ships; /live setup stages it in %LOCALAPPDATA%\\live-vibe), since WSLg's audio adds crackle; elsewhere the local speaker. local: always the local speaker (WSLg under WSL). windows: the Windows player, falling back to local with a warning when it cannot start.",
       "options": ["auto", "local", "windows"],
       "default": "auto"
     },
