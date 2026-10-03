@@ -93,7 +93,8 @@ The file rotates at 5 MB and keeps one previous copy (`sidecar.log.1`). If the p
 | `speaker` | empty | Output device, the same way. With the Windows speaker, part of a Windows device name. |
 | `speakerBackend` | `auto` | `auto`: the Windows player under WSL with interop, else local. `local`: always local (WSLg under WSL). `windows`: the Windows player, falling back to local with a warning. |
 | `logFile` | empty | Sidecar log path; empty means `~/.cache/duplex_voice/sidecar.log`. |
-| `endSilenceMs` | 1500 | Whisper: the pause that ends your turn. Kyutai: only a cap on a pause between words. |
+| `endSilenceMs` | 3000 | Whisper: the pause that ends your turn. Kyutai: the longest pause between words while the model is unsure you are done (1 s after a finished sentence). |
+| `endSilenceLongMs` | 4000 | Kyutai: the pause allowed when the model predicts you will keep talking or the sentence looks unfinished (a trailing comma, `and`, `so`, `the`). |
 | `frontBackend` | `llamacpp` | `llamacpp` (the managed llama-server, or any OpenAI-compatible server that takes `response_format`) or `anthropic` (needs `ANTHROPIC_API_KEY` or `ant auth login`). |
 | `frontUrl` | empty | Empty: a managed llama-server (below). Set: the front's server, which can be another host, such as a GPU box; nothing starts locally. |
 | `frontServerBin` | empty | Managed server: an existing `llama-server` to run instead of the download. |

@@ -129,7 +129,8 @@ def recognizer(check: Report, args: argparse.Namespace):
         progress(f"Whisper {args.asr} and Silero VAD: loading (downloads about 150 MB on first run)")
     t = time.monotonic()
     try:
-        det, transcribe = speech.recognizer(args.stt, args.asr, args.end_silence_ms, lambda: False)
+        det, transcribe = speech.recognizer(args.stt, args.asr, args.end_silence_ms, lambda: False,
+                                               args.end_silence_long_ms)
     except Exception as e:  # noqa: BLE001
         check("recognizer", "fail", f"{type(e).__name__}: {str(e)[:200]}")
         return None

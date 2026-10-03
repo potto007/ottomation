@@ -93,7 +93,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--voice", default="", help="Kokoro voice (af_heart) or say voice (Samantha)")
     ap.add_argument("--tts-device", choices=["auto", "cuda", "cpu"], default="auto", help="where Kokoro runs")
     ap.add_argument("--aec", choices=["on", "off"], default="on", help="echo cancelling on the mic")
-    ap.add_argument("--end-silence-ms", type=int, default=1500)
+    ap.add_argument("--end-silence-ms", type=int, default=3000)
+    ap.add_argument("--end-silence-long-ms", type=int, default=4000,
+                    help="kyutai: the pause allowed when the model forecasts more speech or the text is unfinished")
     ap.add_argument("--mic", default="", help="input device: index or name substring (see --list-devices)")
     ap.add_argument("--speaker", default="", help="output device: index or name substring")
     ap.add_argument("--speaker-backend", choices=["auto", "local", "windows"], default="auto",
@@ -147,7 +149,8 @@ def run(args: argparse.Namespace, life: protocol.Lifecycle) -> int:
     if args.fake_audio:
         build = lambda: (speech.NoSpeech(), str)  # noqa: E731
     else:
-        build = lambda: speech.recognizer(args.stt, args.asr, args.end_silence_ms, guard.active)  # noqa: E731
+        build = lambda: speech.recognizer(args.stt, args.asr, args.end_silence_ms, guard.active,  # noqa: E731
+                                          args.end_silence_long_ms)
     listener = audio.Listener(build, life.quit, guard, aec=sd is not None and args.aec == "on")
     if not args.fake_audio:  # the recognizer has the first claim on the GPU; Kokoro takes what is left
         gpu.hold("stt", speech.stt_gpu_need(args.stt))

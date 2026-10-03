@@ -60,8 +60,14 @@
     "endSilenceMs": {
       "type": "number",
       "title": "Pause that ends an utterance (ms)",
-      "description": "With kyutai, the model decides when you are done (about 0.8 s after you stop) and this only caps a pause between words. With whisper, it is the silence after speech before it is sent; raise it if you get cut off mid-sentence.",
-      "default": 1500
+      "description": "With kyutai, the model decides when you are done (about 0.8 s after you stop); this is the longest pause it waits through when it is unsure, cut to 1 s after a finished sentence. With whisper, it is the silence after speech before it is sent; raise it if you get cut off mid-sentence.",
+      "default": 3000
+    },
+    "endSilenceLongMs": {
+      "type": "number",
+      "title": "Pause allowed mid-thought (ms)",
+      "description": "With kyutai, the pause allowed when the model predicts you will keep talking or your sentence looks unfinished (it ends on a comma or a word like and, so or the); never shorter than the pause above.",
+      "default": 4000
     },
     "frontBackend": {
       "type": "string",
