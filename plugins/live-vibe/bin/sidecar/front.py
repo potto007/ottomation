@@ -154,7 +154,7 @@ class RelayCap:
 
 FRAGMENT_HOLD_S = 2.5  # how long an unfinished utterance waits for the rest of the sentence
 FRAGMENT_PIECES = 4  # at most this many pieces are merged into one utterance
-_OPEN_END = re.compile(r"(?:[,;:\-–—]|\.\.\.|…)\s*$")
+_OPEN_END = re.compile(r"(?:[,;:\-\u2013\u2014]|\.\.\.|\u2026)\s*$")
 _FUNCTION_END = re.compile(
     r"\b(?:a|an|the|and|or|but|so|to|of|in|on|at|for|with|from|by|about|into|than|then|which|who|whose|when|where|"
     r"if|because|as|is|are|was|were|be|been|do|does|did|have|has|had|will|would|could|should|can|need|needs|want|"
