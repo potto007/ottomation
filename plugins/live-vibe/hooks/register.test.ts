@@ -115,9 +115,28 @@ test("live vibe: a delegate carries the user's own words beside the front's read
 
   await $.command.run({ command: 'livevibe', ...typed })
 
-  expect(await prompted).toBe('User said: "So what was the fix?". The voice front read it as a task: Summarize the log '
-    + "report. Answer the user's words; treat the front's reading as a hint, and if it is a question about status or "
+  expect(await prompted).toBe('User said: "So what was the fix?"\nThe voice front read it as a task: Summarize the log '
+    + "report.\nAnswer the user's words; treat the front's reading as a hint, and if it is a question about status or "
     + 'progress, answer from what you know rather than starting new work.')
+  await $.command.run({ command: 'livevibe', ...typed })
+  sidecar.release()
+})
+
+// The live prompt of 2026-10-03: a reading that ends in a full stop got another one ("methods.. Answer").
+test('live vibe: a delegation prompt has one full stop after the reading and the instructions once', async ($, on) => {
+  const sidecar = fakeSidecar(4321, JSON.stringify({ type: 'delegate', said: 'Can you have an agent research this?',
+    text: 'Research end-of-utterance detection and real-time methods.' }))
+  on('process.spawn', sidecar.spawn)
+  on('http.fetch', () => ok)
+  const prompted = new Promise<string>(resolve =>
+    on('prompt.submit', (_$, e) => { resolve(e.text); return { text: e.text } }))
+
+  await $.command.run({ command: 'livevibe', ...typed })
+  const text = await prompted
+
+  expect(text).toContain('read it as a task: Research end-of-utterance detection and real-time methods.\nAnswer')
+  expect(text).not.toContain('..')
+  expect(text.split('rather than starting new work').length).toBe(2)
   await $.command.run({ command: 'livevibe', ...typed })
   sidecar.release()
 })
@@ -316,4 +335,158 @@ test('/live setup without uv says how to install it; /live with other words show
   on('process.run', () => { throw new Error('spawn uv ENOENT') })
   expect((await $.command.run({ command: 'live', ...typed, args: 'setup' })).text).toMatch(/uv is not installed/)
   expect((await $.command.run({ command: 'live', ...typed, args: 'please' })).text).toMatch(/Usage/)
+})
+
+// A sidecar that reports ready, sends `first`, waits for `go()`, sends `later`, and says when each batch is handled.
+function scriptedSidecar(first: string[], later: string[]) {
+  let go = () => {}
+  let firstDone = () => {}
+  let laterDone = () => {}
+  const gate = new Promise<void>(resolve => { go = resolve })
+  const sentFirst = new Promise<void>(resolve => { firstDone = resolve })
+  const sentLater = new Promise<void>(resolve => { laterDone = resolve })
+  let release = () => {}
+  const held = new Promise<void>(resolve => { release = resolve })
+  const state = '{"type":"state","state":"listening"}\n'
+  const spawn = async function* () {
+    yield { stream: 'stdout' as const, text: '{"type":"ready","port":4321,"token":"tok"}\n' }
+    for (const line of first) yield { stream: 'stdout' as const, text: `${line}\n` }
+    yield { stream: 'stdout' as const, text: state }
+    firstDone()
+    await gate
+    for (const line of later) yield { stream: 'stdout' as const, text: `${line}\n` }
+    yield { stream: 'stdout' as const, text: state }
+    laterDone()
+    await held
+    return { value: { code: 0, signal: null } }
+  }
+  return { spawn, go, sentFirst, sentLater, release }
+}
+
+const said = (role: string, text: string, kind?: string) => JSON.stringify({ type: 'transcript', role, text, kind })
+
+test('live vibe: fillers share one short line, a retelling of the answer above is one clipped line', async ($, on) => {
+  const answer = 'Research is launched. A worker is surveying what production voice agents do now for end of turn, '
+    + 'from the papers and the vendor docs. One worker is running.'
+  const sidecar = scriptedSidecar([
+    said('user', 'Can you check the logs?'),
+    said('front', 'Let me check.', 'filler'),
+    said('front', 'Let me check.', 'filler'),
+    said('front', "On it, I've asked.", 'filler'),
+    said('user', 'Thanks.'),
+    said('front', "You're welcome.", 'reply'),
+  ], [
+    said('front', 'Research is launched. A worker is surveying what production voice agents do now for end of turn.', 'relay'),
+    said('front', 'The build passed and nothing is pushed.', 'relay'),
+  ])
+  on('process.spawn', sidecar.spawn)
+  on('http.fetch', () => ok)
+  on('clock.sleep', () => new Promise(() => {})) // a filler's line waits for the next line, not the timer
+  on('turn.complete', (_$, e) => ({ text: e.answer }))
+  const shown: string[] = []
+  const debug: string[] = []
+  on('ui.log', (_$, e) => { (e.to === 'debug' ? debug : shown).push(e.text); return { value: undefined } })
+
+  await $.command.run({ command: 'livevibe', ...typed })
+  await sidecar.sentFirst
+  await $.turn.complete({ answer, durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
+  sidecar.go()
+  await sidecar.sentLater
+
+  expect(shown.slice(0, 4)).toEqual(['you (voice): Can you check the logs?', "spoken: Let me check. (x2) / On it, I've asked.",
+    'you (voice): Thanks.', "voice: You're welcome."])
+  expect(shown[4]).toMatch(/^spoken summary: Research is launched\. A worker .*\u2026 \(repeats the answer above\)$/)
+  expect(shown[4]!.length).toBeLessThan(120)
+  expect(shown[5]).toBe('spoken summary: The build passed and nothing is pushed.')
+  expect(shown.length).toBe(6)
+  expect(debug.some(d => d.includes('spoken in full: Research is launched. A worker is surveying'))).toBe(true)
+  await $.command.run({ command: 'livevibe', ...typed })
+  sidecar.release()
+})
+
+test("live vibe: a filler alone gets its line when the timer runs out; one Claude's answer beat is dropped", async ($, on) => {
+  const sidecar = scriptedSidecar([said('front', 'Let me check.', 'filler')], [said('front', 'On it.', 'filler')])
+  on('process.spawn', sidecar.spawn)
+  on('http.fetch', () => ok)
+  on('turn.complete', (_$, e) => ({ text: e.answer }))
+  let wake = () => {}
+  on('clock.sleep', () => new Promise(resolve => { wake = () => resolve({ value: undefined }) }))
+  const shown: string[] = []
+  const debug: string[] = []
+  let logged = () => {}
+  on('ui.log', (_$, e) => { (e.to === 'debug' ? debug : shown).push(e.text); logged(); return { value: undefined } })
+
+  await $.command.run({ command: 'livevibe', ...typed })
+  await sidecar.sentFirst
+  expect(shown).toEqual([])
+  const landed = new Promise<void>(resolve => { logged = resolve })
+  wake()
+  await landed
+  expect(shown).toEqual(['spoken: Let me check.'])
+
+  sidecar.go()
+  await sidecar.sentLater
+  await $.turn.complete({ answer: 'Done: all 41 pass.', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
+  expect(shown).toEqual(['spoken: Let me check.'])
+  expect(debug.some(d => d.includes('spoken: On it. (dropped: the answer came first)'))).toBe(true)
+  await $.command.run({ command: 'livevibe', ...typed })
+  sidecar.release()
+})
+
+const prompt = 'User said: "Can you research this?"\nThe voice front read it as a task: Research end-of-turn detection.\n'
+  + "Answer the user's words; treat the front's reading as a hint."
+
+for (const surface of ['terminal', 'desktop'] as const) {
+  test(`live vibe: its voice prompt is one dim line until expanded (${surface})`, async ($, on) => {
+    on('ui.render', () => ({ type: 'Text', props: {}, children: ['engine row'] }))
+    const origin = { kind: 'plugin', name: 'live-vibe', asUser: true } as const
+    const collapsed = await $.ui.mount({ plugin: 'live-vibe', surface, component: 'UserMessage',
+      props: { text: prompt, origin, isExpanded: false } })
+    expect((await collapsed.find({ type: 'Text' }))?.text)
+      .toBe('front prompt (3 lines, ctrl+o to expand): task: Research end-of-turn detection.')
+
+    const expanded = await $.ui.mount({ plugin: 'live-vibe', surface, component: 'UserMessage',
+      props: { text: prompt, origin, isExpanded: true } })
+    expect(await expanded.find({ text: /front prompt/ })).toBeUndefined()
+    expect((await expanded.find({ type: 'Text' }))?.text).toBe('engine row')
+
+    const typedRow = await $.ui.mount({ plugin: 'live-vibe', surface, component: 'UserMessage',
+      props: { text: 'Fix the parser', origin, isExpanded: false } })
+    expect(await typedRow.find({ text: /front prompt/ })).toBeUndefined()
+  })
+}
+
+for (const surface of ['terminal', 'desktop'] as const) {
+  test(`live vibe: a turn with nothing to add is one dim "no update" line (${surface})`, async ($, on) => {
+    on('ui.render', () => ({ type: 'Text', props: {}, children: ['engine row'] }))
+    for (const text of ['(nothing to add)', ' (Nothing to add.) ']) {
+      const row = await $.ui.mount({ plugin: 'live-vibe', surface, component: 'AssistantMessage',
+        props: { text, isFirstOfReply: true } })
+      expect((await row.find({ type: 'Text' }))?.text).toBe('no update (nothing to add)')
+    }
+    const real = await $.ui.mount({ plugin: 'live-vibe', surface, component: 'AssistantMessage',
+      props: { text: 'Nothing to add yet; the worker still runs.', isFirstOfReply: true } })
+    expect((await real.find({ type: 'Text' }))?.text).toBe('engine row')
+  })
+}
+
+// A worker's notification that repeats a report already given: Claude answers "(nothing to add)", whatever started
+// the turn, and the front hears nothing; the relay prompt tells Claude so.
+test("live vibe: a notification turn's '(nothing to add)' is not relayed, and the relay prompt asks for it", async ($, on) => {
+  const posts: string[] = []
+  const sidecar = fakeSidecar(4321)
+  on('process.spawn', sidecar.spawn)
+  on('turn.complete', (_$, e) => ({ text: e.answer }))
+  on('http.fetch', (_$, e) => { posts.push(e.url); return ok })
+  on('prompt.compose', () => ({ sections: [] }))
+
+  await $.command.run({ command: 'livevibe', ...typed })
+  await sidecar.isUp
+  const relay = (await $.prompt.compose(compose(['Read', 'Agent']))).sections.find(x => x.id === 'live-vibe:relay')
+  expect(relay?.text).toContain("a worker's notification that repeats what you already reported")
+  expect(relay?.text).toContain('reply with exactly: (nothing to add)')
+  await $.turn.complete({ answer: '(nothing to add)', durationMs: 1, isAborted: false, turnId: 'n1', reason: 'answer' })
+  expect(posts).toEqual([])
+  await $.command.run({ command: 'livevibe', ...typed })
+  sidecar.release()
 })

@@ -45,7 +45,7 @@ Live voice is ON. The user is speaking, and your final answer of each turn is re
 
 // In live vibe the user talks to a small voice model; Claude's answers reach them only through its summary.
 const RELAY_SECTION = `<live-vibe-relay>
-Live vibe is ON. The user is talking to a voice front, a small fast model that hands their spoken requests to you and relays your final answer of each turn back to them, summarized in one or two spoken sentences. End every turn with a concise plain-text report the front can summarize: what you did, what you found or changed, whether it is verified, and whether work is still running in the background (workers spawned, results pending). No spoken style needed, but lead with the outcome and leave out long listings unless asked. A bracketed note such as "[The user, by voice, adds ...]" is a live addition to act on at once. A request that starts "User said:" quotes the user's own words, then the front's reading of them; where they differ, go by the user's words. A note "[The user, by voice, to the voice front (no task asked): ...]" is information, such as a confirmation, a correction or a decision: take it as fact from the user in your next answer; it needs no reply of its own.
+Live vibe is ON. The user is talking to a voice front, a small fast model that hands their spoken requests to you and relays your final answer of each turn back to them, summarized in one or two spoken sentences. End every turn with a concise plain-text report the front can summarize: what you did, what you found or changed, whether it is verified, and whether work is still running in the background (workers spawned, results pending). No spoken style needed, but lead with the outcome and leave out long listings unless asked. A bracketed note such as "[The user, by voice, adds ...]" is a live addition to act on at once. A request that starts "User said:" quotes the user's own words, then the front's reading of them; where they differ, go by the user's words. A note "[The user, by voice, to the voice front (no task asked): ...]" is information, such as a confirmation, a correction or a decision: take it as fact from the user in your next answer; it needs no reply of its own. When a turn brings the user nothing new (a worker's notification that repeats what you already reported, a result already relayed), reply with exactly: (nothing to add). The front then says nothing, and the transcript shows one dim "no update" line.
 </live-vibe-relay>`
 
 // A whole utterance that only asks for another model ("switch to sonnet", "change the model to opus please", "use haiku").
@@ -61,6 +61,103 @@ function spokenModel(text: string): string | undefined {
 // are we doing?" handed off as "Review the current status of all running tasks and logs").
 const READING = "Answer the user's words; treat the front's reading as a hint, and if it is a question about status or "
   + 'progress, answer from what you know rather than starting new work.'
+
+// A delegation as Claude reads it: the user's words, the front's reading, then READING, one per line. The reading
+// gets a full stop only when it lacks one (a reading that ended in "." once came out "methods.. Answer").
+function closed(text: string) {
+  const t = text.trim()
+  return /[.!?\u2026]["')\]]*$/.test(t) ? t : `${t}.`
+}
+
+function delegationPrompt(said: string, reading: string) {
+  return `User said: "${said}"\nThe voice front read it as a task: ${closed(reading)}\n${READING}`
+}
+
+function delegationSteer(said: string, reading: string) {
+  return `[The user, by voice, adds while you work: "${said}" The voice front read it as a task: ${closed(reading)} ${READING}]`
+}
+
+// -- what the transcript shows in live vibe ---------------------------------------------------------------------------
+// The engine leads every $.ui.log line with "live-vibe: " and draws it dim. A log row has no collapsed state, so the
+// lines that repeat what is already on screen are one short line, the collapsed form; the prompts the plugin submits
+// are UserMessage rows, which the ui.render hook below draws as one dim line until ctrl+o expands the transcript.
+const FILLER_FLUSH_MS = 1500 // an acknowledgement waits this long for another to join its line
+const ANSWERS_KEPT = 3 // Claude's last answers, which a retelling may repeat
+
+let answers: string[] = []
+let filler: { parts: { text: string; n: number }[]; gen: number } | null = null
+let fillerGen = 0
+const voicePrompts: string[] = [] // prompts submitted for the voice in live vibe, drawn collapsed
+
+function clip(text: string, max: number) {
+  const t = text.replace(/\s+/g, ' ').trim()
+  return t.length <= max ? t : `${t.slice(0, max - 1).replace(/\s+\S*$/, '')}\u2026`
+}
+
+function wordsOf(text: string) {
+  return text.toLowerCase().match(/[a-z0-9']+/g) ?? []
+}
+
+// A retelling that is nearly all words of an answer on screen says nothing new: seen live, the front read Claude's
+// whole answer back and the transcript showed it twice.
+function repeats(spoken: string, shown: readonly string[]) {
+  const words = wordsOf(spoken)
+  if (words.length === 0) return false
+  return shown.some(answer => {
+    const vocabulary = new Set(wordsOf(answer))
+    return words.filter(w => vocabulary.has(w)).length / words.length >= 0.8
+  })
+}
+
+function fillerLine(parts: { text: string; n: number }[]) {
+  return `spoken: ${parts.map(p => (p.n > 1 ? `${p.text} (x${p.n})` : p.text)).join(' / ')}`
+}
+
+function flushFiller($: EngineInterface) {
+  if (!filler) return
+  const { parts } = filler
+  filler = null
+  $.ui.log(fillerLine(parts))
+}
+
+// "Let me check.", "On it, I've asked.": spoken, then one short line; back-to-back ones share it.
+function holdFiller($: EngineInterface, text: string) {
+  if (!filler) {
+    const gen = ++fillerGen
+    filler = { parts: [], gen }
+    void $.clock.sleep(FILLER_FLUSH_MS).then(() => { if (filler?.gen === gen) flushFiller($) }).catch(() => {})
+  }
+  const last = filler.parts.at(-1)
+  if (last && last.text === text) last.n += 1
+  else filler.parts.push({ text, n: 1 })
+}
+
+function showTranscript($: EngineInterface, msg: Record<string, unknown>) {
+  const text = String(msg.text ?? '').trim()
+  if (!text) return
+  if (msg.role === 'user') {
+    flushFiller($)
+    $.ui.log(`you (voice): ${text}`)
+    return
+  }
+  if (msg.kind === 'filler') return holdFiller($, text)
+  flushFiller($)
+  if (msg.kind !== 'relay') return $.ui.log(`voice: ${text}`)
+  if (!repeats(text, answers)) return $.ui.log(`spoken summary: ${text}`)
+  $.ui.log(`spoken summary: ${clip(text, 72)} (repeats the answer above)`)
+  $.ui.log(`live: spoken in full: ${text}`, { to: 'debug' })
+}
+
+// The collapsed line for a prompt this plugin submitted for the voice, or undefined to draw the row as the engine does.
+function promptHeader(text: string) {
+  const lines = text.split('\n').length
+  const head = `front prompt (${lines} line${lines === 1 ? '' : 's'}, ctrl+o to expand)`
+  const task = /^User said: "[\s\S]*"\nThe voice front read it as a task: (.*)\n/.exec(text)
+  if (task) return `${head}: task: ${clip(task[1] ?? '', 100)}`
+  if (text.startsWith('User asked by voice: ')) return `${head}: your question, for Claude to answer`
+  if (text.startsWith('User said, answering your last question: ')) return `${head}: your answer to Claude's question`
+  return voicePrompts.includes(text) ? head : undefined
+}
 
 // Claude's whole answer to a voice question when the front's own holding line already says enough: never posted.
 const NOTHING_TO_ADD = '(nothing to add)'
@@ -116,9 +213,13 @@ async function stopLive($: EngineInterface) {
 
 // Steer a running main-loop turn (the row reaches the model at its next step; nothing is aborted), or start one.
 async function toClaude($: EngineInterface, text: string, steer: string) {
-  const { turnId } = await read($, live)
-  if (turnId) await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: steer }] } })
-  else void $.prompt.submit({ text, asUser: true })
+  const { turnId, mode } = await read($, live)
+  if (turnId) {
+    await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: steer }] } })
+    return
+  }
+  if (mode === 'livevibe') voicePrompts.splice(0, Math.max(0, voicePrompts.push(text) - 50))
+  void $.prompt.submit({ text, asUser: true })
 }
 
 async function onSidecar($: EngineInterface, msg: Record<string, unknown>) {
@@ -150,8 +251,7 @@ async function onSidecar($: EngineInterface, msg: Record<string, unknown>) {
         await toClaude($, text, `[The user, by voice, adds a request while you work: "${text}". Take it into account now.]`)
         break
       }
-      await toClaude($, `User said: "${said}". The voice front read it as a task: ${text}. ${READING}`,
-        `[The user, by voice, adds while you work: "${said}". The voice front read it as a task: ${text}. ${READING}]`)
+      await toClaude($, delegationPrompt(said, text), delegationSteer(said, text))
       break
     }
     // A user turn the front answered itself: a confirmation, a correction or a decision is still Claude's to know.
@@ -181,7 +281,7 @@ async function onSidecar($: EngineInterface, msg: Record<string, unknown>) {
       switchModel($, String(msg.model), (await read($, live)).turnId !== null)
       break
     case 'transcript':
-      $.ui.log(`${msg.role === 'user' ? 'you (voice)' : 'voice'}: ${String(msg.text)}`)
+      showTranscript($, msg)
       break
     case 'spoken':
       if (msg.cut) {
@@ -221,7 +321,7 @@ function startSidecar($: EngineInterface, options: PluginOptions, mode: LiveMode
     await status($)
     const argv = ['uv', 'run', '--script', `${$.plugin.root}/bin/sidecar/main.py`,
       '--mode', mode === 'livevibe' ? 'front' : 'live', '--stt', String(options.stt), '--asr', String(options.asr),
-      '--tts', String(options.tts), '--end-silence-ms', String(options.endSilenceMs)]
+      '--tts', String(options.tts), '--end-silence-ms', String(options.endSilenceMs), '--end-silence-long-ms', String(options.endSilenceLongMs ?? 4000)]
     if (options.voice) argv.push('--voice', String(options.voice))
     if (options.mic) argv.push('--mic', String(options.mic))
     if (options.speaker) argv.push('--speaker', String(options.speaker))
@@ -288,7 +388,7 @@ function setupVoice($: EngineInterface, options: PluginOptions) {
     $.ui.status('setup: installing the Python packages (a minute or two on first run)')
     const argv = ['uv', 'run', '--script', `${$.plugin.root}/bin/sidecar/main.py`, '--setup',
       '--stt', String(options.stt), '--asr', String(options.asr), '--tts', String(options.tts),
-      '--end-silence-ms', String(options.endSilenceMs), '--front-backend', String(options.frontBackend),
+      '--end-silence-ms', String(options.endSilenceMs), '--end-silence-long-ms', String(options.endSilenceLongMs ?? 4000), '--front-backend', String(options.frontBackend),
       '--front-url', String(options.frontUrl), ...frontServerArgv(options)]
     if (options.voice) argv.push('--voice', String(options.voice))
     if (options.mic) argv.push('--mic', String(options.mic))
@@ -454,12 +554,34 @@ export const register: Register = (on, options) => {
     await update($, live, x => ({ ...x, turnId: null }))
     if (e.reason === 'answer' && e.answer.trim()) {
       if (!nothingToAdd(e.answer)) void post($, replyPath(l), e.answer)
+      answers = [e.answer, ...answers].slice(0, ANSWERS_KEPT)
+      // An acknowledgement still waiting for its line would land under the answer it stood in for.
+      if (filler) $.ui.log(`live: ${fillerLine(filler.parts)} (dropped: the answer came first)`, { to: 'debug' })
+      filler = null
     }
     // The front is waiting on a result; tell it the work stopped rather than leave it silent.
     else if (l.mode === 'livevibe' && (e.reason === 'error' || e.reason === 'refusal')) {
       void post($, '/event', e.reason === 'error' ? 'The work stopped on an error before it finished.' : 'That request was declined.')
     }
     return next(e)
+  })
+
+  // The prompts live vibe submits for the voice (the user's words, the front's reading, the instructions) are one dim
+  // line in the transcript, as a thinking block is; ctrl+o draws them whole, and Claude reads them whole either way.
+  on('ui.render', { component: 'UserMessage', props: { origin: { kind: 'plugin' } } }, async ($, e, next) => {
+    const { origin, text, isExpanded } = e.props
+    const head = !isExpanded && origin.kind === 'plugin' && origin.name === PLUGIN ? promptHeader(text) : undefined
+    if (!head) return next(e)
+    const { Text } = $.ui.resolve(e)
+    return <Text dimColor>{head}</Text>
+  })
+
+  // A turn with nothing new ("(nothing to add)", from any turn: a voice question, a worker's notification) is one dim
+  // line; the front never hears it (turn.complete). ctrl+o shows the stored message.
+  on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => {
+    if (!nothingToAdd(e.props.text)) return next(e)
+    const { Text } = $.ui.resolve(e)
+    return <Text dimColor>no update (nothing to add)</Text>
   })
 
   on('prompt.submit', async ($, e, next) => {

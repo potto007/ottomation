@@ -29,10 +29,10 @@ from .checks_front_server import front_server_units
 from .checks_winplayer import winplayer_units
 from .audio import FRAME, SR, CannotStart, Player, check_devices, SentenceSplitter, Tuning, TurnDetector, Voice, speakable
 from .echo import EchoCanceller, EchoGuard, EchoReference
-from .front import (ACK, EVENT, EVENT_CHARS, HISTORY_MAX, HOLD, INTERRUPTED, RETELL, WAITING, _FALLBACKS,
-                    _NO_EFFORT, Brain, Delegator, FrontSession, LlamaCppBrain, SpeechFilter, TurnStream,
-                    acknowledgement, event_message, held_answer, is_turn_start, make_brain, parse_sse,
-                    report_brief, retellable, spoken_model, warm_up)
+from .front import (ACK, EVENT, EVENT_CHARS, FRAGMENT_HOLD_S, HISTORY_MAX, HOLD, INTERRUPTED, RELAY_CHARS, RETELL,
+                    WAITING, _FALLBACKS, _NO_EFFORT, Brain, Delegator, FrontSession, LlamaCppBrain, RelayCap,
+                    SpeechFilter, TurnStream, acknowledgement, event_message, held_answer, is_turn_start,
+                    looks_unfinished, make_brain, parse_sse, report_brief, retellable, spoken_model, warm_up)
 from .session import LiveSession
 from .speech import BARGE_IN_WORDS, KYUTAI_BLOCK, KYUTAI_SR, KyutaiTurns, Pauses, SilentTTS, check_tts, turn_tail
 
@@ -593,6 +593,33 @@ def report_units(check: Checker) -> None:
     got = report_brief("One change fixed it.\n\n| a | b |\n|---|---|\n\n**Why:** WSLg.\n\n**Still open:** echo. Test it?")
     check(got == "One change fixed it.\n\n**Still open:** echo. Test it?",
           f"report brief: a paragraph led by bold text is prose, so it can be the tail {got!r}")
+    def capped(sentences: list[str], report: str = "") -> list[str]:
+        protocol.capture([])  # its log lines
+        try:
+            cap = RelayCap(report)
+            return [t for s in sentences for t in cap.push(s)] + cap.finish()
+        finally:
+            protocol.capture(None)
+
+    got = capped(["Research is launched.", "A worker is surveying end of turn.", "It reads five papers.",
+                  "One worker is running."])
+    check(got == ["Research is launched.", "A worker is surveying end of turn."],
+          f"relay cap: a retelling speaks at most two sentences, whatever the model writes {got}")
+    got = capped(["Fixed it.", "All 41 pass.", "It took three tries.", "Shall I push it?"])
+    check(got == ["Fixed it.", "All 41 pass.", "Shall I push it?"],
+          f"relay cap: a closing question past the cap is still asked {got}")
+    long_ = "x" * 200 + "."
+    got = capped([long_, "y" * 100 + "."])
+    check(got == [long_], f"relay cap: past {RELAY_CHARS} characters, the rest is not spoken {[len(g) for g in got]}")
+    got = capped([], "Fixed parser.py. All 41 tests pass. Not pushed. Want me to push it?")
+    check(got == ["Fixed parser.py.", "All 41 tests pass."],
+          f"relay cap: a retelling with nothing to say falls back to the report's first sentences {got}")
+    unfinished = ["Also, we need", "to resolve how this handles the", "So,", "and then...", "I want to"]
+    whole = ["Fix the failing test.", "what time is it", "tell me something long", "okay goodbye", "yes, perfect",
+             "Is it done?", "explain it to me", ""]
+    got = [t for t in unfinished if not looks_unfinished(t)] + [t for t in whole if looks_unfinished(t)]
+    check(not got, f"unfinished utterance: an open end or a closing function word, never a whole one {got}")
+
     msg = event_message('Done. Want me to run "make test" now?')
     check(msg == f"{EVENT} \"Done. Want me to run 'make test' now?\"\n{RETELL}" and "do not answer" in RETELL,
           f"event message: the report quoted, then the retell reminder, so its question is not the last word {msg!r}")
@@ -896,6 +923,8 @@ def fake_front() -> tuple[str, list[dict[str, Any]]]:
             delay = 0.0
             if text.startswith(EVENT) and "next steps" in text:  # a small model re-delegating a result's to-dos
                 deltas = turn("I'll get the test sentences playing.", "Play the test sentences and report back")
+            elif text.startswith(EVENT) and "asks at the end" in text:
+                deltas = turn("".join(f"Point {i} is covered here. " for i in range(5)) + "Shall I push it?")
             elif text.startswith(EVENT) and "long report" in text:
                 deltas = turn("".join(f"Report sentence {i} goes on for a while here. " for i in range(10)))
             elif text.startswith(EVENT):
@@ -931,6 +960,8 @@ def fake_front() -> tuple[str, list[dict[str, Any]]]:
             elif "explain it" in text:  # a delegating turn whose say answers from memory
                 deltas = turn("I don't have information about how it was done. The steps are not recorded.",
                               "Review the changes and explain how the static was fixed")
+            elif "rest of it" in text:
+                deltas = turn("On it.", "Finish the rest of it")
             elif "fix" in text:
                 deltas = turn("On it.", "Fix the failing test in parser.py")
             else:
@@ -1060,7 +1091,8 @@ async def selftest_sessions(check: Checker) -> None:
     check([m["role"] for m in brain.history] == ["user", "assistant"] and said() == "On it."
           and delegated() == "Fix the failing test in parser.py" and "[" not in said(),
           f"front: history keeps the turn as the model answers it, words and delegation apart {brain.history}")
-    check([o["role"] for o in emitted("transcript")] == ["user", "front"], "front: transcript, user then front")
+    check([(o["role"], o.get("kind")) for o in emitted("transcript")] == [("user", None), ("front", "filler")],
+          f"front: transcript, user then front, a delegation's acknowledgement marked filler {emitted('transcript')}")
     check(not emitted("note"), "front: a turn that delegates sends no note")
 
     n = len(brain.history)
@@ -1261,6 +1293,38 @@ async def selftest_sessions(check: Checker) -> None:
     check(r == 204 and len(seen) == n and sess.results.empty() and said().endswith("...")
           and any("nothing to say" in o["text"] for o in emitted("log")),
           f"announcer: a bracket-only result is dropped, never a silent or invented turn {len(seen) - n}")
+
+    out.clear()
+    await asyncio.to_thread(post, port, "/event", "A report that asks at the end.", token)
+    await until(lambda: emitted("transcript"), 5)
+    shown_while_speaking = sess.turn_running()
+    await turn_done()
+    relay = emitted("transcript")
+    check(sess.turn_spoken == ["Point 0 is covered here.", "Point 1 is covered here.", "Shall I push it?"]
+          and [(o["role"], o["kind"], o["text"]) for o in relay] == [("front", "relay", " ".join(sess.turn_spoken))],
+          f"announcer: a long retelling is cut to two sentences and its closing question {sess.turn_spoken}")
+    check(shown_while_speaking, "announcer: the retelling is on screen once written, while the voice still reads it")
+
+    out.clear()
+    utter("Also, we need")
+    await asyncio.sleep(0.5)
+    held_back = not emitted("transcript") and not sess.turn_running() and bool(sess.fragment)
+    utter("to finish the rest of it.")
+    await until(lambda: emitted("delegate"), 5)
+    await turn_done()
+    users = [o["text"] for o in emitted("transcript") if o["role"] == "user"]
+    check(held_back and users == ["Also, we need to finish the rest of it."]
+          and [d.get("said") for d in emitted("delegate")] == ["Also, we need to finish the rest of it."],
+          f"fragment: an unfinished utterance waits for its rest and goes on as one {users} {emitted('delegate')}")
+    out.clear()
+    t0 = time.monotonic()
+    utter("So the thing is")
+    await until(lambda: emitted("transcript"), FRAGMENT_HOLD_S + 3)
+    waited = time.monotonic() - t0
+    await turn_done()
+    users = [o["text"] for o in emitted("transcript") if o["role"] == "user"]
+    check(users == ["So the thing is"] and FRAGMENT_HOLD_S - 0.2 <= waited < FRAGMENT_HOLD_S + 1.5,
+          f"fragment: with nothing after it, a held utterance goes on alone after {FRAGMENT_HOLD_S} s ({waited:.1f} s)")
 
     out.clear()
     tts.started.clear()
