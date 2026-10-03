@@ -27,8 +27,8 @@ import numpy as np
 from . import gpu, protocol
 from .audio import FRAME, SR, CannotStart, Player, check_devices, SentenceSplitter, Tuning, TurnDetector, Voice, speakable
 from .echo import EchoCanceller, EchoGuard, EchoReference
-from .front import (EVENT, HISTORY_MAX, _FALLBACKS, _NO_EFFORT, Brain, Delegator, FrontSession, LlamaCppBrain,
-                    make_brain, parse_sse, spoken_model, warm_up)
+from .front import (EVENT, HISTORY_MAX, INTERRUPTED, _FALLBACKS, _NO_EFFORT, Brain, Delegator, FrontSession,
+                    LlamaCppBrain, SpeechFilter, is_turn_start, make_brain, parse_sse, spoken_model, warm_up)
 from .session import LiveSession
 from .speech import BARGE_IN_WORDS, KYUTAI_BLOCK, KYUTAI_SR, KyutaiTurns, SilentTTS, check_tts
 
@@ -261,6 +261,77 @@ def gpu_budget(check: Checker) -> None:
           f"whisper: CPU on a full GPU, one log line {said}")
 
 
+def tool_pairs_ok(history: list[dict[str, Any]]) -> bool:
+    """Every OpenAI tool result answers a call made earlier in the history, and every call is answered."""
+    asked: set[str] = set()
+    answered: set[str] = set()
+    for m in history:
+        asked |= {c["id"] for c in m.get("tool_calls") or []}
+        if m["role"] == "tool":
+            if m["tool_call_id"] not in asked:
+                return False
+            answered.add(m["tool_call_id"])
+    return asked == answered
+
+
+def front_history(check: Checker) -> None:
+    """The front's history shape: delegations as structured tool calls (never bracketed text among the words),
+    a cut turn flagged on the next user message, trimming by whole turns, and the speech filter."""
+    b = Brain()
+    b.begin("fix the parser")
+    call = {"role": "assistant", "content": None, "tool_calls": [
+        {"id": "c1", "type": "function", "function": {"name": "delegate", "arguments": '{"request": "Fix it"}'}}]}
+    b.record(call, {"role": "tool", "tool_call_id": "c1", "content": "Handed off"})
+    said = b.commit("On it.", False)
+    roles = [m["role"] for m in b.history]
+    words = [m["content"] for m in b.history if m["role"] == "assistant" and m["content"]]
+    check(said == "On it." and roles == ["user", "assistant", "tool", "assistant"] and words == ["On it."]
+          and not any("[" in w for w in words) and tool_pairs_ok(b.history),
+          f"front history: a delegation is a tool call and its result, the words stay clean {roles}")
+    b.begin("tell me more")
+    said = b.commit("Well, the first...", True)
+    b.begin("stop")
+    check(b.history[-1]["content"] == f"{INTERRUPTED} stop" and not any("cut off" in str(m["content"]) for m in b.history),
+          "front history: a cut turn is flagged on the next user message, not among the assistant's words")
+    b.commit("", False)
+    check(b.history[-1]["role"] == "user", "front history: nothing heard, no assistant message")
+
+    b = Brain()
+    for i in range(HISTORY_MAX):
+        b.begin(f"u{i}")
+        b.record({"role": "assistant", "content": None, "tool_calls": [
+            {"id": f"c{i}", "type": "function", "function": {"name": "delegate", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": f"c{i}", "content": "ok"})
+        b.commit(f"a{i}", False)
+        b.begin(f"chat{i}")
+        b.commit(f"sure{i}", False)
+    b.begin("last")
+    check(len(b.history) <= HISTORY_MAX and is_turn_start(b.history[0]) and tool_pairs_ok(b.history),
+          f"front history: trimming drops whole turns, no orphan tool call or result ({len(b.history)} messages)")
+    a = Brain()
+    a.history = [{"role": "user", "content": "x"}, {"role": "assistant", "content": [{"type": "tool_use", "id": "t"}]},
+                 {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t"}]}]
+    check(is_turn_start(a.history[0]) and not is_turn_start(a.history[2]),
+          "front history: an Anthropic tool_result message is not a turn start")
+
+    def filtered(deltas: list[str]) -> tuple[str, list[str], list[str]]:
+        f = SpeechFilter()
+        out = "".join(f.push(d) for d in deltas) + f.flush()
+        return out, f.notes, f.delegations()
+
+    got = filtered(["<th", "ink>\n\n</th", "ink>\n\nI'm doing well."])
+    check(got[0].strip() == "I'm doing well." and not got[1], f"speech filter: a think block split across deltas {got}")
+    got = filtered(["<think>plan", " this</think>Fine. 2 < 3, and a <b>."])
+    check(got[0] == "Fine. 2 < 3, and a <b>.", f"speech filter: thinking dropped, other angle brackets kept {got}")
+    got = filtered(["On it. [deleg", "ated: Open the parser file and fix the te", "st] Back soon."])
+    check(got[0] == "On it.  Back soon." and got[2] == ["Open the parser file and fix the test"],
+          f"speech filter: a delegation note is not spoken and becomes a request {got}")
+    got = filtered(["Done. [cut off by the user]", " [delegated: half a note"])
+    check(got[0].strip() == "Done." and got[2] == ["half a note"], f"speech filter: notes, even unclosed, are silent {got}")
+    got = filtered(["[", "x" * 500, " tail"])
+    check(got[0].startswith("[x") and got[0].endswith("tail"), "speech filter: a lone '[' in long text is spoken")
+
+
 def units() -> int:
     check = Checker()
 
@@ -329,10 +400,11 @@ def units() -> int:
     b = Brain()
     for i in range(HISTORY_MAX):
         b.begin(f"u{i}")
-        b.commit(f"a{i}", [], False)
+        b.commit(f"a{i}", False)
     b.begin("last")
     check(len(b.history) <= HISTORY_MAX and b.history[0]["role"] == "user" and b.history[-1]["content"] == "last",
           f"front history capped at {HISTORY_MAX}, starting on a user turn")
+    front_history(check)
 
     class NoDevices:
         def query_devices(self, device=None, kind=None):
@@ -466,6 +538,10 @@ def fake_front() -> tuple[str, list[dict[str, Any]]]:
                 deltas = [{"content": "All the tests pass now."}]
             elif "goodbye" in text.lower():
                 deltas = [{"content": "Goodbye."}]
+            elif "thinking leak" in text:
+                deltas = [{"content": "<think>\n\n</th"}, {"content": "ink>\n\nHello there."}]
+            elif "notecall" in text:
+                deltas = [{"content": "Sure. [delegated: Rebuild"}, {"content": " the index]"}]
             elif "garbled" in text:
                 raw, deltas = ["data: {not json"], [{"content": "Still here."}]
             elif "badargs" in text:
@@ -578,7 +654,10 @@ async def selftest_sessions(check: Checker) -> None:
     await until(lambda: emitted("delegate"))
     await turn_done()
     check(emitted("delegate") == [{"type": "delegate", "text": "Fix the failing test in parser.py"}], f"front: utterance -> delegate {emitted('delegate')}")
-    check("[delegated: Fix the failing test" in brain.history[-1]["content"], f"front: spoke and noted the delegation {brain.history[-1]['content']!r}")
+    asked, answer, words = brain.history[-3:]
+    check(asked.get("tool_calls", [{}])[0].get("function", {}).get("name") == "delegate" and answer["role"] == "tool"
+          and answer["tool_call_id"] == asked["tool_calls"][0]["id"] and words["content"] == "On it. I'll let you know.",
+          f"front: the delegation is a tool call and result in history, the words carry no note {brain.history[-3:]}")
     check([o["role"] for o in emitted("transcript")] == ["user", "front"], "front: transcript, user then front")
 
     n = len(brain.history)
@@ -618,10 +697,9 @@ async def selftest_sessions(check: Checker) -> None:
           "voice: the next sentence is synthesized while the current one plays")
     sess.post("speech_start", 1.0)
     await turn_done()
-    last = brain.history[-1]["content"]
-    spoken = last.removesuffix(" [cut off by the user]")
-    check(last.endswith("[cut off by the user]") and spoken.endswith("...") and "sentence number 0 of a long answer." in spoken
-          and "number 11" not in spoken, f"barge-in: cuts the front, commits only what was heard {last!r}")
+    spoken = brain.history[-1]["content"]
+    check(brain.interrupted and spoken.endswith("...") and "sentence number 0 of a long answer." in spoken
+          and "number 11" not in spoken, f"barge-in: cuts the front, commits only what was heard {spoken!r}")
     sess.post("discard", None)
     await until(lambda: sess.state == "listening")
 
@@ -630,12 +708,13 @@ async def selftest_sessions(check: Checker) -> None:
     await asyncio.sleep(0.3)
     r = await asyncio.to_thread(post, port, "/stop", "", token)
     await turn_done()
-    check(r == 204 and brain.history[-1]["content"].endswith("[cut off by the user]"), "POST /stop cuts the front")
+    check(r == 204 and brain.interrupted and brain.history[-1]["content"].endswith("..."), "POST /stop cuts the front")
 
     out.clear()
     utter("boom")
     await until(lambda: emitted("delegate"))
     await turn_done()
+    check(seen[-1]["messages"][-1]["content"] == f"{INTERRUPTED} boom", "front: after a cut, the next user message says so")
     check(emitted("delegate") == [{"type": "delegate", "text": "boom"}] and "HTTP 500" in emitted("warn")[0]["text"],
           f"front 5xx: warns, and the request goes straight to Claude {[o['text'][:60] for o in emitted('warn')]}")
 
@@ -647,9 +726,24 @@ async def selftest_sessions(check: Checker) -> None:
           and any("malformed" in o["text"] for o in emitted("log")), "front: a malformed stream line is skipped, the turn goes on")
 
     out.clear()
+    utter("thinking leak")
+    await turn_done()
+    await until(lambda: brain.history[-1]["content"] == "Hello there.", 3)
+    check(brain.history[-1]["content"] == "Hello there." and sess.turn_spoken == ["Hello there."],
+          f"front: a leaked think block is not spoken {sess.turn_spoken}")
+
+    out.clear()
+    utter("notecall")
+    await until(lambda: emitted("delegate"), 3)
+    await turn_done()
+    check(emitted("delegate") == [{"type": "delegate", "text": "Rebuild the index"}] and sess.turn_spoken[0] == "Sure."
+          and not any("[" in t for t in sess.turn_spoken) and brain.history[-3].get("tool_calls"),
+          f"front: a written delegation note is silent and still delegates {sess.turn_spoken}")
+
+    out.clear()
     utter("badargs")
     await until(lambda: brain.history[-1]["content"] == "I'll let you know.", 5)
-    tool_msg = next(m for m in seen[-1]["messages"] if m["role"] == "tool")
+    tool_msg = [m for m in seen[-1]["messages"] if m["role"] == "tool"][-1]  # earlier turns' results come first
     check(not emitted("delegate") and tool_msg["content"].startswith("error") and brain.history[-1]["content"] == "I'll let you know.",
           "front: a tool call with bad JSON gets an error result, the session goes on")
 

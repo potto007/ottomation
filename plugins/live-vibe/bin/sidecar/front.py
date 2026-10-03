@@ -19,6 +19,7 @@ from .protocol import Route, emit, log, warn
 from .session import Duplex, cancel_and_wait
 
 EVENT = "[task finished]"
+INTERRUPTED = "(you were interrupted)"  # leads the next user message after a cut: user text, so never imitated
 EVENT_CHARS = 6000  # a long report is cut for the small front model; Claude's full answer is on screen
 HISTORY_MAX = 40  # ponytail: the front keeps its last 40 messages; summarize older ones if long sessions forget
 TOOL_ROUNDS = 4
@@ -52,17 +53,15 @@ FRONT_PROMPT = (
     f"A message starting with {EVENT} is the result of earlier work, not words from the user: present it "
     "naturally as your own result in one or two spoken sentences, and say so if work is still running. Never "
     "mention delegation, the agent or the protocol.\n"
-    "Bracketed notes in the history such as [delegated: ...] or [cut off by the user] are annotations added by "
-    "the system, not words you said; never write such notes yourself. [cut off by the user] means you were "
-    "interrupted there; do not repeat yourself. If the user says goodbye, say a short goodbye."
+    "Work is handed off only by calling the delegate tool: saying that you are on it, or writing a note about "
+    "it, hands off nothing. Never write notes in brackets or tags; everything you write is read aloud.\n"
+    f"A user message starting with {INTERRUPTED} means the user cut you off there, and your previous reply was "
+    "heard only up to its '...'; do not repeat yourself. If the user says goodbye, say a short goodbye."
 )
 
 
 class Delegator:
     """The front's one tool: hands work to Claude over stdout."""
-
-    def __init__(self) -> None:
-        self.notes: list[str] = []
 
     async def call(self, name: str, args: Any) -> str:
         if not isinstance(args, dict):
@@ -71,39 +70,130 @@ class Delegator:
         if name != "delegate" or not request:
             return f"error: use delegate with a request (got {name})"
         emit(type="delegate", text=request)
-        self.notes.append(f"delegated: {request[:100]}")
         return f"Handed off; it runs in the background. Keep talking. The result arrives as a {EVENT} message."
 
 
+_NOTE_DELEGATE = re.compile(r"^\s*delegat\w*\s*[:-]\s*(.+)$", re.I | re.S)
+
+
+class SpeechFilter:
+    """What the model writes, minus what must never be read aloud: <think> blocks (a template can leak an empty one
+    even with thinking off) and bracketed notes like "[delegated: ...]", which a model copies from anything
+    bracket-shaped. Tags and notes may be split across stream deltas, so a possible start is held back until it
+    resolves. The notes are kept: a "[delegated: X]" written instead of a tool call is still a request for X."""
+
+    TAGS = ("<think>", "</think>")
+    NOTE_MAX = 400  # an unclosed "[" this far back was ordinary text after all
+
+    def __init__(self) -> None:
+        self.buf = ""
+        self.thinking = False
+        self.notes: list[str] = []
+
+    def push(self, delta: str) -> str:
+        self.buf += delta
+        out: list[str] = []
+        while self.buf:
+            if self.thinking:
+                i = self.buf.find("</think>")
+                if i < 0:
+                    self.buf = self.buf[-(len("</think>") - 1):]  # a closing tag may be arriving in pieces
+                    break
+                self.buf, self.thinking = self.buf[i + len("</think>"):], False
+                continue
+            starts = [i for i in (self.buf.find("<"), self.buf.find("[")) if i >= 0]
+            if not starts:
+                out.append(self.buf)
+                self.buf = ""
+                break
+            i = min(starts)
+            out.append(self.buf[:i])
+            self.buf = self.buf[i:]
+            if self.buf[0] == "<":
+                tag = next((t for t in self.TAGS if self.buf.startswith(t)), None)
+                if tag:
+                    self.buf, self.thinking = self.buf[len(tag):], tag == "<think>"
+                elif any(t.startswith(self.buf) for t in self.TAGS):
+                    break  # wait for the rest of the tag
+                else:
+                    out.append("<")
+                    self.buf = self.buf[1:]
+                continue
+            j = self.buf.find("]")
+            if j >= 0:
+                self.notes.append(self.buf[1:j].strip())
+                self.buf = self.buf[j + 1:]
+            elif len(self.buf) > self.NOTE_MAX:
+                out.append("[")
+                self.buf = self.buf[1:]
+            else:
+                break  # wait for the "]"
+        return "".join(out)
+
+    def flush(self) -> str:
+        rest, self.buf = self.buf, ""
+        if self.thinking or rest.startswith("<"):
+            self.thinking = False
+            return ""
+        if rest.startswith("["):  # a note cut off by the end of the reply is still a note
+            self.notes.append(rest[1:].strip())
+            return ""
+        return rest
+
+    def delegations(self) -> list[str]:
+        """The requests in "[delegated: ...]" notes."""
+        return [m.group(1).strip() for n in self.notes if (m := _NOTE_DELEGATE.match(n)) and m.group(1).strip()]
+
+
 # -- brains -----------------------------------------------------------------------------------------------
+def is_turn_start(m: dict[str, Any]) -> bool:
+    """A user's own message, where a turn begins: tool results (role tool, or for Anthropic a user message of
+    tool_result blocks) belong to the turn before them."""
+    return m.get("role") == "user" and isinstance(m.get("content"), str)
+
+
 class Brain:
-    """Streams text deltas and runs its own tool loop. History is plain text turns, so a cut turn is easy to commit."""
+    """Streams text deltas and runs its own tool loop. Per turn the history holds the user's message, the turn's tool
+    calls and results in the backend's own structured form, then only what was heard: no annotations among the
+    assistant's words, since a model imitates whatever its own past turns look like."""
 
     name = "base"
     model = ""
 
     def __init__(self, system: str = ""):
         self.system = system
-        self.history: list[dict[str, str]] = []
+        self.history: list[dict[str, Any]] = []
+        self.pending: list[dict[str, Any]] = []  # this turn's tool calls and results, committed with the words
+        self.interrupted = False  # the last turn was cut: the next user message says so
 
     @property
     def where(self) -> str:
         return self.name
 
     def begin(self, user_text: str) -> None:
+        if self.interrupted:
+            user_text = f"{INTERRUPTED} {user_text}"
+            self.interrupted = False
+        self.pending = []
         self.history.append({"role": "user", "content": user_text})
-        if len(self.history) > HISTORY_MAX:
+        if len(self.history) > HISTORY_MAX:  # whole turns go, so no tool result outlives its call
             del self.history[: len(self.history) - HISTORY_MAX]
-            while self.history and self.history[0]["role"] != "user":
+            while self.history and not is_turn_start(self.history[0]):
                 del self.history[0]
 
-    def commit(self, spoken: str, notes: list[str], interrupted: bool) -> None:
+    def record(self, *messages: dict[str, Any]) -> None:
+        """Tool calls and their results, as the turn makes them."""
+        self.pending.extend(messages)
+
+    def commit(self, spoken: str, interrupted: bool) -> str:
+        """Ends the turn: its tool exchange, then what was heard (nothing when nothing was). Returns that text."""
         text = spoken.strip()
-        if notes:
-            text += " [" + "; ".join(notes) + "]"
-        if interrupted:
-            text += " [cut off by the user]"
-        self.history.append({"role": "assistant", "content": text or "(said nothing)"})
+        self.history.extend(self.pending)
+        self.pending = []
+        if text:
+            self.history.append({"role": "assistant", "content": text})
+        self.interrupted = interrupted
+        return text
 
     def respond(self, user_text: str, tools: Delegator) -> AsyncIterator[str]:
         raise NotImplementedError
@@ -173,8 +263,9 @@ class LlamaCppBrain(Brain):
     async def respond(self, user_text: str, tools: Delegator) -> AsyncIterator[str]:
         self.begin(user_text)
         msgs: list[dict[str, Any]] = [{"role": "system", "content": self.system}, *self.history]
-        for _round in range(TOOL_ROUNDS):
+        for n in range(TOOL_ROUNDS):
             content, calls, bad = "", {}, 0
+            speech = SpeechFilter()
             body = {"model": self.model, "messages": msgs, "tools": self.tools, "tool_choice": "auto",
                     "stream": True, "max_tokens": 400, **self.SAMPLING,
                     "chat_template_kwargs": {"enable_thinking": False}}
@@ -190,9 +281,10 @@ class LlamaCppBrain(Brain):
                         bad += 1
                     if delta is None:
                         continue
-                    if isinstance(delta.get("content"), str) and delta["content"]:
-                        content += delta["content"]
-                        yield delta["content"]
+                    text = delta.get("content")
+                    if isinstance(text, str) and text and (said := speech.push(text)):
+                        content += said
+                        yield said
                     for tc in delta.get("tool_calls") or []:
                         if not isinstance(tc, dict):
                             continue
@@ -201,19 +293,30 @@ class LlamaCppBrain(Brain):
                         fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
                         e["name"] += str(fn.get("name") or "")
                         e["args"] += str(fn.get("arguments") or "")
+            if said := speech.flush():
+                content += said
+                yield said
             if bad:
                 log(f"front: skipped {bad} malformed stream line(s) from {self.url}")
             if not calls:
+                for i, request in enumerate(speech.delegations()):  # the note instead of the call: make the call
+                    log(f"front: the model wrote a delegation note instead of calling delegate; delegating {request!r}")
+                    calls[i] = {"id": f"call_note_{n}_{i}", "name": "delegate", "args": json.dumps({"request": request})}
+            if not calls:
                 return
-            msgs.append({"role": "assistant", "content": content or None, "tool_calls": [
-                {"id": e["id"] or f"call_{i}", "type": "function", "function": {"name": e["name"], "arguments": e["args"]}}
-                for i, e in calls.items()]})
+            ids = {i: e["id"] or f"call_{n}_{i}" for i, e in calls.items()}
+            asked = {"role": "assistant", "content": None, "tool_calls": [
+                {"id": ids[i], "type": "function", "function": {"name": e["name"], "arguments": e["args"]}}
+                for i, e in calls.items()]}
+            results = []
             for i, e in calls.items():
                 try:
                     args = json.loads(e["args"] or "{}")
                 except ValueError:
                     args = None
-                msgs.append({"role": "tool", "tool_call_id": e["id"] or f"call_{i}", "content": await tools.call(e["name"], args)})
+                results.append({"role": "tool", "tool_call_id": ids[i], "content": await tools.call(e["name"], args)})
+            msgs += [{**asked, "content": content or None}, *results]
+            self.record(asked, *results)
 
     async def aclose(self) -> None:
         await self.client.aclose()
@@ -253,22 +356,37 @@ class AnthropicBrain(Brain):
             kw["output_config"] = {"effort": "low"}  # voice: latency over depth
         if _FALLBACKS.match(self.model):
             kw["betas"], kw["fallbacks"] = ["server-side-fallback-2026-07-01"], "default"
-        for _round in range(TOOL_ROUNDS):
+        for n in range(TOOL_ROUNDS):
+            speech = SpeechFilter()
             async with self.client.beta.messages.stream(messages=msgs, **kw) as stream:
                 async for ev in stream:
-                    if ev.type == "text":
-                        yield ev.text
+                    if ev.type == "text" and (said := speech.push(ev.text)):
+                        yield said
                 msg = await stream.get_final_message()
+            if said := speech.flush():
+                yield said
             if msg.stop_reason == "refusal":
                 yield " I can't help with that one."
                 return
-            uses = [b for b in msg.content if b.type == "tool_use"]
-            if not uses or msg.stop_reason == "max_tokens":
+            if msg.stop_reason == "max_tokens":
                 return
-            msgs.append({"role": "assistant", "content": msg.content})
+            uses = [{"type": "tool_use", "id": b.id, "name": b.name, "input": b.input}
+                    for b in msg.content if b.type == "tool_use"]
+            if not uses:  # the note instead of the call: make the call
+                for i, request in enumerate(speech.delegations()):
+                    log(f"front: the model wrote a delegation note instead of calling delegate; delegating {request!r}")
+                    uses.append({"type": "tool_use", "id": f"toolu_note_{n}_{i}", "name": "delegate",
+                                 "input": {"request": request}})
+            if not uses:
+                return
+            asked = {"role": "assistant", "content": uses}
             # eager input streaming leaves validation to us: Delegator checks the input's shape
-            msgs.append({"role": "user", "content": [
-                {"type": "tool_result", "tool_use_id": b.id, "content": await tools.call(b.name, b.input)} for b in uses]})
+            results = {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": u["id"], "content": await tools.call(u["name"], u["input"])}
+                for u in uses]}
+            text = [{"type": "text", "text": b.text} for b in msg.content if b.type == "text" and b.text.strip()]
+            msgs += [{"role": "assistant", "content": text + uses}, results]
+            self.record(asked, results)
 
     async def aclose(self) -> None:
         await self.client.close()
@@ -375,7 +493,7 @@ class FrontSession(Duplex):
         brain = brain or self.brain
         if brain is None:
             return await self.front_down(user_text, is_event)
-        self.turn_spoken, self.tools.notes = [], []
+        self.turn_spoken = []
         failed: list[Exception] = []
 
         async def sentences() -> AsyncIterator[str]:
@@ -395,10 +513,9 @@ class FrontSession(Duplex):
         try:
             interrupted = await self.voice.speak(sentences(), self.turn_spoken, lambda: self.set_state("speaking"))
         finally:
-            brain.commit(" ".join(self.turn_spoken), list(self.tools.notes), interrupted)
-            said = brain.history[-1]["content"] if brain.history else ""
-            if brain is self.brain and said != "(said nothing)":
-                emit(type="transcript", role="front", text=said.strip())
+            said = brain.commit(" ".join(self.turn_spoken), interrupted)
+            if brain is self.brain and said:
+                emit(type="transcript", role="front", text=said)
         if failed:
             e = failed[0]
             warn(f"front model failed at {brain.where} ({type(e).__name__}: {str(e)[:160]})")
