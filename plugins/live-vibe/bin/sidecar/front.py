@@ -257,7 +257,7 @@ class Brain:
 
     def begin(self, user_text: str) -> None:
         self.user_said = user_text
-        if self.interrupted:
+        if self.interrupted and not user_text.startswith(EVENT):  # a report is not the user: the flag waits for them
             user_text = f"{INTERRUPTED} {user_text}"
             self.interrupted = False
         self.pending = []
@@ -856,14 +856,24 @@ class FrontSession(Duplex):
 
         self.set_state("thinking")
         interrupted = True
+        cancelled = False
         try:
             interrupted = await self.voice.speak(sentences(), self.turn_spoken, lambda: self.set_state("speaking"))
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
         finally:
             said = brain.commit(" ".join(self.turn_spoken), interrupted)
             if brain is self.brain and said:
                 emit(type="transcript", role="front", text=said)
             if not (is_event or failed) and brain is self.brain:  # also when a barge-in cut the reply: the user's
                 self.pass_on(user_text, said, handed, brain.plain)  # words were heard whole, the reply maybe not
+            # A barge-in cut the reply: unless two whole sentences of it were heard (most of a retelling), the
+            # waiting results it took go back to the announcer, or to the user's next turn.
+            whole = [s for s in self.turn_spoken if not s.endswith("...")]
+            if cancelled and waiting and (brain.trimmed or brain.plain or len(whole) < 2):
+                log(f"front: the reply was cut early; {len(waiting)} waiting result(s) go back to the announcer")
+                self.requeue(waiting)
         if failed:
             e = failed[0]
             warn(f"front model failed at {brain.where} ({type(e).__name__}: {str(e)[:160]})")

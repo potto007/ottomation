@@ -1012,6 +1012,33 @@ async def selftest_sessions(check: Checker) -> None:
           events[0] and sess.results.empty(),
           f"announcer: a waiting result whose user turn was cut to {ASKED!r} is announced after it, once {events}")
 
+    async def barge_with_waiting(report: str, whole_heard: int) -> list[str]:
+        """A result waits while the user talks; the user's turn starts a long reply; the user barges in once
+        `whole_heard` sentences of it were heard. Returns the announcements that follow."""
+        sess.post("speech_start", 1.0)
+        await until(lambda: sess.user_talking)
+        n = len(seen)
+        await asyncio.to_thread(post, port, "/event", report, token)
+        sess.post("transcribing", None)
+        sess.post("utterance", "tell me the whole story")
+        await until(lambda: sess.state == "speaking", 5)
+        await until(lambda: len(sess.turn_spoken) >= whole_heard, 5)
+        sess.post("speech_start", 1.0)  # barge in
+        await turn_done()
+        sess.post("discard", None)
+        await asyncio.sleep(1.0)
+        await turn_done()
+        return events_since(n)
+
+    events = await barge_with_waiting("The third worker finished: the cache is rebuilt.", 0)
+    check(len(events) == 1 and "The third worker finished" in events[0] and sess.results.empty(),
+          f"announcer: a waiting result whose user turn was cut by a barge-in early is announced after it, once "
+          f"{[e[:60] for e in events]}")
+    events = await barge_with_waiting("The fourth worker finished: the index is rebuilt.", 2)
+    check(not events and sess.results.empty(),
+          f"announcer: once two whole sentences of the reply were heard, a cut turn's waiting result is not announced "
+          f"again {[e[:60] for e in events]}")
+
     out.clear()
     utter("How are you?")
     await until(lambda: emitted("note"), 5)
