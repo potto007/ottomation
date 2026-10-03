@@ -1962,6 +1962,10 @@ def experimental_relay(check: Checker, front: Any) -> None:
     d.handed = 3
     check(fresh and not d.status_fresh and not Delegator().status_fresh,
           "relay: a Status report is fresh until the next delegation")
+    asks = ["How's it going?", "So, is it done yet?", "Where are we?", "Any update?", "how are things going?"]
+    other = ["Did you get that?", "What was the fix?", "How are you?", "It is done.", "What's the status of the cat"]
+    got = [t for t in asks if not front.is_status_question(t)] + [t for t in other if front.is_status_question(t)]
+    check(not got, f"relay: only a question about how the work stands is answered from the Status report {got}")
     got = [front.status_reply(t) for t in ("It's still running; a worker reviews the diff. More soon. And more.",
                                            "It was likely the cache.", "")]
     check(got == ["It's still running; a worker reviews the diff. More soon.", HOLD, HOLD],
@@ -2132,6 +2136,21 @@ async def experimental_speculation(check: Checker, front: Any, logs: list[str], 
           and any(t.startswith("front speculate: used saved_ms=") for t in logs)
           and any(t.startswith("front turn: eot_to_first_token_ms=0 ") for t in logs),
           f"speculation: an unchanged final text releases the held reply, no second request {logs}")
+    # L4: a status question right after a Status report is the front's to answer, so no Claude turn (no ask)
+    out.clear()
+    sess.tools.saw_status("working")
+    await sess.handle("utterance", "How's it going?")
+    await settle()
+    note = emitted("note")
+    check(" ".join(sess.turn_spoken) == ("This is sentence number 0 of a long answer. This is sentence number 1 of "
+                                         "a long answer.") and note and "ask" not in note[0] and not emitted("delegate"),
+          f"relay: a status question on a fresh Status report is answered by the front, no ask {note}")
+    sess.tools.handed += 1
+    out.clear()
+    await sess.handle("utterance", "How's it going?")
+    await settle()
+    check(sess.turn_spoken == [HOLD] and emitted("note") and emitted("note")[0].get("ask") is True,
+          f"relay: after a new delegation the status is stale: only {HOLD!r}, and Claude gets the question")
     # never while a model switch or an unfinished sentence would not be a front turn
     await sess.handle("eot_likely", "Okay, switch to Sonnet.")
     switch = sess.spec is None

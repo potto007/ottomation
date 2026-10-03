@@ -572,6 +572,18 @@ def acknowledgement(say: str) -> str:
     return short_first(say) or ACK
 
 
+_STATUS_QUESTION = re.compile(
+    r"\b(?:how(?:'s| is| are)? (?:it|things|we|that|everything|the \w+) (?:going|doing|coming along)|where (?:are we|do "
+    r"things stand|things stand|is it at)|status|progress|any (?:news|update)|is it (?:done|finished|ready|still running)"
+    r"|done yet|finished yet|still running)\b", re.I)
+
+
+def is_status_question(text: str) -> bool:
+    """A question about how the work stands ("how's it going?", "is it done yet?"), which a fresh Status report
+    answers (experimental)."""
+    return "?" in text and bool(_STATUS_QUESTION.search(text))
+
+
 _GUESS = re.compile(r"\b(likely|probably|because|due to|seems?|must have)\b", re.I)
 
 
@@ -799,7 +811,8 @@ class LlamaCppBrain(Brain):
         words: asyncio.Queue[str | None] = asyncio.Queue()
         announcing = bool(getattr(tools, "announcing", False))
         turn.worked = bool(getattr(tools, "work_in_session", False))
-        turn.fresh_status = self.experimental and bool(getattr(tools, "status_fresh", False))
+        turn.fresh_status = (self.experimental and bool(getattr(tools, "status_fresh", False))
+                             and is_status_question(user_text))
         reader = asyncio.create_task(self._read(msgs, turn, words, tools, announcing, prefetch))
         finished = False
         try:
