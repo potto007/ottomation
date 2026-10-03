@@ -128,6 +128,38 @@ The file rotates at 5 MB and keeps one previous copy (`sidecar.log.1`). If the p
 | `frontServerModel` | empty | Managed server: an existing GGUF to serve instead of the default model. |
 | `frontServerLog` | empty | Managed server: where its stdout and stderr go; empty means `~/.cache/duplex_voice/front-server.log`. |
 | `frontModel` | empty | Sent as `model` on every request. Empty means the server's own model (or `claude-haiku-4-5` for anthropic). |
+| `experimental` | `true` | The experimental voice path (below). Off restores the 0.6.4 behaviour. |
+| `backchannels` | `false` | Live vibe, with `experimental` on: the front says a short "mm-hm" during long dictation. Leave it off on open speakers. |
+
+### Experimental voice path
+
+The `experimental` setting turns on changes from the GPT-Live design notes
+(`docs/design/gpt-live-informed-voice.md`), all at once. With it off, the sidecar and the relay prompt behave exactly
+as in 0.6.4.
+
+- **Stable front cache.** The front's history no longer drops its oldest message every turn past 40, which moved
+  everything after the system prompt and cost llama-server its prompt cache on each request. Past 40 messages it is
+  trimmed once, to about 20, after a turn ends, cutting only where a user turn starts (no tool result or delegation
+  loses its pair), and a 1-token request then caches the new prefix while nobody talks (skipped while you speak,
+  cancelled when you start).
+- **STT flush and continuous end-of-turn wait** (Kyutai). The recognizer's trailing words are flushed at the end of
+  your turn instead of waited for, and the pause it waits through scales with how sure the model is that you are done.
+- **Commentary relay.** Claude ends each answer with `Status: working`, `done`, `failed` or `cancelled` and at most
+  three spoken sentences; the front retells only those (500 tokens at most, counted by llama-server's `/tokenize`).
+  The rest of the answer goes into the front's history as silent notes, so "how's it going?" right after a report is
+  answered by the front itself, with no Claude turn; after a new delegation the front still says "Let me check."
+- **Speculative front replies** (Kyutai, llama.cpp front). When the recognizer's pause head says the end of your turn
+  is likely, the front starts its reply on the words so far, speaking and handing off nothing. The same final words
+  take that reply; a new word or different final words throw it away. Claude is never asked speculatively. Whisper
+  gives no such signal, so it never speculates.
+- **Backchannels**, with `backchannels` also on (Kyutai only): a cached Kokoro "mm-hm" when you have talked for over
+  6 s and pause with more to come, at most once per 8 s, never over the front's voice or while you answer its
+  question. It plays through the same player as speech, so the echo canceller hears it as playback.
+
+The sidecar log gets one line per front turn, `front turn: eot_to_first_token_ms=<n> first_audio_ms=<n> f_keep=<n/a>
+prefill_tokens=<n> cached_tokens=<n> kind=user|event`, from llama-server's timings (its `f_keep` is only in
+`front-server.log`), with the setting on or off, and with it on, `front speculate: used|discarded|cancelled
+saved_ms=<n>`, `front warm: ...` and `front backchannel: ...` lines.
 
 ## The managed front server
 
@@ -197,6 +229,10 @@ What reaches Claude from the front:
   inside its note, as heard: up to its last whole word, then `...`.
 - A backchannel the voice played on through ("mm-hm") joins as `[The user, by voice, said "Mm-hm." while
   listening; the voice played on (no task asked)]`.
+- With `experimental` on, Claude's relay prompt asks it to end every answer with a `Status: working|done|failed|cancelled`
+  line and at most three spoken sentences. The front retells those lines; the rest reaches the front only as
+  background. A status question the latest report answers, with nothing handed off since, is answered by the front
+  and reaches Claude as a note rather than a question.
 
 Claude's results are announced when nobody is talking. A result that arrives while the user is speaking goes into the
 front's reply to them instead; results that waited together are one announcement, and none is announced twice.
