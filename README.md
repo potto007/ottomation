@@ -1,6 +1,7 @@
-# live-vibe
+# ottomation
 
-A Claude Code plugin marketplace with one plugin, live-vibe. It adds voice and director modes to Claude Code:
+ottomation is a Claude Code plugin marketplace. Its first plugin is live-vibe, which adds voice and director modes
+to Claude Code:
 
 - `/live` is full-duplex voice with Claude. The mic stays open, and you can talk over an answer to cut it off.
 - `/vibe` is director mode. Claude reads and directs worker subagents instead of editing files itself.
@@ -10,8 +11,8 @@ A Claude Code plugin marketplace with one plugin, live-vibe. It adds voice and d
 ## Install
 
 ```
-/plugin marketplace add potto007/live-vibe
-/plugin install live-vibe@potto007
+/plugin marketplace add potto007/ottomation
+/plugin install live-vibe@ottomation
 ```
 
 Then run `/live setup` once on each machine.
