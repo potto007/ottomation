@@ -310,8 +310,9 @@ class KyutaiTurns:
     heads), shaped by the text and the 0.5 s head (_p). The semantic trigger stays as the early exit.
 
     Tuning.stt_flush (experimental): at the first step of a high-heads run (s2 and s05 above END_OF_TURN, no
-    piece) in an active turn, _flush steps delay_steps + 1 silent blocks at once and the triggers above are read
-    as if that silence had passed; a flushed piece aborts it. The log line gains flush=<steps>/<compute ms>."""
+    piece) in an active turn, _flush steps delay_steps + 1 silent blocks at once; the triggers above then read
+    that silence as quiet until the next piece. A flushed piece aborts it. The log line gains
+    flush=<steps>/<compute ms> and quiet_ms includes the flushed silence."""
 
     IN_BLOCK = KYUTAI_BLOCK * SR // KYUTAI_SR  # 1280 input samples per 80 ms step
     MS_PER_STEP = 1000 * KYUTAI_BLOCK / KYUTAI_SR  # 80

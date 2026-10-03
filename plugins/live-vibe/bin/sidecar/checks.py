@@ -36,7 +36,8 @@ from .front import (ACK, EVENT, EVENT_CHARS, FRAGMENT_HOLD_S, HISTORY_MAX, HOLD,
                     looks_unfinished, make_brain, parse_sse, report_brief, retellable, spoken_model, spoken_upto,
                     warm_up)
 from .session import LiveSession
-from .speech import BARGE_IN_WORDS, KYUTAI_BLOCK, KYUTAI_SR, KyutaiTurns, Pauses, SilentTTS, check_tts, turn_tail
+from .speech import (BARGE_IN_WORDS, FLUSH_BLOCK, KYUTAI_BLOCK, KYUTAI_SR, KyutaiTurns, Pauses, SilentTTS, check_tts,
+                     turn_tail)
 
 MAIN = Path(__file__).with_name("main.py")
 # The mod's SPOKEN_SWITCH source, as register.tsx passes it in --switch-pattern.
@@ -74,10 +75,12 @@ def run_detector(probs: list[float], speaking: bool = False) -> list[tuple[int, 
 
 class FakeKyutai:
     """KyutaiSTT's stepping interface over a script of (piece, pauses) per 80 ms step. A float for pauses stands
-    for all four heads at that value."""
+    for all four heads at that value. `flush_steps`, when set, is what the STT flush's silent blocks
+    (speech.FLUSH_BLOCK) yield, one entry per block, (None, 0.0) once used up; unset, they read the script."""
 
     MAX_STEPS = 4096
     delay_steps = 6
+    flush_steps: list[tuple[str | None, float | Pauses]] | None = None
 
     def __init__(self, script: list[tuple[str | None, float | Pauses]]):
         self.script, self.steps = list(script), 0
@@ -87,7 +90,9 @@ class FakeKyutai:
 
     def step(self, block) -> tuple[str | None, Pauses]:
         self.steps += 1
-        piece, p = self.script.pop(0) if self.script else (None, 0.0)
+        flushing = self.flush_steps is not None and block is FLUSH_BLOCK
+        script = self.flush_steps if flushing else self.script
+        piece, p = script.pop(0) if script else (None, 0.0)
         return piece, p if isinstance(p, Pauses) else Pauses(p, p, p, p)
 
     def transcribe(self, payload: Any) -> str:
@@ -851,6 +856,9 @@ def units() -> int:
           f"kyutai turns: 3000 ms without a word caps the turn while the model is unsure {ev}")
     kyutai_end_of_turn(check)
     kyutai_silence_tiers(check)
+    kyutai_continuous(check)
+    kyutai_max_extend(check)
+    kyutai_flush(check)
     barge_units(check)
 
     check(spoken_model(SWITCH, "Okay, switch to Sonnet.") == "sonnet" and spoken_model(SWITCH, "Use opus to review this.") is None,
@@ -1852,3 +1860,203 @@ def selftest() -> int:
     selftest_backends(check)
     print("ALL PASS" if check.ok else "SOME CHECKS FAILED", flush=True)
     return 0 if check.ok else 1
+
+
+# =============================================================================================================
+# experimental end of turn (Tuning.eot_continuous, Tuning.stt_flush) and the max extension
+# =============================================================================================================
+def run_turns(stt: FakeKyutai, tune: Tuning, frames: list[np.ndarray] | None = None,
+              logs: list[str] | None = None) -> list[tuple[int, str, Any]]:
+    """run_kyutai over a prepared fake (flush_steps set): (frame index, event kind, value). `frames` defaults to
+    one silent 80 ms block per script step plus 25."""
+    from . import speech
+
+    turns = KyutaiTurns(stt, tune, lambda: False)
+    block = KYUTAI_BLOCK * SR // KYUTAI_SR
+    feed = frames if frames is not None else [np.zeros(block, np.float32)] * (len(stt.script) + 25)
+    sink = logs if logs is not None else []
+    with patched((speech, "file_log", lambda level, text: sink.append(f"{level} {text}"))):
+        return [(i, k, v) for i, f in enumerate(feed) for k, v in turns.feed(f)]
+
+
+def kyutai_continuous(check: Checker) -> None:
+    """Tuning.eot_continuous: wait_ms = 400 + (1 - p) * 3600 per step, p the s2 EMA shaped by the text and the
+    0.5 s head; the semantic trigger still exits first."""
+    on = Tuning(end_silence_ms=3000, eot_continuous=True)
+    turns = KyutaiTurns(FakeKyutai([]), on, lambda: False)
+    table = {p: turns._wait(p) for p in (0.95, 0.8, 0.6, 0.3, 0.0)}
+    short = KyutaiTurns(FakeKyutai([]), Tuning(eot_continuous=True, max_utterance_s=2.0), lambda: False)._wait(0.0)
+    check(table == {0.95: 580, 0.8: 1120, 0.6: 1840, 0.3: 2920, 0.0: 4000} and short == 2000,
+          f"continuous: p to wait_ms, never above max_utterance_s {table} {short}")
+
+    def shaped(text: str, ema: float, s05: float, heads: bool = True) -> float:
+        turns.text, turns.s2_ema = text, ema
+        turns.peak = Pauses(s05, 0.0, ema, 0.0) if heads else Pauses()
+        return round(turns._p(s05), 2)
+
+    cases = {("open the file", 0.9, 0.9): 0.9, ("I went and", 0.9, 0.9): 0.3, ("so I think,", 0.95, 0.95): 0.3,
+             ("are you there?", 0.2, 0.9): 0.7, ("Done.", 0.1, 0.9): 0.7, ("are you there?", 0.2, 0.2): 0.6,
+             ("open the file", 0.9, 0.3): 0.6, ("open the file", 1.4, 0.9): 1.0, ("open the file", -0.1, 0.1): 0.0,
+             ("open the file", 0.95, 0.95): 0.95}
+    got = {k: shaped(*k) for k in cases}
+    none = (shaped("open the file", 0.0, 0.0, heads=False), shaped("Done.", 0.0, 0.0, heads=False))
+    check(got == cases and none == (0.5, 0.6),
+          f"continuous: an unfinished tail caps p at 0.3, . ? ! floor it at 0.7, above 0.6 it needs s05 > 0.6, "
+          f"no heads read 0.5 {got} {none}")
+
+    pad = [(None, 0.0)] * 12
+    for s2, end, quiet in ((0.6, 14 + 23, 1840), (0.3, 14 + 37, 2960), (0.0, 14 + 50, 4000)):
+        h = Pauses(0.2, 0.2, s2, 0.2)
+        logs: list[str] = []
+        ev = run_kyutai(pad + [("▁open", h), ("▁the", h), ("▁file", h)] + [(None, h)] * 60, logs=logs, tune=on)
+        pattern = (rf"INFO kyutai turn end: trigger=silence cap=continuous wait_ms={table[s2]} p={s2:.2f} tail=word "
+                   rf"sent=utterance len_ms={(end - 12 + 1) * 80} quiet_ms={quiet} words=3 peak/final .*")
+        check([k for _, k, _ in ev] == ["speech_start", "utterance"] and ev[1][0] == end and len(logs) == 1
+              and re.fullmatch(pattern, logs[0]),
+              f"continuous: p {s2} ends at wait_ms {table[s2]}, logged with cap, wait and p {ev} {logs}")
+    h = Pauses(0.2, 0.2, 0.9, 0.2)  # the 2 s head says done, the text says more is coming
+    logs = []
+    ev = run_kyutai(pad + [("▁I", h), ("▁went", h), ("▁and", h), (",", h)] + [(None, h)] * 60, logs=logs, tune=on)
+    check([k for _, k, _ in ev] == ["speech_start", "utterance"] and ev[1][0] == 15 + 37
+          and "cap=continuous wait_ms=2920 p=0.30 tail=comma " in logs[0],
+          f"continuous: a comma holds a confident s2 to p 0.3 (2920 ms) {ev} {logs}")
+
+    for words in ([("▁open", 0.0), ("▁the", 0.0), ("▁file", 0.0)], [("▁are", 0.0), ("▁you", 0.0), ("?", 0.0)]):
+        logs = []
+        ev = run_kyutai(pad + words + [(None, 0.9)] * 10, logs=logs, tune=on)
+        check([k for _, k, _ in ev] == ["speech_start", "utterance"] and ev[1][0] == 14 + 6
+              and "trigger=semantic cap=semantic wait_ms=" in logs[0] and "quiet_ms=480 " in logs[0],
+              f"continuous: the semantic trigger still ends a held forecast at 480 ms {ev} {logs}")
+    logs = []
+    ev = run_kyutai(pad + [("▁open", 1.0), ("▁the", 1.0), ("▁file", 1.0)] + [(None, 1.0)] * 10, logs=logs, tune=on)
+    check([k for _, k, _ in ev] == ["speech_start", "utterance"] and ev[1][0] == 14 + 5
+          and "trigger=silence cap=continuous wait_ms=400 p=1.00 " in logs[0] and "quiet_ms=400 " in logs[0],
+          f"continuous: a certain end (p 1.0) never waits past 480 ms {ev} {logs}")
+
+
+def kyutai_max_extend(check: Checker) -> None:
+    """At max_utterance_s a turn ends only if p >= 0.6 (or the model has no heads); else it runs on 10 s at a
+    time to max_utterance_extend_s, then ends regardless."""
+    pad = [(None, 0.0)] * 12
+    low = Pauses(0.2, 0.0, 0.0, 0.0)  # heads present, p 0.0: more speech coming
+    for tune in (Tuning(end_silence_ms=3000), Tuning(end_silence_ms=3000, eot_continuous=True)):
+        logs: list[str] = []
+        ev = run_kyutai(pad + [(f"▁w{i}", low) for i in range(1600)], logs=logs, tune=tune)[:3]
+        check([k for _, k, _ in ev] == ["speech_start", "utterance", "speech_start"] and ev[1][0] == 12 + 1500
+              and len(logs) == 1 and "trigger=max extended=90 " in logs[0] and "len_ms=120080 " in logs[0]
+              and "words=1501 " in logs[0],
+              f"max: p 0.0 at 30 s runs on, ends at 120 s with extended=90 (continuous "
+              f"{'on' if tune.eot_continuous else 'off'}) {[e[:2] for e in ev]} {logs[:1]}")
+    logs = []
+    ev = run_kyutai(pad + [(f"▁w{i}", 0.9) for i in range(400)], logs=logs)[:2]
+    check([k for _, k, _ in ev] == ["speech_start", "utterance"] and ev[1][0] == 12 + 375
+          and "trigger=max extended=0 " in logs[0] and "len_ms=30080 " in logs[0],
+          f"max: p 0.9 ends at 30 s {[e[:2] for e in ev]} {logs[:1]}")
+    logs = []
+    ev = run_kyutai(pad + [(f"▁w{i}", low) for i in range(400)], logs=logs,
+                    tune=Tuning(end_silence_ms=3000, max_utterance_extend_s=0))[:2]
+    check([k for _, k, _ in ev] == ["speech_start", "utterance"] and ev[1][0] == 12 + 375
+          and "trigger=max extended=0 " in logs[0],
+          f"max: max_utterance_extend_s at or below max_utterance_s never extends {[e[:2] for e in ev]} {logs[:1]}")
+
+
+def kyutai_flush(check: Checker) -> None:
+    """Tuning.stt_flush: at the first high-heads step, delay_steps + 1 silent blocks at once; the end of turn is
+    read as if that much silence had passed; a flushed piece aborts it; queued audio is fed after."""
+    from . import speech
+
+    pad = [(None, 0.0)] * 12
+    words = [("▁open", 0.0), ("▁the", 0.0), ("▁file", 0.0)]
+    on = Tuning(end_silence_ms=3000, stt_flush=True)
+
+    stt = FakeKyutai(pad + words + [(None, 0.9)] * 10)
+    stt.flush_steps = [(None, 0.9)] * 7
+    logs: list[str] = []
+    ev = run_turns(stt, on, logs=logs)
+    pattern = (r"INFO kyutai turn end: trigger=semantic cap=semantic tail=word sent=utterance len_ms=320 "
+               r"quiet_ms=640 flush=7/\d+ms words=3 peak/final s05=0\.90/0\.90 s1=0\.90/0\.90 s2=0\.90/0\.90 "
+               r"s3=0\.90/0\.90")
+    check([k for _, k, _ in ev] == ["speech_start", "utterance"] and ev[1] == (15, "utterance", "open the file")
+          and len(logs) == 1 and re.fullmatch(pattern, logs[0]) and stt.flush_steps == [],
+          f"flush: heads high and nothing flushed ends the turn on the first high step, 80 ms real plus 560 ms "
+          f"flushed quiet {ev} {logs}")
+    turns = KyutaiTurns(FakeKyutai(pad + words + [(None, 0.9)] * 4), on, lambda: False)
+    turns.stt.flush_steps = [(None, 0.9)] * 7
+    block = np.zeros(KYUTAI_BLOCK * SR // KYUTAI_SR, np.float32)
+    with patched((speech, "file_log", lambda level, text: None)):
+        ends = [k for _ in range(16) for k, _ in turns.feed(block)]
+    check(ends == ["speech_start", "utterance"] and turns.stt.steps == 16 + 7 and turns.skew == 7,
+          f"flush: the model ran 7 steps ahead, the turn's clock did not (steps {turns.stt.steps}, skew "
+          f"{turns.skew})")
+
+    stt = FakeKyutai(pad + words + [(None, 0.9), ("▁please", 0.0)] + [(None, 0.9)] * 10)
+    stt.flush_steps = [(None, 0.9), ("▁now", 0.9)] + [(None, 0.9)] * 7
+    logs = []
+    ev = run_turns(stt, on, logs=logs)
+    check([k for _, k, _ in ev] == ["speech_start", "utterance"]
+          and ev[1] == (17, "utterance", "open the file now please")
+          and len(logs) == 2 and re.fullmatch(r"INFO kyutai flush: aborted at step 2/7 ms=\d+", logs[0])
+          and "trigger=semantic " in logs[1] and "len_ms=480 quiet_ms=640 flush=9/" in logs[1]
+          and "words=5 " in logs[1] and stt.steps == 12 + 3 + 12 + 25 + 9,
+          f"flush: a flushed piece aborts the flush and stays in the text; the turn goes on and ends at the next "
+          f"pause's flush {ev} {logs}")
+    stt = FakeKyutai(pad + words + [(None, 0.9)] * 12)
+    stt.flush_steps = [(None, 0.9), ("▁now", 0.9)] + [(None, 0.3)] * 7
+    logs = []
+    ev = run_turns(stt, on, logs=logs)
+    check([k for _, k, _ in ev] == ["speech_start", "utterance"] and ev[1] == (22, "utterance", "open the file now")
+          and len(logs) == 2 and "trigger=semantic " in logs[1] and "len_ms=880 quiet_ms=1120 flush=9/" in logs[1],
+          f"flush: one completed flush per pause; with its heads low the semantic count restarts, its 560 ms stay "
+          f"in quiet_ms {ev} {logs}")
+
+    class Recorder(FakeKyutai):
+        """Tags each block it steps: 'F' for the flush, else the input block's value."""
+
+        def __init__(self, script: list[tuple[str | None, float | Pauses]]) -> None:
+            super().__init__(script)
+            self.seen: list[Any] = []
+
+        def step(self, block) -> tuple[str | None, Pauses]:
+            self.seen.append("F" if block is FLUSH_BLOCK else round(float(block[-1])))
+            return super().step(block)
+
+    stt = Recorder(pad + words + [(None, 0.9), ("▁next", 0.0)] + [(None, 0.0)] * 4)
+    stt.flush_steps = [(None, 0.9)] * 7
+    n = len(stt.script)
+    one = np.concatenate([np.full(KYUTAI_BLOCK * SR // KYUTAI_SR, i, np.float32) for i in range(n)])
+    ev = run_turns(stt, on, frames=[one])
+    check(stt.seen == list(range(16)) + ["F"] * 7 + list(range(16, n))
+          and [k for _, k, _ in ev] == ["speech_start", "utterance", "speech_start"] and ev[1][2] == "open the file",
+          f"flush: audio that arrived during the flush is fed after it, in order, none dropped {stt.seen} {ev}")
+
+    stt = FakeKyutai(pad + words + [(None, 0.9)] * 10)
+    stt.flush_steps = [("▁never", 0.9)] * 7
+    logs = []
+    ev = run_turns(stt, Tuning(end_silence_ms=3000), logs=logs)
+    check(ev[1:] == [(20, "utterance", "open the file")] and len(stt.flush_steps) == 7
+          and stt.steps == 12 + 3 + 10 + 25 and len(logs) == 1 and "flush=" not in logs[0]
+          and "wait_ms=" not in logs[0] and "cap=semantic tail=word sent=utterance len_ms=720 quiet_ms=480 words=3 "
+          in logs[0], f"flags off: no flush, no wait fields, the semantic end unchanged {ev} {logs}")
+
+    if importlib.util.find_spec("torch") is not None:  # the CUDA backend's step() on the flush block, model stubbed
+        import torch
+
+        from .kyutai_cuda import KyutaiCudaSTT
+
+        class Stub:
+            def __init__(self, **kw: Any) -> None:
+                self.__dict__.update(kw)
+
+        got: list[Any] = []
+        k = object.__new__(KyutaiCudaSTT)
+        k._torch, k.device, k._steps = torch, "cpu", 0
+        k.mimi = Stub(encode=lambda x: got.append(x.clone()) or torch.zeros(1, 32, 1))
+        p = [torch.tensor([[[0.9, 0.1]]]) for _ in range(4)]
+        k.gen = Stub(step_with_extra_heads=lambda codes: (torch.full((1, 1, 1), 3), p))
+        k.tok = Stub(id_to_piece=lambda t: f"piece{t}")
+        out = [k.step(FLUSH_BLOCK) for _ in range(7)]
+        check(k.steps == 7 and all(o[0] is None and np.allclose(o[1], 0.9) for o in out) and len(got) == 7
+              and all(tuple(x.shape) == (1, 1, KYUTAI_BLOCK) and not x.any() for x in got) and not FLUSH_BLOCK.any(),
+              f"kyutai cuda: step() takes the flush's zero block back to back and leaves it zero {k.steps} {out[:1]}")
+    else:
+        print("SKIP  kyutai cuda: torch not installed here, the flush block not exercised", flush=True)
