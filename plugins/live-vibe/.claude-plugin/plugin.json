@@ -7,8 +7,8 @@
     "name": "Paul Otto",
     "email": "potto007@gmail.com"
   },
-  "repository": "https://github.com/ClearBridgeRIP/claude-plugins",
-  "keywords": ["clearbridge", "function-hooks", "voice", "vibe", "subagents"],
+  "repository": "https://github.com/potto007/live-vibe",
+  "keywords": ["function-hooks", "voice", "vibe", "subagents"],
   "types": "./types/index.d.ts",
   "userConfig": {
     "stt": {

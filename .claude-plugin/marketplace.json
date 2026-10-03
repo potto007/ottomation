@@ -1,0 +1,20 @@
+{
+  "name": "potto007",
+  "description": "Claude Code plugin marketplace for live-vibe.",
+  "owner": {
+    "name": "Paul Otto"
+  },
+  "plugins": [
+    {
+      "name": "live-vibe",
+      "source": "./plugins/live-vibe",
+      "description": "/live: full-duplex voice (Kyutai streaming STT with semantic end of turn, or Silero and Whisper; Kokoro TTS) through a sidecar; /vibe: director mode that delegates all work to subagents; /livevibe: talk with a fast voice front that hands the work to Claude as director.",
+      "version": "0.7.0",
+      "keywords": [
+        "function-hooks",
+        "voice",
+        "subagents"
+      ]
+    }
+  ]
+}
