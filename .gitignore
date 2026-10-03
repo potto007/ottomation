@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+.venv/
+plugins/live-vibe/win_player/target/
