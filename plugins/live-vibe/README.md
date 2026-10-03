@@ -53,9 +53,7 @@ Kyutai STT about 2.4 GB (Apple silicon, or Linux with an Nvidia GPU), the Whispe
 | `frontServerLog` | empty | Managed server: where its stdout and stderr go; empty means `~/.cache/duplex_voice/front-server.log`. |
 | `frontModel` | empty | Sent as `model` on every request. Empty means the server's own model (or `claude-haiku-4-5` for anthropic). |
 
-## The front server
-
-### Managed (the default)
+## The managed front server
 
 With `frontUrl` empty and the `llamacpp` backend, `/livevibe` runs its own llama.cpp `llama-server`. `/live setup`
 downloads a pinned prebuilt release (llama.cpp v0.5.0, build `b11146`, checked against GitHub's sha256 digests) and the
@@ -91,10 +89,11 @@ the CPU (`-ngl 0 --device none`) with one warning that replies will be slow. On 
 
 To skip the downloads, point `frontServerBin` at a `llama-server` you built and `frontServerModel` at a GGUF you have.
 If anything fails, the warning says why and speech goes straight to Claude, as when any front server is down.
+To use a server you run instead, set `frontUrl` (or `/livevibe url <url>`), as below.
 
-### Your own server
+## The front server
 
-Set `frontUrl` (or `/livevibe url <url>`). Any OpenAI-compatible chat server with tool calling works. With llama.cpp:
+Any OpenAI-compatible chat server with tool calling works. With llama.cpp:
 
 ```sh
 llama-server -m Qwen3-8B-Q4_K_M.gguf --jinja --port 8080   # --jinja is required for tool calls
