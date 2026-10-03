@@ -26,6 +26,7 @@ import numpy as np
 
 from . import gpu, protocol
 from .checks_front_server import front_server_units
+from .checks_winplayer import winplayer_units
 from .audio import FRAME, SR, CannotStart, Player, check_devices, SentenceSplitter, Tuning, TurnDetector, Voice, speakable
 from .echo import EchoCanceller, EchoGuard, EchoReference
 from .front import (EVENT, HISTORY_MAX, INTERRUPTED, _FALLBACKS, _NO_EFFORT, Brain, Delegator, FrontSession,
@@ -497,6 +498,7 @@ def units() -> int:
 
     front_server_units(check)
     echo_units(check)
+    winplayer_units(check)
     print("UNIT: ALL PASS" if check.ok else "UNIT: SOME CHECKS FAILED", flush=True)
     return 0 if check.ok else 1
 

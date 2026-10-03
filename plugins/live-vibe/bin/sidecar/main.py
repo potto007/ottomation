@@ -96,6 +96,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--end-silence-ms", type=int, default=1500)
     ap.add_argument("--mic", default="", help="input device: index or name substring (see --list-devices)")
     ap.add_argument("--speaker", default="", help="output device: index or name substring")
+    ap.add_argument("--speaker-backend", choices=["auto", "local", "windows"], default="auto",
+                    help="auto: under WSL, play on Windows (win_player.py through interop) instead of WSLg")
     ap.add_argument("--front-backend", choices=["llamacpp", "anthropic"], default="llamacpp")
     ap.add_argument("--front-url", default="", help="OpenAI-compatible server; empty: run a managed llama-server")
     ap.add_argument("--front-server-bin", default="", help="managed front: an existing llama-server (no download)")
@@ -124,6 +126,16 @@ def run(args: argparse.Namespace, life: protocol.Lifecycle) -> int:
     if sd is not None:
         mic, speaker = audio.pick_device(sd, args.mic, "input"), audio.pick_device(sd, args.speaker, "output")
         audio.check_devices(sd, mic, speaker)
+    launch = None
+    if sd is not None:  # under WSL the speaker can be Windows' own: started now, it comes up while the models load
+        from sidecar import winplayer
+
+        backend, why = winplayer.resolve(args.speaker_backend)
+        log(f"speaker backend: {backend} ({why})")
+        if backend == "windows":
+            launch = winplayer.Launch(args.speaker).start()
+        elif args.speaker_backend == "windows":
+            warn(f"Windows speaker unavailable ({why}); playing locally instead.")
     if not args.fake_audio:  # /livevibe without frontUrl: our own llama-server, admitted to the GPU before the recognizer
         from sidecar import front_server
 
@@ -144,14 +156,22 @@ def run(args: argparse.Namespace, life: protocol.Lifecycle) -> int:
         tts = speech.SilentTTS() if args.fake_audio else speech.make_tts(args.tts, args.voice, args.tts_device)
     except BaseException:
         listener.close()
+        if launch is not None:
+            launch.abandon()
         raise
     reference = EchoReference(tts.sample_rate) if sd is not None else None
     listener.reference = reference  # read by the mic callback, which opens later
-    try:
-        player = audio.Player(sd, tts.sample_rate, speaker, reference, guard)
-    except Exception as e:  # noqa: BLE001 - no speaker: keep listening, answer silently
-        warn(f"speaker unavailable ({type(e).__name__}: {str(e)[:160]}); answers are not read aloud.")
-        player = audio.Player(None, tts.sample_rate)
+    player = None
+    if launch is not None:
+        player = launch.player(tts.sample_rate, reference, guard)
+        if player is not None:  # if it dies mid-session, the local speaker takes over
+            player.fallback = lambda: audio.Player(sd, tts.sample_rate, speaker, reference, guard)
+    if player is None:
+        try:
+            player = audio.Player(sd, tts.sample_rate, speaker, reference, guard)
+        except Exception as e:  # noqa: BLE001 - no speaker: keep listening, answer silently
+            warn(f"speaker unavailable ({type(e).__name__}: {str(e)[:160]}); answers are not read aloud.")
+            player = audio.Player(None, tts.sample_rate)
     try:
         if not listener.wait_built():
             if listener.error is not None:

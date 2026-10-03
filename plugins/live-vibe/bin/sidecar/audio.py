@@ -232,7 +232,7 @@ class Listener:
             ref = None
             if self.reference is not None:  # what the speaker played while this block was captured
                 adc = stream_time(time_info.inputBufferAdcTime, time_info.currentTime)
-                ref = self.reference.take(frames, adc, SR)
+                ref = self.reference.take(frames, adc, SR, time_info.currentTime)
             self.frames.put_nowait((indata[:, 0].copy(), ref))
         except queue.Full:
             self.dropped += 1

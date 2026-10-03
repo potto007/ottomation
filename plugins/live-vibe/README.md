@@ -20,7 +20,32 @@ stdout and a loopback HTTP port guarded by a per-run token.
 - Per OS:
   - **macOS (Apple silicon):** `brew install espeak-ng` for Kokoro. Kyutai STT runs on MLX.
   - **Linux:** `sudo apt install espeak-ng libportaudio2`. On x86_64, uv also installs PyTorch with CUDA and Kyutai's `moshi` package (about 3 GB the first time), and Kyutai STT runs on an Nvidia GPU (about 3.2 GB of VRAM; it needs 5 GB free when it starts, else Whisper runs). Without a usable GPU, Whisper runs instead: on an Nvidia GPU when CTranslate2 finds one, CUDA 12 cuBLAS and cuDNN 9 are installed and the GPU has room, otherwise on the CPU. Kokoro runs on the GPU through onnxruntime-gpu (a CUDA 12 build, sharing PyTorch's CUDA and cuDNN wheels), when about 1.4 GB of VRAM still leaves 3 GB free; otherwise on the CPU, which is fast enough. Every GPU backend checks free VRAM first, so a GPU already busy with another model (a local LLM server) does not get pushed into paging; the log says where each one runs (`tts: Kokoro ... on CUDAExecutionProvider` or `CPUExecutionProvider`).
-  - **Windows / WSL:** not tested. WSL needs working audio (WSLg) plus the Linux packages above.
+  - **Windows / WSL:** native Windows is not tested. WSL2 needs WSLg for the mic plus the Linux packages above. Speech plays on Windows directly (below), because WSLg's RDP audio adds crackle to it.
+
+## The Windows speaker (WSL)
+
+Under WSL2, WSLg carries audio over RDP, and that leg crackles: the speech leaves WSL clean (PulseAudio's
+`RDPSink.monitor` matches a fresh Kokoro render) yet sounds full of static on Windows. With `speakerBackend` on
+`auto` (the default) the sidecar plays speech on Windows instead: it runs `bin/sidecar/win_player.py` with `uv.exe`
+through WSL interop and streams the PCM over the player's stdin, which plays it through WASAPI on the Windows default
+output (or the one whose name contains the `speaker` setting). No network, port or firewall rule is involved, and the
+mic stays on WSLg.
+
+- Everything lives in `%LOCALAPPDATA%\live-vibe`: a pinned `uv.exe` (0.10.8, sha256-checked) when none is on the
+  PATH, uv's own cache, a Python if uv must download one, and a copy of the player. Nothing is installed globally.
+  `/live setup` prepares it (about 60 MB the first time) and reports
+  `speaker: Windows player via WASAPI on <device>, <rate> Hz, <latency> ms`.
+- A barge-in cuts within a pipe round trip: the player drops its queue and the device buffer (measured: play()
+  returns 5-6 ms after the cancel, the device restart takes 2 ms).
+- The echo canceller still gets a time-aligned reference: the player reports which samples each device callback
+  took and their DAC time on Windows' clock, ping/pong maps that clock onto the sidecar's (the lowest round trip of
+  the last 32, measured 0.24 ms, so within about 0.1 ms), and the reference lands on the mic stream's clock. What
+  stays unmeasured (latency past WASAPI such as a Bluetooth link, the room, and the RDP leg of the mic) only makes the
+  reference lead the echo, which AEC3's delay estimator absorbs.
+- The player exits on stdin EOF, which covers the sidecar exiting, crashing or being killed, and after 15 s without
+  the sidecar's once-a-second ping. If it cannot start, one warning says why and the WSLg speaker plays; if it dies
+  mid-session, the WSLg speaker takes over. The sidecar log records the device, rate, latency and any fallback.
+- `speakerBackend`: `local` keeps the old path (WSLg), `windows` insists on Windows (still falling back with a warning).
 
 ## First run
 
@@ -55,7 +80,8 @@ The file rotates at 5 MB and keeps one previous copy (`sidecar.log.1`). If the p
 | `tts` | `kokoro` | `kokoro`, or `say` (macOS only). |
 | `voice` | empty | A Kokoro voice (`af_heart`) or a macOS `say` voice. |
 | `mic` | empty | Input device: an index or part of its name (`AirPods`). Empty means the system default. |
-| `speaker` | empty | Output device, the same way. |
+| `speaker` | empty | Output device, the same way. With the Windows speaker, part of a Windows device name. |
+| `speakerBackend` | `auto` | `auto`: the Windows player under WSL with interop, else local. `local`: always local (WSLg under WSL). `windows`: the Windows player, falling back to local with a warning. |
 | `logFile` | empty | Sidecar log path; empty means `~/.cache/duplex_voice/sidecar.log`. |
 | `endSilenceMs` | 1500 | Whisper: the pause that ends your turn. Kyutai: only a cap on a pause between words. |
 | `frontBackend` | `llamacpp` | `llamacpp` (the managed llama-server, or any OpenAI-compatible server that takes `response_format`) or `anthropic` (needs `ANTHROPIC_API_KEY` or `ant auth login`). |

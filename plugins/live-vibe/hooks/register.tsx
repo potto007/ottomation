@@ -182,6 +182,7 @@ function startSidecar($: EngineInterface, options: PluginOptions, mode: LiveMode
     if (options.voice) argv.push('--voice', String(options.voice))
     if (options.mic) argv.push('--mic', String(options.mic))
     if (options.speaker) argv.push('--speaker', String(options.speaker))
+    if (options.speakerBackend) argv.push('--speaker-backend', String(options.speakerBackend))
     if (options.logFile) argv.push('--log-file', String(options.logFile))
     if (mode === 'livevibe') {
       argv.push('--front-backend', String(options.frontBackend), '--front-url', String(options.frontUrl),
@@ -249,6 +250,7 @@ function setupVoice($: EngineInterface, options: PluginOptions) {
     if (options.voice) argv.push('--voice', String(options.voice))
     if (options.mic) argv.push('--mic', String(options.mic))
     if (options.speaker) argv.push('--speaker', String(options.speaker))
+    if (options.speakerBackend) argv.push('--speaker-backend', String(options.speakerBackend))
     if (options.logFile) argv.push('--log-file', String(options.logFile))
     if (options.frontModel) argv.push('--front-model', String(options.frontModel))
     const rows: string[] = []

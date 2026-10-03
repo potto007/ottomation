@@ -60,7 +60,7 @@ def run(args: argparse.Namespace) -> int:
     if tts is not None and recognized is not None:
         round_trip(check, tts, *recognized)
     if tts is not None and sd is not None:
-        play(check, sd, tts, speaker)
+        play(check, sd, tts, speaker, args)
     front(check, args)
     emit(type="done", ok=check.ok)
     return 0 if check.ok else 1
@@ -170,9 +170,15 @@ def round_trip(check: Report, tts, det, transcribe) -> None:
         check("round trip", "warn", f"said {PROBE!r}, heard {repr(heard) if heard else 'nothing'}")
 
 
-def play(check: Report, sd, tts, speaker) -> None:
+def play(check: Report, sd, tts, speaker, args: argparse.Namespace) -> None:
+    from . import winplayer
     from .audio import Player
 
+    backend, why = winplayer.resolve(getattr(args, "speaker_backend", "auto"))
+    if backend == "windows" and windows_speaker(check, tts, args):
+        return
+    if backend == "local" and getattr(args, "speaker_backend", "auto") == "windows":
+        check("windows speaker", "warn", f"{why}; the local speaker plays instead")
     try:
         player = Player(sd, tts.sample_rate, speaker)
         try:
@@ -184,6 +190,29 @@ def play(check: Report, sd, tts, speaker) -> None:
         check("speaker", "fail", f"{type(e).__name__}: {str(e)[:200]}")
         return
     check("speaker", "ok", "played \"Live voice is set up.\"; if you did not hear it, set the speaker option")
+
+
+def windows_speaker(check: Report, tts, args: argparse.Namespace) -> bool:
+    """Under WSL: prepare the Windows player (uv.exe, then Python, numpy and sounddevice in its own cache under
+    %LOCALAPPDATA%\\live-vibe) and play the sentence through it. False: it failed, and the local speaker is tried."""
+    from . import winplayer
+
+    progress("Windows player: preparing uv, Python and sounddevice on Windows (first run downloads about 60 MB)")
+    launch = winplayer.Launch(args.speaker, prepare=True, progress=progress).start()
+    p = launch.player(tts.sample_rate, timeout=winplayer.SETUP_TIMEOUT_S, report=lambda _: None)
+    if p is None:
+        check("windows speaker", "warn", f"unavailable ({launch.error[:200]}); /live plays through WSLg, which "
+                                         "can crackle. speakerBackend local skips this")
+        return False
+    try:
+        p.play(tts.synth("Live voice is set up."), threading.Event())
+        time.sleep(float(p.info.get("latency", 0.05)) + 0.3)  # let the device drain before the stream closes
+        broken = p.broken
+    finally:
+        p.close()
+    check("speaker", "warn" if broken else "ok", f"{p.summary()}; played \"Live voice is set up.\" with "
+          f"{p.underflows} underflow(s); if you did not hear it, set the speaker option (part of a Windows device name)")
+    return not broken
 
 
 def front(check: Report, args: argparse.Namespace) -> None:

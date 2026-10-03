@@ -64,10 +64,13 @@ class EchoReference:
         self.in_clock: StreamClock | None = None
         self.prev = 0.0
         self.next_k: int | None = None  # the first ring index the next output block may write
+        self.pa_offset = 0.0  # the mic stream's clock minus time.monotonic(), learned in take()
         self._lock = threading.Lock()
 
-    def played(self, block: np.ndarray, dac_time: float) -> None:
-        start = self.out_clock.place(dac_time, len(block)) * APM_RATE
+    def played(self, block: np.ndarray, dac_time: float, exact: bool = False) -> None:
+        """A block the speaker played, with the DAC time of its first sample on the mic stream's clock. exact: the
+        time is already continuous from block to block (a remote player's report), so it is used as given."""
+        start = (dac_time if exact else self.out_clock.place(dac_time, len(block))) * APM_RATE
         pos = start + np.arange(len(block)) * self.ratio
         k0 = int(np.ceil(start))
         if self.next_k is not None and abs(k0 - self.next_k) <= 2:
@@ -84,8 +87,18 @@ class EchoReference:
         with self._lock:
             self.ring[idx] = vals
 
-    def take(self, frames: int, adc_time: float, rate: int) -> np.ndarray:
-        """The reference for a mic block of `frames` at `rate` (the mic's) captured from `adc_time`."""
+    def played_at(self, block: np.ndarray, mono_time: float) -> None:
+        """played() for a block whose DAC time is on time.monotonic(): the Windows player's, mapped by its clock
+        sync. Moved onto the mic stream's clock with the offset take() learned."""
+        self.played(block, mono_time + self.pa_offset, exact=True)
+
+    def take(self, frames: int, adc_time: float, rate: int, now: float = 0.0) -> np.ndarray:
+        """The reference for a mic block of `frames` at `rate` (the mic's) captured from `adc_time`. `now` is the
+        callback's currentTime, which ties the mic stream's clock to time.monotonic() for played_at()."""
+        if now:
+            off = now - time.monotonic()
+            jumped = abs(off - self.pa_offset) > 0.05
+            self.pa_offset = off if jumped else self.pa_offset + 0.05 * (off - self.pa_offset)
         if self.in_clock is None:
             self.in_clock = StreamClock(rate)
         start = self.in_clock.place(adc_time, frames)
