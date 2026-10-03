@@ -351,7 +351,7 @@ def front_history(check: Checker) -> None:
     check(out == "Plain reply. More." and t.plain and not t.fields, "json turn: a reply not starting with { is plain")
     b = LlamaCppBrain("sys", "http://127.0.0.1:9", "")
     b.begin("fix it")
-    b.request = "Fix it now"
+    b.current.request = "Fix it now"
     b.commit("", True)
     b.begin("hi")
     b.commit("Hello.", False)
@@ -359,6 +359,22 @@ def front_history(check: Checker) -> None:
           == [{"say": "", "delegate": "Fix it now"}, {"say": "Hello.", "delegate": ""}]
           and b.history[2]["content"] == f"{INTERRUPTED} hi" and b.system.endswith(LlamaCppBrain.PROTOCOL),
           "json turn: history keeps each turn as JSON, a delegation even when nothing was heard")
+    b = LlamaCppBrain("sys", "http://127.0.0.1:9", "")
+    b.begin("fix it")
+    late = b.current
+    b.commit("On it, I'll...", True)  # cut before the delegate field arrived
+    b.begin("wait")
+    quiet = b.current
+    b.commit("", True)  # cut before anything was heard
+    b.begin("next")
+    late.request, quiet.request = "Fix it", "Wait for it"
+    b._amend(late)
+    b._amend(quiet)
+    contents = [m["content"] for m in b.history]
+    check(json.loads(contents[1]) == {"say": "On it, I'll...", "delegate": "Fix it"}
+          and json.loads(contents[3]) == {"say": "", "delegate": "Wait for it"}
+          and contents[4] == f"{INTERRUPTED} next",
+          f"json turn: a delegation landing after its turn was cut joins that turn's place in history {contents}")
 
 
 def units() -> int:
@@ -567,6 +583,7 @@ def fake_front() -> tuple[str, list[dict[str, Any]]]:
             self.send_header("Content-Type", "text/event-stream")
             self.end_headers()
             raw: list[str] = []
+            delay = 0.0
             if text.startswith(EVENT):
                 deltas = turn("All the tests pass now.")
             elif "goodbye" in text.lower():
@@ -581,6 +598,9 @@ def fake_front() -> tuple[str, list[dict[str, Any]]]:
                 deltas = turn("I'll let you know.", "Never sent", cut=8)
             elif "plaintext" in text:
                 deltas = [{"content": "Plain words. "}, {"content": "No JSON here."}]
+            elif "slow work" in text:  # a long "on it", then the delegate field: cut while it is spoken
+                deltas = turn("".join(f"Working on part {i} of it now. " for i in range(8)), "Rebuild the cache")
+                delay = 0.03
             elif "fix" in text:
                 deltas = turn("On it.", "Fix the failing test in parser.py")
             else:
@@ -589,6 +609,7 @@ def fake_front() -> tuple[str, list[dict[str, Any]]]:
                 self.wfile.write(f"{r}\n\n".encode())
             for d in deltas:
                 self.wfile.write(f"data: {json.dumps({'choices': [{'delta': d}]})}\n\n".encode())
+                time.sleep(delay)
             self.wfile.write(b"data: [DONE]\n\n")
 
     srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
@@ -801,6 +822,24 @@ async def selftest_sessions(check: Checker) -> None:
     await turn_done()
     check(said() == "Plain words. No JSON here." and any("plain text" in o["text"] for o in emitted("log")),
           "front: a server that ignores response_format is spoken as plain text, with a log line")
+
+    out.clear()
+    utter("slow work please")
+    await until(lambda: sess.state == "speaking", 5)
+    await asyncio.sleep(0.2)
+    sess.post("speech_start", 1.0)  # barge in while "on it" is spoken, before the delegate field has streamed
+    await turn_done()
+    cut_early = not emitted("delegate")
+    await until(lambda: emitted("delegate"), 5)
+    asked = next(i for i, m in enumerate(brain.history) if m["content"] == f"{INTERRUPTED} slow work please"
+                 or m["content"] == "slow work please")
+    entry = json.loads(brain.history[asked + 1]["content"]) if len(brain.history) > asked + 1 else {}
+    check(cut_early and emitted("delegate") == [{"type": "delegate", "text": "Rebuild the cache"}]
+          and entry.get("delegate") == "Rebuild the cache" and "Working on part 0" in str(entry.get("say", ""))
+          and "part 7" not in str(entry.get("say", "")),
+          f"front: a turn cut while 'on it' is spoken still hands off its delegate field, and history shows it {entry}")
+    sess.post("discard", None)
+    await until(lambda: sess.state == "listening")
 
     dead = make_brain("llamacpp", "http://127.0.0.1:9", "")
     assert dead is not None

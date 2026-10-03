@@ -11,6 +11,7 @@ import contextlib
 import json
 import re
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, ClassVar
 
@@ -303,6 +304,18 @@ class TurnStream:
             out.append(text)  # braces inside the string (Qwen3-4B once said "you're welcome'}{"); never speak them
 
 
+@dataclass
+class FrontTurn:
+    """One llama.cpp front turn, kept past its end so a delegation that arrives after a cut joins its history."""
+
+    asked: dict[str, Any] | None = None  # the user's message in history
+    answer: dict[str, Any] | None = None  # the assistant's entry, once committed
+    request: str = ""  # what was delegated
+    heard: str = ""  # what of "say" was heard
+    cut_at: float | None = None  # when the turn was cut while its reply was still streaming
+    committed: bool = False
+
+
 class LlamaCppBrain(Brain):
     """llama-server (llama.cpp) or any OpenAI-compatible endpoint that takes response_format json_schema.
 
@@ -322,9 +335,12 @@ class LlamaCppBrain(Brain):
         'conversation, whenever the user asks for any work; otherwise "". When delegate is set, say is a few words '
         "that you are on it. Only delegate hands work off: saying that you are on it hands off nothing."
     )
-    FORMAT: ClassVar[dict[str, Any]] = {"type": "json_schema", "json_schema": {"name": "front_turn", "strict": True, "schema": {
+    FORMAT: ClassVar[dict[str, Any]] = {"type": "json_schema", "json_schema": {
+        "name": "front_turn", "strict": True, "schema": {
         "type": "object", "properties": {"say": {"type": "string"}, "delegate": {"type": "string"}},
         "required": ["say", "delegate"], "additionalProperties": False}}}
+
+    DRAIN_S = 10.0  # how long a cut turn's reply is still read for its delegate field
 
     def __init__(self, system: str, url: str, model: str):
         super().__init__(system + self.PROTOCOL)
@@ -334,11 +350,17 @@ class LlamaCppBrain(Brain):
         self.model = model or "default"
         # read: the longest gap between two streamed chunks; a model that stalls that long has failed this turn
         self.client = httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=5.0, write=10.0, pool=5.0))
-        self.request = ""  # this turn's delegation, committed with the words
+        self.current = FrontTurn()
+        self._readers: set[asyncio.Task] = set()  # replies still read after their turn was cut
 
     @property
     def where(self) -> str:
         return f"{self.url} model {self.model}"
+
+    @property
+    def request(self) -> str:
+        """This turn's delegation so far."""
+        return self.current.request
 
     def _body(self, messages: list[dict[str, Any]], max_tokens: int, stream: bool) -> dict[str, Any]:
         return {"model": self.model, "messages": messages, "response_format": self.FORMAT, "stream": stream,
@@ -351,46 +373,105 @@ class LlamaCppBrain(Brain):
         r.raise_for_status()
 
     def begin(self, user_text: str) -> None:
-        self.request = ""
         super().begin(user_text)
+        self.current = FrontTurn(asked=self.history[-1])
 
     def said(self, text: str) -> str | None:
         """In the shape the model answers in, so its own past turns teach the format; a delegation stays even when
         nothing of the reply was heard."""
-        if not (text or self.request):
+        self.current.heard = text
+        if not (text or self.current.request):
             return None
-        return json.dumps({"say": text, "delegate": self.request}, ensure_ascii=False)
+        return json.dumps({"say": text, "delegate": self.current.request}, ensure_ascii=False)
+
+    def commit(self, spoken: str, interrupted: bool) -> str:
+        text = super().commit(spoken, interrupted)
+        last = self.history[-1] if self.history else None
+        self.current.answer = last if last is not None and last["role"] == "assistant" else None
+        self.current.committed = True
+        return text
+
+    def _amend(self, turn: FrontTurn) -> None:
+        """A delegation that arrived after its turn was committed (cut while "on it" was spoken) joins that turn's
+        history entry, or becomes one right after the user's message."""
+        content = json.dumps({"say": turn.heard, "delegate": turn.request}, ensure_ascii=False)
+        if turn.answer is not None:
+            turn.answer["content"] = content
+            return
+        at = next((i for i, m in enumerate(self.history) if m is turn.asked), None)
+        if at is not None:
+            turn.answer = {"role": "assistant", "content": content}
+            self.history.insert(at + 1, turn.answer)
 
     async def respond(self, user_text: str, tools: Delegator) -> AsyncIterator[str]:
+        """Speaks the reply's "say" as it streams. The reply is read by its own task, which hands off the delegate
+        field even when this turn is cut first: the user may already have heard "on it"."""
         self.begin(user_text)
         msgs: list[dict[str, Any]] = [{"role": "system", "content": self.system}, *self.history]
+        turn = self.current
+        words: asyncio.Queue[str | None] = asyncio.Queue()
+        reader = asyncio.create_task(self._read(msgs, turn, words, tools))
+        finished = False
+        try:
+            while (said := await words.get()) is not None:
+                yield said
+            await reader  # its delegation is made before it ends the words; raises the turn's failure
+            finished = True
+        finally:
+            if not finished and not reader.done():
+                turn.cut_at = time.monotonic()
+                self._readers.add(reader)
+                reader.add_done_callback(self._reader_done)
+
+    def _reader_done(self, task: asyncio.Task) -> None:
+        self._readers.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            e = task.exception()
+            log(f"front: reading a cut turn's reply failed ({type(e).__name__}: {str(e)[:120]})")
+
+    async def _read(self, msgs: list[dict[str, Any]], turn: FrontTurn, words: asyncio.Queue[str | None],
+                    tools: Delegator) -> None:
         # raw -> no think block (one can lead the JSON) -> the "say" field -> no notes or think blocks -> speech
-        think, turn, speech, bad = SpeechFilter(notes=False), TurnStream(), SpeechFilter(), 0
-        async with self.client.stream("POST", f"{self.url}/v1/chat/completions",
-                                      json=self._body(msgs, 400, True)) as r:
-            if r.status_code >= 400:
-                await r.aread()
-                raise RuntimeError(f"HTTP {r.status_code}: {r.text[:160]}")
-            async for line in r.aiter_lines():
-                kind, delta = parse_sse(line)
-                if kind == "done":
-                    break
-                if kind == "bad":
-                    bad += 1
-                text = (delta or {}).get("content")
-                if isinstance(text, str) and text and (said := speech.push(turn.push(think.push(text)))):
-                    yield said
-        if said := speech.push(turn.push(think.flush())) + speech.flush():
-            yield said
-        if bad:
-            log(f"front: skipped {bad} malformed stream line(s) from {self.url}")
-        requests = [turn.fields.get("delegate", "").strip()] + speech.delegations()
-        if turn.plain:
-            log(f"front: {self.url} answered in plain text, not the JSON turn; does it take response_format?")
-        for request in requests[:1] if requests[0] else requests[1:]:  # the field, or the notes written instead
-            if request and request.lower().strip(".") not in NO_REQUEST:
-                await tools.call("delegate", {"request": request})
-                self.request = f"{self.request} {request}".strip()
+        think, json_turn, speech, bad = SpeechFilter(notes=False), TurnStream(), SpeechFilter(), 0
+        try:
+            async with self.client.stream("POST", f"{self.url}/v1/chat/completions",
+                                          json=self._body(msgs, 400, True)) as r:
+                if r.status_code >= 400:
+                    await r.aread()
+                    raise RuntimeError(f"HTTP {r.status_code}: {r.text[:160]}")
+                async for line in r.aiter_lines():
+                    kind, delta = parse_sse(line)
+                    if kind == "done":
+                        break
+                    if kind == "bad":
+                        bad += 1
+                    text = (delta or {}).get("content")
+                    if isinstance(text, str) and text and (said := speech.push(json_turn.push(think.push(text)))):
+                        words.put_nowait(said)
+                    if turn.cut_at is not None and ("delegate" in json_turn.fields
+                                                    or time.monotonic() - turn.cut_at > self.DRAIN_S):
+                        break  # cut: only the delegate field was still wanted
+            if said := speech.push(json_turn.push(think.flush())) + speech.flush():
+                words.put_nowait(said)
+            if bad:
+                log(f"front: skipped {bad} malformed stream line(s) from {self.url}")
+            if json_turn.plain:
+                log(f"front: {self.url} answered in plain text, not the JSON turn; does it take response_format?")
+            requests = [json_turn.fields.get("delegate", "").strip()] + speech.delegations()
+            for request in requests[:1] if requests[0] else requests[1:]:  # the field, or the notes written instead
+                if request and request.lower().strip(".") not in NO_REQUEST:
+                    await tools.call("delegate", {"request": request})
+                    turn.request = f"{turn.request} {request}".strip()
+                    if turn.committed:  # cut, and its words already in history
+                        log(f"front: the turn was cut, but its delegation went out: {request!r}")
+                        self._amend(turn)
+        finally:
+            words.put_nowait(None)
+
+    async def aclose(self) -> None:
+        for task in list(self._readers):
+            task.cancel()
+        await self.client.aclose()
 
 
 # Haiku 4.5 and Sonnet 4.5 reject output_config.effort; the server-side fallback takes only the newest models.
