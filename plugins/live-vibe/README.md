@@ -135,7 +135,7 @@ The file rotates at 5 MB and keeps one previous copy (`sidecar.log.1`). If the p
 
 The `experimental` setting turns on changes from the GPT-Live design notes
 (`docs/design/gpt-live-informed-voice.md`), all at once. With it off, the sidecar and the relay prompt behave exactly
-as in 0.6.4.
+as in 0.6.4, except that the 30 s maximum-utterance extension stays on regardless, since it is a bug fix.
 
 - **Stable front cache.** The front's history no longer drops its oldest message every turn past 40, which moved
   everything after the system prompt and cost llama-server its prompt cache on each request. Past 40 messages it is
