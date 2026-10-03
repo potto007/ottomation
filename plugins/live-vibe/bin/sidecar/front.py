@@ -94,8 +94,8 @@ RETELL = ("(Retell that report to the user in one to three short sentences, with
           "a question, end by asking the user that question; do not answer it.)")
 
 
-WAITING = ("(That report came in while the user was talking; their words follow. Answer them with it, keeping its "
-           "status as written.)")
+WAITING = ("(That report came in while the user was talking; their words follow. Use it only if it answers them; if "
+           "it does not, delegate their question.)")  # "answer them with it" had Qwen3-4B invent an answer from it
 
 
 def event_message(report: str, note: str = RETELL) -> str:
