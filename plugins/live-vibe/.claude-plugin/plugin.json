@@ -8,6 +8,7 @@
     "email": "potto007@gmail.com"
   },
   "repository": "https://github.com/potto007/ottomation",
+  "license": "MIT",
   "keywords": ["function-hooks", "voice", "vibe", "subagents"],
   "types": "./types/index.d.ts",
   "userConfig": {
