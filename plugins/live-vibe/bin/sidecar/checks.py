@@ -443,6 +443,26 @@ def units() -> int:
         protocol.capture(None)
     check(bad.startswith("error") and out == [{"type": "delegate", "text": "Fix it"}] and good.startswith("Handed off"),
           "delegate: bad JSON arguments answer the model, a good call reaches Claude")
+    out.clear()
+    protocol.capture(out)
+    try:
+        d = Delegator()
+        first = asyncio.run(d.call("delegate", {"request": "Play the test sentences and report back."}))
+        again = asyncio.run(d.call("delegate", {"request": "play the test sentences, and report back"}))
+        other = asyncio.run(d.call("delegate", {"request": "Run the unit tests."}))
+        d.announcing = True
+        on_result = asyncio.run(d.call("delegate", {"request": "Fix the build."}))
+        d.announcing = False
+        d.sent = [(t - d.REPEAT_S - 1, r) for t, r in d.sent]
+        later = asyncio.run(d.call("delegate", {"request": "Play the test sentences and report back."}))
+    finally:
+        protocol.capture(None)
+    sent = [o["text"] for o in out if o["type"] == "delegate"]
+    check(first.startswith("Handed off") and again.startswith("Not handed off") and other.startswith("Handed off")
+          and on_result.startswith("Not handed off") and later.startswith("Handed off")
+          and sent == ["Play the test sentences and report back.", "Run the unit tests.",
+                       "Play the test sentences and report back."],
+          f"delegate: no repeat within {Delegator.REPEAT_S:.0f} s, nothing while a result is announced {sent}")
     b = Brain()
     for i in range(HISTORY_MAX):
         b.begin(f"u{i}")
@@ -635,7 +655,9 @@ def fake_front() -> tuple[str, list[dict[str, Any]]]:
             self.end_headers()
             raw: list[str] = []
             delay = 0.0
-            if text.startswith(EVENT):
+            if text.startswith(EVENT) and "next steps" in text:  # a small model re-delegating a result's to-dos
+                deltas = turn("I'll get the test sentences playing.", "Play the test sentences and report back")
+            elif text.startswith(EVENT):
                 deltas = turn("All the tests pass now.")
             elif "goodbye" in text.lower():
                 deltas = turn("Goodbye.")
@@ -678,7 +700,7 @@ def post(port: int, path: str, body: str = "", token: str | None = None) -> int:
             return r.status
     except urllib.error.HTTPError as e:
         return e.code
-    except urllib.error.URLError:  # e.g. reset while still sending a body the server already refused
+    except (urllib.error.URLError, ConnectionError):  # reset: the server refused the body, or exited first
         return -1
 
 
@@ -808,6 +830,14 @@ async def selftest_sessions(check: Checker) -> None:
     check(brain.history[-2]["content"].startswith(f"{EVENT} Fixed parser.py") and said() == "All the tests pass now.",
           "announcer: then the front relays it as a [task finished] turn")
 
+    out.clear()
+    r = await asyncio.to_thread(post, port, "/event", "Done. next steps: play the test sentences and report back.", token)
+    await until(lambda: said() == "I'll get the test sentences playing.", 5)
+    await turn_done()
+    check(r == 204 and not emitted("delegate") and delegated() == ""
+          and any("announces a result" in o["text"] for o in emitted("log")),
+          "announcer: a result listing next steps is reported, never re-delegated (no delegation loop)")
+
     tts.started.clear()
     player.ended.clear()
     utter("tell me something long")
@@ -886,7 +916,7 @@ async def selftest_sessions(check: Checker) -> None:
                  or m["content"] == "slow work please")
     entry = json.loads(brain.history[asked + 1]["content"]) if len(brain.history) > asked + 1 else {}
     check(cut_early and emitted("delegate") == [{"type": "delegate", "text": "Rebuild the cache"}]
-          and entry.get("delegate") == "Rebuild the cache" and "Working on part 0" in str(entry.get("say", ""))
+          and entry.get("delegate") == "Rebuild the cache" and str(entry.get("say", "")).startswith("Working")
           and "part 7" not in str(entry.get("say", "")),
           f"front: a turn cut while 'on it' is spoken still hands off its delegate field, and history shows it {entry}")
     sess.post("discard", None)
