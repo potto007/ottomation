@@ -54,7 +54,7 @@ def run(args: argparse.Namespace) -> int:
     managed_front(check, args)  # first, as in a live run: the front model has the first claim on the GPU
     from . import gpu, speech
 
-    gpu.hold("stt", speech.stt_gpu_need(args.stt))  # as in a live run: the recognizer has the first claim
+    gpu.hold("stt", speech.stt_gpu_need(args.stt))  # as in a live run: the recognizer claims before Kokoro
     tts = synthesizer(check, args)
     recognized = recognizer(check, args)
     if tts is not None and recognized is not None:

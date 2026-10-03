@@ -44,7 +44,7 @@ Everything the sidecar says (startup, which recognizer and synthesizer ran or fe
 2026-10-02T23:14:50.101-06:00 WARNING pid=786551 Kyutai STT on CUDA unavailable (...); using Whisper.
 ```
 
-The file rotates at 5 MB and keeps one previous copy (`sidecar.log.1`). If the path cannot be written, the sidecar warns once and carries on without it.
+The file rotates at 5 MB and keeps one previous copy (`sidecar.log.1`). If the path cannot be written, the sidecar warns once and carries on without it. The managed front server's own output goes to a separate file, `front-server.log` beside it (the `frontServerLog` setting); the sidecar log gets its start, command line, port and stop.
 
 ## Settings (`/config`)
 
@@ -58,7 +58,7 @@ The file rotates at 5 MB and keeps one previous copy (`sidecar.log.1`). If the p
 | `speaker` | empty | Output device, the same way. |
 | `logFile` | empty | Sidecar log path; empty means `~/.cache/duplex_voice/sidecar.log`. |
 | `endSilenceMs` | 1500 | Whisper: the pause that ends your turn. Kyutai: only a cap on a pause between words. |
-| `frontBackend` | `llamacpp` | `llamacpp` (any OpenAI-compatible server) or `anthropic` (needs `ANTHROPIC_API_KEY` or `ant auth login`). |
+| `frontBackend` | `llamacpp` | `llamacpp` (the managed llama-server, or any OpenAI-compatible server that takes `response_format`) or `anthropic` (needs `ANTHROPIC_API_KEY` or `ant auth login`). |
 | `frontUrl` | empty | Empty: a managed llama-server (below). Set: the front's server, which can be another host, such as a GPU box; nothing starts locally. |
 | `frontServerBin` | empty | Managed server: an existing `llama-server` to run instead of the download. |
 | `frontServerModel` | empty | Managed server: an existing GGUF to serve instead of the default model. |
