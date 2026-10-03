@@ -25,11 +25,25 @@ Claude's answers print as usual. Around them, each line starts with `live-vibe:`
 | `front prompt (3 lines, ctrl+o to expand): task: ...` | The prompt the front handed Claude (your words, the front's reading, the instructions), drawn as one line; ctrl+o shows it whole. |
 | `no update (nothing to add)` | A Claude turn with nothing new, such as a worker's notification repeating a report: the front says nothing. |
 
+## Barge-in
+
+Talking over the voice stops it on your first word. A word the echo guard places in what the speaker played in
+the last 2.5 s is the assistant's own echo and does not stop it (the sidecar log says `reason=echo-ignored`). Without
+a running echo canceller (AEC3 off or missing), the sidecar cannot tell echo from you, and three words stop it, as
+before. On the Whisper recognizer, the speech onset is transcribed until it shows a word.
+
+The first word pauses the voice rather than ending it. If what you said turns out to be only a listening sound
+("mm-hm", "uh-huh", "yeah", "okay", "right", "sure", "got it") and ends within 1.2 s, the voice picks up from the
+sample where it stopped, and your words reach Claude as a note, not a prompt. Anything else ends the answer there:
+the rest of the sentence and the sentences after it are dropped, and only the words actually played count as heard
+(a cut sentence up to its last whole word in the played share of its audio). Each barge-in writes one line to the
+sidecar log: `barge-in: words=<n> at_ms=<ms of the clip played> resumed=<yes|no> reason=<backchannel|speech|echo-ignored>`.
+
 ## Requirements
 
 - Claude Code 2.1.287 or newer (mods are on by default from that build).
 - [uv](https://docs.astral.sh/uv/). The sidecar is a PEP 723 script; uv installs Python 3.12 and its packages on first use.
-- A microphone and speaker on the machine running Claude Code. A headless or SSH-only box cannot use voice; `/vibe` still works there. Headphones are best, because the mic stays open while the assistant speaks. On open speakers, the sidecar cancels the assistant's echo from the mic (WebRTC AEC3, through the `livekit` package), keeps barge-in strict until the speaker has gone quiet, and drops utterances that only repeat what it just said. Pick devices with the `mic` and `speaker` settings; `--list-devices` (below) shows the choices.
+- A microphone and speaker on the machine running Claude Code. A headless or SSH-only box cannot use voice; `/vibe` still works there. Headphones are best, because the mic stays open while the assistant speaks. On open speakers, the sidecar cancels the assistant's echo from the mic (WebRTC AEC3, through the `livekit` package), keeps barge-in strict until the speaker has gone quiet, and drops utterances that only repeat what it just said (see Barge-in below). Pick devices with the `mic` and `speaker` settings; `--list-devices` (below) shows the choices.
 - Per OS:
   - **macOS (Apple silicon):** `brew install espeak-ng` for Kokoro. Kyutai STT runs on MLX.
   - **Linux:** `sudo apt install espeak-ng libportaudio2`. On x86_64, uv also installs PyTorch with CUDA and Kyutai's `moshi` package (about 3 GB the first time), and Kyutai STT runs on an Nvidia GPU (about 3.2 GB of VRAM; it needs 5 GB free when it starts, else Whisper runs). Without a usable GPU, Whisper runs instead: on an Nvidia GPU when CTranslate2 finds one, CUDA 12 cuBLAS and cuDNN 9 are installed and the GPU has room, otherwise on the CPU. Kokoro runs on the GPU through onnxruntime-gpu (a CUDA 12 build, sharing PyTorch's CUDA and cuDNN wheels), when about 1.4 GB of VRAM still leaves 3 GB free; otherwise on the CPU, which is fast enough. Every GPU backend checks free VRAM first, so a GPU already busy with another model (a local LLM server) does not get pushed into paging; the log says where each one runs (`tts: Kokoro ... on CUDAExecutionProvider` or `CPUExecutionProvider`).
@@ -177,6 +191,12 @@ What reaches Claude from the front:
 - Whatever the user says without asking for work (a confirmation, a correction, a decision) joins Claude's
   conversation as a note, without starting a turn. A reply to a question in Claude's last answer is a prompt.
 - A question the front answered itself starts a Claude turn, so Claude gives the real answer.
+- A retelling of Claude's answer that the user cut off joins the conversation as `[The user cut off the voice
+  front's retelling of your last answer; it was spoken up to: "...<its last 12 words heard>"]` (or that they heard
+  none of it), so Claude does not assume the rest was heard. A reply of the front's own that was cut reaches Claude
+  inside its note, as heard: up to its last whole word, then `...`.
+- A backchannel the voice played on through ("mm-hm") joins as `[The user, by voice, said "Mm-hm." while
+  listening; the voice played on (no task asked)]`.
 
 Claude's results are announced when nobody is talking. A result that arrives while the user is speaking goes into the
 front's reply to them instead; results that waited together are one announcement, and none is announced twice.
