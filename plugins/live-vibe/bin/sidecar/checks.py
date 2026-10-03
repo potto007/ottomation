@@ -395,6 +395,9 @@ def report_units(check: Checker) -> None:
     check(report_brief("Lead.\n\n1. one\n\n2. two") == "Lead.",
           "report brief: only the lead when nothing after it is prose")
     check(len(report_brief("x" * (EVENT_CHARS + 50))) == EVENT_CHARS, "report brief: cut at EVENT_CHARS")
+    got = report_brief("One change fixed it.\n\n| a | b |\n|---|---|\n\n**Why:** WSLg.\n\n**Still open:** echo. Test it?")
+    check(got == "One change fixed it.\n\n**Still open:** echo. Test it?",
+          f"report brief: a paragraph led by bold text is prose, so it can be the tail {got!r}")
     msg = event_message('Done. Want me to run "make test" now?')
     check(msg == f"{EVENT} \"Done. Want me to run 'make test' now?\"\n{RETELL}" and "do not answer" in RETELL,
           f"event message: the report quoted, then the retell reminder, so its question is not the last word {msg!r}")

@@ -74,7 +74,7 @@ FRONT_PROMPT = (
 HANDED_OFF = "Handed off"
 
 _HEADING = re.compile(r"^\s{0,3}#{1,6}\s.*$", re.M)
-_NOT_PROSE = re.compile(r"^\s*(?:[-*+|>]|\d+[.)]\s|```)")
+_NOT_PROSE = re.compile(r"^\s*(?:[-*+]\s|[|>]|\d+[.)]\s|```)")  # "**Still open:** ..." is prose, "- a" is not
 
 
 def report_brief(text: str) -> str:
