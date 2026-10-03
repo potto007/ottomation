@@ -386,6 +386,9 @@ def front_history(check: Checker) -> None:
           f"acknowledgement: a short first sentence with no claim about the work, else {ACK!r} {acks}")
     got = [asked("Good question. It was likely the routing."), asked("It was fixed in the audio pipeline config.")]
     check(got == [f"Good question. {ASKED}", ASKED], f"asked: the short first sentence, then {ASKED!r} {got}")
+    got = [asked("I have asked. More later."), asked("I've asked about the review."), acknowledgement("I've asked.")]
+    check(got == ["I have asked.", "I've asked about the review.", "I've asked."],
+          f"asked: a first sentence that already says it asked gets no second 'asked' {got}")
     guesses = ["The fix was in the audio pipeline config.", "It was likely the routing.", "Probably the new player.",
                "It stopped because of the buffer.", "That was due to WSLg."]
     got = [asked(g) for g in guesses] + [acknowledgement(g) for g in guesses]

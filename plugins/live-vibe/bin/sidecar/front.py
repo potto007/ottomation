@@ -350,6 +350,8 @@ def asked(say: str) -> str:
     gets the question (an `ask` note) and gives the real answer; seen with Qwen3-4B on "so what was the fix?" with
     only a log report to go on, every reply guessed a cause after its first sentence."""
     first = short_first(say)
+    if re.search(r"\basked\b", first, re.I):  # "I have asked." then ASKED was said twice (seen with Qwen3.6-35B)
+        return first
     return f"{first} {ASKED}" if first else ASKED
 
 
