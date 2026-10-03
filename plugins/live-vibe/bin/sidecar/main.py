@@ -97,7 +97,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--mic", default="", help="input device: index or name substring (see --list-devices)")
     ap.add_argument("--speaker", default="", help="output device: index or name substring")
     ap.add_argument("--speaker-backend", choices=["auto", "local", "windows"], default="auto",
-                    help="auto: under WSL, play on Windows (win_player.py through interop) instead of WSLg")
+                    help="auto: under WSL, play on Windows (win_player.exe through interop) instead of WSLg")
     ap.add_argument("--front-backend", choices=["llamacpp", "anthropic"], default="llamacpp")
     ap.add_argument("--front-url", default="", help="OpenAI-compatible server; empty: run a managed llama-server")
     ap.add_argument("--front-server-bin", default="", help="managed front: an existing llama-server (no download)")
@@ -162,16 +162,25 @@ def run(args: argparse.Namespace, life: protocol.Lifecycle) -> int:
     reference = EchoReference(tts.sample_rate) if sd is not None else None
     listener.reference = reference  # read by the mic callback, which opens later
     player = None
+    local = lambda: audio.Player(sd, tts.sample_rate, speaker, reference, guard)  # noqa: E731
     if launch is not None:
         player = launch.player(tts.sample_rate, reference, guard)
         if player is not None:  # if it dies mid-session, the local speaker takes over
-            player.fallback = lambda: audio.Player(sd, tts.sample_rate, speaker, reference, guard)
+            player.fallback = local
     if player is None:
         try:
-            player = audio.Player(sd, tts.sample_rate, speaker, reference, guard)
+            player = local()
         except Exception as e:  # noqa: BLE001 - no speaker: keep listening, answer silently
             warn(f"speaker unavailable ({type(e).__name__}: {str(e)[:160]}); answers are not read aloud.")
             player = audio.Player(None, tts.sample_rate)
+    if launch is not None:  # after a Windows player failure, one background retry; it takes over between sentences
+        def retry():
+            p = winplayer.Launch(args.speaker).start().player(tts.sample_rate, reference, guard, report=log)
+            if p is not None:
+                p.fallback = local
+            return p
+
+        player = winplayer.Speaker(player, retry)
     try:
         if not listener.wait_built():
             if listener.error is not None:

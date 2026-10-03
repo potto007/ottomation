@@ -1,14 +1,22 @@
 """Speech on Windows for a sidecar under WSL. WSLg carries audio over RDP, and on WSL2 that transport adds crackle
 the Linux side never produced (measured: the RDPSink monitor matched a fresh Kokoro render). So the sidecar can play
-through win_player.py on Windows instead: uv.exe runs it through WSL interop, and the PCM streams over its stdin, so
-there is no network, port or firewall. The mic stays on WSLg.
+through win_player.exe on Windows instead (a native binary built from ../../win_player, shipped prebuilt next to
+this file): WSL interop runs it, and the PCM streams over its stdin, so there is no network, port or firewall. The
+mic stays on WSLg. When the exe is missing, win_player.py (the same player in Python) runs through uv.exe instead.
 
-Everything on Windows lives in %LOCALAPPDATA%\\live-vibe: a pinned uv.exe when none is on the PATH, uv's cache, any
-Python uv downloads, and a copy of win_player.py. Nothing is installed globally.
+Everything on Windows lives in %LOCALAPPDATA%\\live-vibe: a copy of win_player.exe named by its content (Windows
+locks a running exe, so an update never overwrites another session's), and for the Python fallback a pinned uv.exe
+when none is on the PATH, uv's cache, any Python uv downloads, and a copy of win_player.py. Nothing is installed
+globally.
 
-Echo alignment: the player reports, per device callback, which samples of which clip it handed to WASAPI and the
-DAC time of the first one on its perf counter (QueryPerformanceCounter; PortAudio's outputBufferDacTime, or the
-callback time plus the stream latency where the host API gives none). Ping/pong maps that clock onto
+Startup: the reader starts with the process, and the once-a-second ping (the player's heartbeat) starts at its
+`hello`, so a player launched while the models load is not ended by its own watchdog. The device open gets
+OPEN_WAIT_S; the exe reports `opening` progress, and the log carries hello and open timings. If the Windows player
+fails, at start or mid-session, Speaker plays through WSLg and retries the Windows player once in the background.
+
+Echo alignment: the player reports, per device period, which samples of which clip it handed to WASAPI and the
+DAC time of the first one on its perf counter (QueryPerformanceCounter; IAudioClock's position, or the time now
+plus what is queued and the stream latency when the clock gives none). Ping/pong maps that clock onto
 time.monotonic() (offset of the lowest-round-trip exchange of the last 32, error within half that round trip, about
 a millisecond over the interop pipe), and EchoReference.played_at moves it onto the mic stream's clock. The reference
 then leads the echo by what no one reports: device and driver latency past WASAPI (a Bluetooth link: 100-250 ms),
@@ -17,6 +25,7 @@ sync error, and AEC3's delay estimator absorbs it (offline it held 150-600 ms)."
 from __future__ import annotations
 
 import collections
+import hashlib
 import json
 import os
 import platform
@@ -35,10 +44,13 @@ import numpy as np
 from .protocol import file_log, log, warn
 
 SCRIPT = Path(__file__).with_name("win_player.py")
+EXE = Path(__file__).with_name("win_player.exe")  # built by ../../win_player/build.sh
 HEADER = struct.Struct("<cI")
 AUDIO = struct.Struct("<III")
 READY_TIMEOUT_S = 45.0  # a run whose uv cache is cold fetches Python and numpy first; /live setup does that ahead
 SETUP_TIMEOUT_S = 600.0
+OPEN_WAIT_S = 30.0  # from `open` sent to the device open (the exe takes tens of ms; it has its own 45 s limit)
+RETRY_DELAY_S = 5.0  # after a failure, before the one background retry
 
 # uv 0.10.8 for Windows; sha256 digests are GitHub's own, from the release API (assets[].digest).
 UV_VERSION = "0.10.8"
@@ -187,6 +199,36 @@ def stage_script(paths: WinPaths) -> str:
     return paths.win("win_player.py")
 
 
+def stage_exe(paths: WinPaths) -> Path:
+    """A copy of win_player.exe on the Windows drive, named by its content: Windows locks a running exe, so another
+    session's player is never overwritten; copies no longer running are removed."""
+    data = EXE.read_bytes()
+    dest = paths.root / f"win_player-{hashlib.sha256(data).hexdigest()[:12]}.exe"
+    if not dest.exists() or dest.stat().st_size != len(data):
+        paths.root.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_suffix(".part")
+        tmp.write_bytes(data)
+        tmp.replace(dest)
+    try:
+        os.chmod(dest, 0o755)
+    except OSError:
+        pass
+    for old in paths.root.glob("win_player-*.exe"):
+        if old != dest:
+            try:
+                old.unlink()
+            except OSError:
+                pass  # running in another session
+    return dest
+
+
+def exe_command(exe: Path, speaker: str, latency: float) -> list[str]:
+    argv = [str(exe), "--latency", str(latency)]
+    if speaker:
+        argv += ["--speaker", speaker]
+    return argv
+
+
 def command(paths: WinPaths, uv: Path, script: str, speaker: str, latency: float) -> tuple[list[str], dict[str, str]]:
     env = dict(os.environ)
     env.update(UV_CACHE_DIR=paths.win("uv-cache"), UV_PYTHON_INSTALL_DIR=paths.win("python"), UV_NO_PROGRESS="1")
@@ -200,7 +242,7 @@ def command(paths: WinPaths, uv: Path, script: str, speaker: str, latency: float
 
 # -- the player -----------------------------------------------------------------------------------------------
 class WinPlayer:
-    """audio.Player's interface over win_player.py: play() blocks, stops within one pipe round trip of `cancel`
+    """audio.Player's interface over the Windows player: play() blocks, stops within one pipe round trip of `cancel`
     (the player drops its queue and the device buffer), and returns how many samples were played. The reader thread
     turns the player's reports into the echo reference and the echo guard's tail, as the local callback does."""
 
@@ -238,6 +280,10 @@ class WinPlayer:
         self._broken = False
         self._delegate: Any = None
         self._closed = False
+        self._t0 = time.monotonic()  # the process started about now
+        self._opening: dict[str, Any] = {}  # the last `opening` progress line
+        self._open_sent = 0.0
+        self._beating = False
         threading.Thread(target=self._read, name="winplayer-out", daemon=True).start()
         threading.Thread(target=self._drain_stderr, name="winplayer-err", daemon=True).start()
 
@@ -304,8 +350,18 @@ class WinPlayer:
         elif t == "xrun":
             self.underflows = int(msg.get("total", self.underflows + 1))
         elif t == "hello":
-            self.info["pid"], self.info["python"] = msg.get("pid"), msg.get("python")
+            self.info["pid"], self.info["python"], self.info["player"] = msg.get("pid"), msg.get("python"), msg.get("player")
+            log(f"windows player: hello after {1000 * (time.monotonic() - self._t0):.0f} ms (Windows pid {msg.get('pid')}, "
+                f"{msg.get('player') or 'Python ' + str(msg.get('python'))})")
             self._hello.set()
+            if not self._beating:  # from here on the player hears from us every second, even before open()
+                self._beating = True
+                threading.Thread(target=self._heartbeat, name="winplayer-ping", daemon=True).start()
+        elif t == "opening":
+            self._opening = msg
+            since = f", {1000 * (time.monotonic() - self._open_sent):.0f} ms after open" if self._open_sent else ""
+            extra = f", {msg.get('device')} ({msg.get('note')})" if msg.get("device") else ""
+            file_log("INFO", f"windows player: opening: {msg.get('stage')} at +{msg.get('ms')} ms player side{since}{extra}")
         elif t == "open":
             self.info.update(msg)
             self._opened.set()
@@ -346,10 +402,19 @@ class WinPlayer:
         if not self._wait(self._hello, deadline):
             self.error = self.error or ("the process exited" if self._gone.is_set() else f"no answer within {timeout:.0f}s")
             return False
+        self._open_sent = time.monotonic()
         self._send_json(op="open", rate=rate)
-        if not self._wait(self._opened, min(deadline, time.monotonic() + 10.0)) or "device" not in self.info:
-            self.error = self.error or "the device did not open"
+        if not self._wait(self._opened, time.monotonic() + OPEN_WAIT_S) or "device" not in self.info:
+            took = time.monotonic() - self._open_sent
+            if not self.error:
+                stage = self._opening.get("stage")
+                where = (f"the player reached '{stage}' at +{self._opening.get('ms')} ms" if stage else
+                         "no progress from the player" if self.info.get("player") else "win_player.py reports no progress")
+                self.error = (f"the device did not open ({'the process exited' if self._gone.is_set() else 'no answer'} "
+                              f"after {took:.1f}s; {where})")
             return False
+        log(f"windows player: device open {1000 * (time.monotonic() - self._open_sent):.0f} ms after the request, "
+            f"{1000 * (time.monotonic() - self._t0):.0f} ms after launch")
         for _ in range(8):
             self._send_json(op="ping", t=time.monotonic())
             time.sleep(0.02)
@@ -358,7 +423,6 @@ class WinPlayer:
             time.sleep(0.01)
         if self.offset is None:
             log("windows player: no clock sync; the echo reference uses the stream latency instead")
-        threading.Thread(target=self._heartbeat, name="winplayer-ping", daemon=True).start()
         return True
 
     def _wait(self, ev: threading.Event, deadline: float) -> bool:
@@ -368,8 +432,8 @@ class WinPlayer:
         return True
 
     def _heartbeat(self) -> None:
-        while not self._gone.wait(self.PING_S):
-            if not self._send_json(op="ping", t=time.monotonic()):
+        while self._send_json(op="ping", t=time.monotonic()):
+            if self._gone.wait(self.PING_S):
                 return
 
     @property
@@ -385,8 +449,9 @@ class WinPlayer:
 
     def describe(self) -> str:
         i = self.info
+        runs = i.get("player") or f"Python {i.get('python')}"
         return (f"{self.summary()} (device mix {i.get('device_rate', '?')} Hz, opened as {i.get('how', '?')}, "
-                f"{i.get('note', '')}); Windows pid {i.get('pid')}, Python {i.get('python')}; clock sync "
+                f"{i.get('note', '')}); Windows pid {i.get('pid')}, {runs}; clock sync "
                 f"{1000 * self.rtt:.1f} ms round trip")
 
     # -- playback
@@ -486,13 +551,15 @@ class WinPlayer:
 
 # -- starting it ----------------------------------------------------------------------------------------------
 class Launch:
-    """Starts the Windows process on a thread (the first uv run may fetch Python and numpy), so it comes up while
-    the models load; player() waits for it and returns a WinPlayer, or None after one warn."""
+    """Starts the Windows process on a thread (staging the exe, or for the Python fallback the first uv run, which
+    may fetch Python and numpy), so it comes up while the models load. Its WinPlayer reads the process from the start
+    and pings it from `hello` on; player() opens the device and returns it, or None after one warn."""
 
     def __init__(self, speaker: str = "", latency: float = WinPlayer.LATENCY_S, prepare: bool = False,
                  progress: Callable[[str], None] = lambda _: None):
         self.speaker, self.latency, self.prepare, self.progress = speaker, latency, prepare, progress
         self.proc: subprocess.Popen[bytes] | None = None
+        self.winplayer: WinPlayer | None = None
         self.error = ""
         self.done = threading.Event()
         self.abandoned = False
@@ -505,17 +572,24 @@ class Launch:
     def _run(self) -> None:
         try:
             paths = win_paths()
-            uv = ensure_uv(paths, self.progress) if self.prepare else find_uv(paths)
-            if uv is None:
-                raise WinPlayerError("uv.exe is not on the PATH and not prepared yet; /live setup prepares it")
-            script = stage_script(paths)
-            argv, env = command(paths, uv, script, self.speaker, self.latency)
-            log(f"windows player: {' '.join(argv)} (uv cache {paths.win('uv-cache')})")
+            env: dict[str, str] | None = None
+            if EXE.is_file():
+                argv = exe_command(stage_exe(paths), self.speaker, self.latency)
+                log(f"windows player: {' '.join(argv)}")
+            else:
+                log(f"windows player: {EXE.name} is missing from the plugin; falling back to win_player.py through uv")
+                uv = ensure_uv(paths, self.progress) if self.prepare else find_uv(paths)
+                if uv is None:
+                    raise WinPlayerError("uv.exe is not on the PATH and not prepared yet; /live setup prepares it")
+                script = stage_script(paths)
+                argv, env = command(paths, uv, script, self.speaker, self.latency)
+                log(f"windows player: {' '.join(argv)} (uv cache {paths.win('uv-cache')})")
             with self._lock:
                 if self.abandoned:
                     return
                 self.proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                              stderr=subprocess.PIPE, cwd=str(paths.root), env=env)
+                self.winplayer = WinPlayer(self.proc)  # reads it now: hello starts the heartbeat
         except Exception as e:  # noqa: BLE001 - reported by player()
             self.error = f"{type(e).__name__}: {e}" if not isinstance(e, WinPlayerError) else str(e)
         finally:
@@ -525,9 +599,8 @@ class Launch:
                report: Callable[[str], None] = warn) -> WinPlayer | None:
         deadline = time.monotonic() + timeout
         self.done.wait(timeout)
-        p = None
-        if self.proc is not None:
-            p = WinPlayer(self.proc)
+        p = self.winplayer
+        if p is not None:
             if p.open(rate, reference, guard, max(1.0, deadline - time.monotonic())):
                 log(f"speaker: {p.describe()}")
                 return p
@@ -549,3 +622,75 @@ class Launch:
                 proc.wait(timeout=2.0)
             except Exception:  # noqa: BLE001
                 proc.kill()
+
+
+class Speaker:
+    """audio.Player's interface over whichever speaker plays now, for a session that wants the Windows player: that
+    player while it works, else the local (WSLg) one. After a failure, at start or mid-session, one background retry
+    of the Windows player; if it comes up, it takes over at the next play(), between sentences. One retry a session,
+    so a Windows side that keeps failing costs one more attempt, not a loop."""
+
+    def __init__(self, current: Any, retry: Callable[[], WinPlayer | None], delay: float = RETRY_DELAY_S):
+        self.current, self._retry_fn, self._delay = current, retry, delay
+        self._next: Any = None
+        self._mu = threading.Lock()
+        self._retried = False
+        self._closed = False
+        if not isinstance(current, WinPlayer):
+            self._start_retry("the Windows player did not start")
+
+    def _broken(self) -> bool:
+        return isinstance(self.current, WinPlayer) and self.current.broken
+
+    def _start_retry(self, why: str) -> None:
+        if self._retried:
+            return
+        self._retried = True
+        log(f"windows player: {why}; retrying once in {self._delay:.0f}s")
+        threading.Thread(target=self._retry, name="winplayer-retry", daemon=True).start()
+
+    def _retry(self) -> None:
+        time.sleep(self._delay)
+        if self._closed:
+            return
+        try:
+            p = self._retry_fn()
+        except Exception as e:  # noqa: BLE001 - the retry is an aid
+            log(f"windows player: the retry failed ({type(e).__name__}: {e}); WSLg plays for this session")
+            return
+        if p is None:
+            log("windows player: the retry failed too; WSLg plays for this session")
+            return
+        with self._mu:
+            if self._closed:
+                p.close()
+                return
+            self._next = p
+        log(f"windows player: the retry worked; switching back at the next sentence ({p.summary()})")
+
+    def play(self, audio: np.ndarray, cancel: threading.Event) -> int:
+        with self._mu:
+            nxt, self._next = self._next, None
+        if nxt is not None:
+            old, self.current = self.current, nxt
+            try:
+                old.close()
+            except Exception as e:  # noqa: BLE001
+                file_log("INFO", f"windows player: closing the replaced speaker: {type(e).__name__}: {e}")
+        if self._broken():
+            self._start_retry("the Windows player failed mid-session")
+        n = self.current.play(audio, cancel)
+        if self._broken():
+            self._start_retry("the Windows player failed mid-session")
+        return n
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.current, name)
+
+    def close(self) -> None:
+        with self._mu:
+            self._closed = True
+            nxt, self._next = self._next, None
+        if nxt is not None:
+            nxt.close()
+        self.current.close()

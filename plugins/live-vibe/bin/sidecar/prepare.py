@@ -193,11 +193,15 @@ def play(check: Report, sd, tts, speaker, args: argparse.Namespace) -> None:
 
 
 def windows_speaker(check: Report, tts, args: argparse.Namespace) -> bool:
-    """Under WSL: prepare the Windows player (uv.exe, then Python, numpy and sounddevice in its own cache under
-    %LOCALAPPDATA%\\live-vibe) and play the sentence through it. False: it failed, and the local speaker is tried."""
+    """Under WSL: stage the Windows player in %LOCALAPPDATA%\\live-vibe (win_player.exe; without it, the Python
+    fallback's uv.exe, Python, numpy and sounddevice in its own cache there) and play the sentence through it.
+    False: it failed, and the local speaker is tried."""
     from . import winplayer
 
-    progress("Windows player: preparing uv, Python and sounddevice on Windows (first run downloads about 60 MB)")
+    if winplayer.EXE.is_file():
+        progress("Windows player: staging win_player.exe in %LOCALAPPDATA%\\live-vibe")
+    else:
+        progress("Windows player: preparing uv, Python and sounddevice on Windows (first run downloads about 60 MB)")
     launch = winplayer.Launch(args.speaker, prepare=True, progress=progress).start()
     p = launch.player(tts.sample_rate, timeout=winplayer.SETUP_TIMEOUT_S, report=lambda _: None)
     if p is None:
