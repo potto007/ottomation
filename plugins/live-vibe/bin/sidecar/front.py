@@ -12,7 +12,7 @@ import json
 import re
 import time
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable
+from typing import Any, AsyncIterator, Callable, ClassVar
 
 from .audio import SentenceSplitter, Voice, split_all
 from .protocol import Route, emit, log, warn
@@ -23,6 +23,7 @@ INTERRUPTED = "(you were interrupted)"  # leads the next user message after a cu
 EVENT_CHARS = 6000  # a long report is cut for the small front model; Claude's full answer is on screen
 HISTORY_MAX = 40  # ponytail: the front keeps its last 40 messages; summarize older ones if long sessions forget
 TOOL_ROUNDS = 4
+NO_REQUEST = {"", "none", "n/a", "null", "no"}  # what a small model writes in an empty delegate field
 RESULTS_MAX = 32  # Claude results waiting for the floor
 
 DELEGATE = {
@@ -45,19 +46,19 @@ FRONT_PROMPT = (
     "You are the voice of a coding assistant working in the software project at {workspace}. "
     "You are heard, not read: answer in one to three short spoken sentences. No markdown, no lists, "
     "no code blocks, no URLs. Say file names and numbers plainly.\n"
-    "You and the coding agent are one assistant, not separate agents. Delegate all repository work, coding, "
-    "tool use and verification with the delegate tool; never attempt it and never guess at files or results. "
-    "Keep the conversation natural while work runs: say in a few words that you are on it. Never claim changes, "
-    f"findings or verification before a {EVENT} message reports them. A new request while work is running is "
-    "a new delegation. Answer greetings and ordinary conversation directly, without delegating.\n"
+    "You and the coding agent are one assistant, not separate agents. You cannot read files, run commands or "
+    "change anything yourself: delegate all repository work, coding, investigation, checks, tests and questions "
+    "about the project's current state to the coding agent, as described at the end; never guess at files or "
+    f"results. Never claim changes, findings or verification before a {EVENT} message reports them. A new request "
+    "while work is running is a new delegation. Answer greetings, thanks and ordinary conversation directly, "
+    "without delegating.\n"
     f"A message starting with {EVENT} is the result of earlier work, not words from the user: present it "
     "naturally as your own result in one or two spoken sentences, and say so if work is still running. Never "
-    "mention delegation, the agent or the protocol.\n"
-    "Work is handed off only by calling the delegate tool: saying that you are on it, or writing a note about "
-    "it, hands off nothing. Never write notes in brackets or tags; everything you write is read aloud.\n"
+    "mention delegation, the agent or the protocol. Never write notes in brackets or tags; everything you say is "
+    "read aloud.\n"
     f"A user message starting with {INTERRUPTED} means the user cut you off there, and your previous reply was "
     "heard only up to its '...'; do not repeat yourself. If the user says goodbye, say a short goodbye."
-)
+)  # each brain appends its PROTOCOL: how a delegation is made
 
 
 class Delegator:
@@ -85,9 +86,10 @@ class SpeechFilter:
     TAGS = ("<think>", "</think>")
     NOTE_MAX = 400  # an unclosed "[" this far back was ordinary text after all
 
-    def __init__(self) -> None:
+    def __init__(self, notes: bool = True) -> None:
         self.buf = ""
         self.thinking = False
+        self.catch = "<[" if notes else "<"  # notes=False strips only think blocks (ahead of the JSON turn)
         self.notes: list[str] = []
 
     def push(self, delta: str) -> str:
@@ -101,7 +103,7 @@ class SpeechFilter:
                     break
                 self.buf, self.thinking = self.buf[i + len("</think>"):], False
                 continue
-            starts = [i for i in (self.buf.find("<"), self.buf.find("[")) if i >= 0]
+            starts = [i for i in map(self.buf.find, self.catch) if i >= 0]
             if not starts:
                 out.append(self.buf)
                 self.buf = ""
@@ -190,10 +192,14 @@ class Brain:
         text = spoken.strip()
         self.history.extend(self.pending)
         self.pending = []
-        if text:
-            self.history.append({"role": "assistant", "content": text})
+        if (content := self.said(text)) is not None:
+            self.history.append({"role": "assistant", "content": content})
         self.interrupted = interrupted
         return text
+
+    def said(self, text: str) -> str | None:
+        """The assistant message for what was heard, or None for no message."""
+        return text or None
 
     def respond(self, user_text: str, tools: Delegator) -> AsyncIterator[str]:
         raise NotImplementedError
@@ -230,96 +236,161 @@ def parse_sse(line: str) -> tuple[str, dict[str, Any] | None]:
     return ("delta", delta) if isinstance(delta, dict) else ("bad", None)
 
 
-class LlamaCppBrain(Brain):
-    """llama-server (llama.cpp) or any OpenAI-compatible endpoint; llama-server needs --jinja for tools.
+class TurnStream:
+    """Reads the front's JSON turn, {"say": "...", "delegate": "..."}, as it streams: push() returns the newly decoded
+    characters of "say", so speech starts before the object is complete; `fields` holds each finished value. A reply
+    that does not start with "{" (a server that ignores response_format) is plain text, passed through whole."""
 
-    Sampling matches the FTL spec-decoding bench on the M5 Pro (Qwen3.6-35B-A3B Q4_0, DFlash2 n=3). Thinking is off
-    per request through chat_template_kwargs: a spoken reply cannot wait for a thinking block."""
+    _ESCAPES: ClassVar[dict[str, str]] = {"n": "\n", "t": "\t", "r": "", "b": "", "f": "", "/": "/", "\\": "\\", '"': '"'}
+
+    def __init__(self, speak: str = "say") -> None:
+        self.speak = speak
+        self.plain: bool | None = None  # unknown until the first non-blank character
+        self.fields: dict[str, str] = {}
+        self.in_str = self.esc = self.value = False
+        self.key = ""
+        self.cur: list[str] = []
+        self.hexits: str | None = None  # the digits of a \\u escape so far
+
+    def push(self, delta: str) -> str:
+        if self.plain is None:
+            stripped = delta.lstrip()
+            if not stripped:
+                return ""
+            self.plain = not stripped.startswith("{")
+        if self.plain:
+            return delta
+        out: list[str] = []
+        for ch in delta:
+            if not self.in_str:
+                if ch == '"':
+                    self.in_str, self.cur = True, []
+                elif ch == ":":
+                    self.value = True
+                elif ch in ",{}":
+                    self.value = False
+                continue
+            if self.hexits is not None:
+                self.hexits += ch
+                if len(self.hexits) == 4:
+                    code = int(self.hexits, 16) if all(c in "0123456789abcdefABCDEF" for c in self.hexits) else 0
+                    self.hexits = None
+                    if code and not 0xD800 <= code < 0xE000:  # a lone surrogate cannot be spoken
+                        self._add(chr(code), out)
+                continue
+            if self.esc:
+                self.esc = False
+                if ch == "u":
+                    self.hexits = ""
+                else:
+                    self._add(self._ESCAPES.get(ch, ch), out)
+                continue
+            if ch == "\\":
+                self.esc = True
+            elif ch == '"':
+                self.in_str = False
+                if self.value:
+                    self.fields[self.key], self.value = "".join(self.cur), False
+                else:
+                    self.key = "".join(self.cur)
+            else:
+                self._add(ch, out)
+        return "".join(out)
+
+    def _add(self, text: str, out: list[str]) -> None:
+        self.cur.append(text)
+        if self.value and self.key == self.speak and text not in "{}":  # a small model can echo the JSON's
+            out.append(text)  # braces inside the string (Qwen3-4B once said "you're welcome'}{"); never speak them
+
+
+class LlamaCppBrain(Brain):
+    """llama-server (llama.cpp) or any OpenAI-compatible endpoint that takes response_format json_schema.
+
+    Each turn is one JSON object, {"say": what to speak, "delegate": the request for Claude or ""}, held to that
+    schema by the server's grammar. Measured on llama.cpp b741 with Qwen3-4B-Instruct-2507, Qwen3-8B and Gemma 4 E4B:
+    offered a delegate tool, small models narrate the work ("I'm on it, I'll open the parser file") and call nothing,
+    and tool_choice "required" was not enforced; a required delegate field is filled every time. "say" comes first,
+    so speech starts as soon as with plain text. Sampling matches the FTL spec-decoding bench on the M5 Pro
+    (Qwen3.6-35B-A3B Q4_0, DFlash2 n=3). Thinking is off per request through chat_template_kwargs: a spoken reply
+    cannot wait for a thinking block."""
 
     name = "llamacpp"
     SAMPLING = {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "presence_penalty": 0.0}
+    PROTOCOL = (
+        '\nAnswer with one JSON object only: {"say": "...", "delegate": "..."}. say is what you speak. delegate is the '
+        "complete, self-contained request for the coding agent, in plain language with the context it needs from the "
+        'conversation, whenever the user asks for any work; otherwise "". When delegate is set, say is a few words '
+        "that you are on it. Only delegate hands work off: saying that you are on it hands off nothing."
+    )
+    FORMAT: ClassVar[dict[str, Any]] = {"type": "json_schema", "json_schema": {"name": "front_turn", "strict": True, "schema": {
+        "type": "object", "properties": {"say": {"type": "string"}, "delegate": {"type": "string"}},
+        "required": ["say", "delegate"], "additionalProperties": False}}}
 
     def __init__(self, system: str, url: str, model: str):
-        super().__init__(system)
+        super().__init__(system + self.PROTOCOL)
         import httpx
 
         self.url = url.rstrip("/")
         self.model = model or "default"
         # read: the longest gap between two streamed chunks; a model that stalls that long has failed this turn
         self.client = httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=5.0, write=10.0, pool=5.0))
-        self.tools = [{"type": "function", "function": DELEGATE}]
+        self.request = ""  # this turn's delegation, committed with the words
 
     @property
     def where(self) -> str:
         return f"{self.url} model {self.model}"
 
+    def _body(self, messages: list[dict[str, Any]], max_tokens: int, stream: bool) -> dict[str, Any]:
+        return {"model": self.model, "messages": messages, "response_format": self.FORMAT, "stream": stream,
+                "max_tokens": max_tokens, **self.SAMPLING, "chat_template_kwargs": {"enable_thinking": False}}
+
     async def warm_up(self) -> None:
-        body = {"model": self.model, "max_tokens": 1, "stream": False, **self.SAMPLING,
-                "messages": [{"role": "system", "content": self.system}, {"role": "user", "content": "Hi."}],
-                "tools": self.tools, "chat_template_kwargs": {"enable_thinking": False}}
-        r = await self.client.post(f"{self.url}/v1/chat/completions", json=body, timeout=120.0)  # a router may load the model now
+        msgs = [{"role": "system", "content": self.system}, {"role": "user", "content": "Hi."}]
+        r = await self.client.post(f"{self.url}/v1/chat/completions", json=self._body(msgs, 1, False),
+                                   timeout=120.0)  # a router may load the model now
         r.raise_for_status()
+
+    def begin(self, user_text: str) -> None:
+        self.request = ""
+        super().begin(user_text)
+
+    def said(self, text: str) -> str | None:
+        """In the shape the model answers in, so its own past turns teach the format; a delegation stays even when
+        nothing of the reply was heard."""
+        if not (text or self.request):
+            return None
+        return json.dumps({"say": text, "delegate": self.request}, ensure_ascii=False)
 
     async def respond(self, user_text: str, tools: Delegator) -> AsyncIterator[str]:
         self.begin(user_text)
         msgs: list[dict[str, Any]] = [{"role": "system", "content": self.system}, *self.history]
-        for n in range(TOOL_ROUNDS):
-            content, calls, bad = "", {}, 0
-            speech = SpeechFilter()
-            body = {"model": self.model, "messages": msgs, "tools": self.tools, "tool_choice": "auto",
-                    "stream": True, "max_tokens": 400, **self.SAMPLING,
-                    "chat_template_kwargs": {"enable_thinking": False}}
-            async with self.client.stream("POST", f"{self.url}/v1/chat/completions", json=body) as r:
-                if r.status_code >= 400:
-                    await r.aread()
-                    raise RuntimeError(f"HTTP {r.status_code}: {r.text[:160]}")
-                async for line in r.aiter_lines():
-                    kind, delta = parse_sse(line)
-                    if kind == "done":
-                        break
-                    if kind == "bad":
-                        bad += 1
-                    if delta is None:
-                        continue
-                    text = delta.get("content")
-                    if isinstance(text, str) and text and (said := speech.push(text)):
-                        content += said
-                        yield said
-                    for tc in delta.get("tool_calls") or []:
-                        if not isinstance(tc, dict):
-                            continue
-                        e = calls.setdefault(tc.get("index", 0), {"id": "", "name": "", "args": ""})
-                        e["id"] = tc.get("id") or e["id"]
-                        fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
-                        e["name"] += str(fn.get("name") or "")
-                        e["args"] += str(fn.get("arguments") or "")
-            if said := speech.flush():
-                content += said
-                yield said
-            if bad:
-                log(f"front: skipped {bad} malformed stream line(s) from {self.url}")
-            if not calls:
-                for i, request in enumerate(speech.delegations()):  # the note instead of the call: make the call
-                    log(f"front: the model wrote a delegation note instead of calling delegate; delegating {request!r}")
-                    calls[i] = {"id": f"call_note_{n}_{i}", "name": "delegate", "args": json.dumps({"request": request})}
-            if not calls:
-                return
-            ids = {i: e["id"] or f"call_{n}_{i}" for i, e in calls.items()}
-            asked = {"role": "assistant", "content": None, "tool_calls": [
-                {"id": ids[i], "type": "function", "function": {"name": e["name"], "arguments": e["args"]}}
-                for i, e in calls.items()]}
-            results = []
-            for i, e in calls.items():
-                try:
-                    args = json.loads(e["args"] or "{}")
-                except ValueError:
-                    args = None
-                results.append({"role": "tool", "tool_call_id": ids[i], "content": await tools.call(e["name"], args)})
-            msgs += [{**asked, "content": content or None}, *results]
-            self.record(asked, *results)
-
-    async def aclose(self) -> None:
-        await self.client.aclose()
+        # raw -> no think block (one can lead the JSON) -> the "say" field -> no notes or think blocks -> speech
+        think, turn, speech, bad = SpeechFilter(notes=False), TurnStream(), SpeechFilter(), 0
+        async with self.client.stream("POST", f"{self.url}/v1/chat/completions",
+                                      json=self._body(msgs, 400, True)) as r:
+            if r.status_code >= 400:
+                await r.aread()
+                raise RuntimeError(f"HTTP {r.status_code}: {r.text[:160]}")
+            async for line in r.aiter_lines():
+                kind, delta = parse_sse(line)
+                if kind == "done":
+                    break
+                if kind == "bad":
+                    bad += 1
+                text = (delta or {}).get("content")
+                if isinstance(text, str) and text and (said := speech.push(turn.push(think.push(text)))):
+                    yield said
+        if said := speech.push(turn.push(think.flush())) + speech.flush():
+            yield said
+        if bad:
+            log(f"front: skipped {bad} malformed stream line(s) from {self.url}")
+        requests = [turn.fields.get("delegate", "").strip()] + speech.delegations()
+        if turn.plain:
+            log(f"front: {self.url} answered in plain text, not the JSON turn; does it take response_format?")
+        for request in requests[:1] if requests[0] else requests[1:]:  # the field, or the notes written instead
+            if request and request.lower().strip(".") not in NO_REQUEST:
+                await tools.call("delegate", {"request": request})
+                self.request = f"{self.request} {request}".strip()
 
 
 # Haiku 4.5 and Sonnet 4.5 reject output_config.effort; the server-side fallback takes only the newest models.
@@ -331,9 +402,14 @@ class AnthropicBrain(Brain):
     """Claude through the Anthropic SDK: streaming, a manual tool loop."""
 
     name = "anthropic"
+    PROTOCOL = (
+        "\nDelegate by calling the delegate tool with the complete request, and say in a few words that you are on "
+        "it. Only the tool call hands work off: saying that you are on it, or writing a note about it, hands off "
+        "nothing."
+    )
 
     def __init__(self, system: str, model: str):
-        super().__init__(system)
+        super().__init__(system + self.PROTOCOL)
         import anthropic
 
         self.client = anthropic.AsyncAnthropic(timeout=60.0, max_retries=1)
