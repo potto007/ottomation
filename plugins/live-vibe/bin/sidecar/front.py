@@ -540,7 +540,7 @@ class LlamaCppBrain(Brain):
         # raw -> no think block (one can lead the JSON) -> the "say" field -> no notes or think blocks -> speech
         think, json_turn, speech, bad = SpeechFilter(notes=False), TurnStream(), SpeechFilter(), 0
         held: list[str] | None = None  # a delegating turn's say, kept back whole and cut to an acknowledgement
-        spoke = False
+        spoke = handed = False
         try:
             async with self.client.stream("POST", f"{self.url}/v1/chat/completions",
                                           json=self._body(msgs, 400, True)) as r:
@@ -556,6 +556,9 @@ class LlamaCppBrain(Brain):
                     text = (delta or {}).get("content")
                     if isinstance(text, str) and text:
                         said = speech.push(json_turn.push(think.push(text)))
+                        if not handed and "delegate" in json_turn.fields:  # handed off before a word is spoken,
+                            handed = True  # so a turn cut while it speaks has already delegated, or never will
+                            await self._hand_off(json_turn.fields["delegate"].strip(), turn, tools, announcing)
                         if held is None and not (spoke or announcing) and is_request(json_turn.fields.get("delegate")):
                             held = []  # the delegate field closed before any of say was spoken
                         if said and held is not None:
@@ -575,20 +578,24 @@ class LlamaCppBrain(Brain):
                 log(f"front: skipped {bad} malformed stream line(s) from {self.url}")
             if json_turn.plain:
                 log(f"front: {self.url} answered in plain text, not the JSON turn; does it take response_format?")
-            requests = [json_turn.fields.get("delegate", "").strip()] + speech.delegations()
-            for request in requests[:1] if requests[0] else requests[1:]:  # the field, or the notes written instead
-                if is_request(request):
-                    if announcing:  # snapshot: a cut result turn's reader may finish after the next turn began
-                        log(f"front: not delegated, the turn announces a result: {request[:120]!r}")
-                        continue
-                    if not (await tools.call("delegate", {"request": request}, said=turn.said)).startswith(HANDED_OFF):
-                        continue
-                    turn.request = f"{turn.request} {request}".strip()
-                    if turn.committed:  # cut, and its words already in history
-                        log(f"front: the turn was cut, but its delegation went out: {request!r}")
-                        self._amend(turn)
+            field = json_turn.fields.get("delegate", "").strip()
+            for request in speech.delegations() if not field else [] if handed else [field]:  # or the notes instead
+                await self._hand_off(request, turn, tools, announcing)
         finally:
             words.put_nowait(None)
+
+    async def _hand_off(self, request: str, turn: FrontTurn, tools: Delegator, announcing: bool) -> None:
+        if not is_request(request):
+            return
+        if announcing:  # snapshot: a cut result turn's reader may finish after the next turn began
+            log(f"front: not delegated, the turn announces a result: {request[:120]!r}")
+            return
+        if not (await tools.call("delegate", {"request": request}, said=turn.said)).startswith(HANDED_OFF):
+            return
+        turn.request = f"{turn.request} {request}".strip()
+        if turn.committed:  # cut, and its words already in history
+            log(f"front: the turn was cut, but its delegation went out: {request!r}")
+            self._amend(turn)
 
     async def aclose(self) -> None:
         for task in list(self._readers):
@@ -814,6 +821,8 @@ class FrontSession(Duplex):
             said = brain.commit(" ".join(self.turn_spoken), interrupted)
             if brain is self.brain and said:
                 emit(type="transcript", role="front", text=said)
+            if not (is_event or failed) and brain is self.brain:  # also when a barge-in cut the reply: the user's
+                self.pass_on(user_text, said, handed)  # words were heard whole, whatever of the reply was not
         if failed:
             e = failed[0]
             warn(f"front model failed at {brain.where} ({type(e).__name__}: {str(e)[:160]})")
@@ -821,8 +830,6 @@ class FrontSession(Duplex):
                 with contextlib.suppress(asyncio.QueueFull):
                     self.results.put_nowait(t)
             return await self.front_down(report or user_text, is_event)
-        if not is_event and brain is self.brain:
-            self.pass_on(user_text, said, handed)
         self.settle()
         if not is_event and _GOODBYE.search(user_text.lower()):
             self.goodbye()

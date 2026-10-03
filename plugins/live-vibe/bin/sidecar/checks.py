@@ -966,6 +966,7 @@ async def selftest_sessions(check: Checker) -> None:
     check(len(events_since(n)) == 1 and said().endswith("...") and sess.results.empty(),
           f"announcer: an announcement cut by a barge-in is not announced again {len(events_since(n))}")
 
+    out.clear()
     tts.started.clear()
     player.ended.clear()
     utter("tell me something long")
@@ -978,6 +979,10 @@ async def selftest_sessions(check: Checker) -> None:
     spoken = said()
     check(brain.interrupted and spoken.endswith("...") and "sentence number 0 of a long answer." in spoken
           and "number 11" not in spoken, f"barge-in: cuts the front, commits only what was heard {spoken!r}")
+    notes = emitted("note")
+    check(len(notes) == 1 and notes[0]["said"] == "tell me something long" and notes[0]["reply"] == spoken
+          and not emitted("delegate"),
+          f"front: a user turn cut mid-reply, with no delegation, still passes on the note with the partial reply {notes}")
     sess.post("discard", None)
     await until(lambda: sess.state == "listening")
 
