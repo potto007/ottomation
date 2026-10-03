@@ -93,10 +93,14 @@ To use a server you run instead, set `frontUrl` (or `/livevibe url <url>`), as b
 
 ## The front server
 
-Any OpenAI-compatible chat server with tool calling works. With llama.cpp:
+Any OpenAI-compatible chat server that takes `response_format` with a JSON schema works (llama-server does). Each
+front turn is one JSON object, `{"say": ..., "delegate": ...}`, held to that schema by the server's grammar: small
+models offered a delegate tool tend to say they are on it and call nothing, but they fill a required field. The
+`say` text is spoken as it streams. A small model is enough; Qwen3-4B-Instruct-2507 delegated every work request in
+testing, in about 5 GB of VRAM with a 16k context (4 GB at 8k):
 
 ```sh
-llama-server -m Qwen3-8B-Q4_K_M.gguf --jinja --port 8080   # --jinja is required for tool calls
+llama-server -m Qwen3-4B-Instruct-2507-Q4_K_M.gguf --jinja -c 16384 -np 1 -ngl 99 --flash-attn on --port 8080
 ```
 
 To switch between small models without keeping a big one in memory, put a router in front (llama-swap, or llama-server's multi-model mode where your build has it) and pick the model with `/livevibe model <name>`. A plain llama-server ignores the model name. Thinking is turned off per request, so a voice turn does not wait for it.

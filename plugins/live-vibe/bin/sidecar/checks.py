@@ -29,7 +29,8 @@ from .checks_front_server import front_server_units
 from .audio import FRAME, SR, CannotStart, Player, check_devices, SentenceSplitter, Tuning, TurnDetector, Voice, speakable
 from .echo import EchoCanceller, EchoGuard, EchoReference
 from .front import (EVENT, HISTORY_MAX, INTERRUPTED, _FALLBACKS, _NO_EFFORT, Brain, Delegator, FrontSession,
-                    LlamaCppBrain, SpeechFilter, is_turn_start, make_brain, parse_sse, spoken_model, warm_up)
+                    LlamaCppBrain, SpeechFilter, TurnStream, is_turn_start, make_brain, parse_sse, spoken_model,
+                    warm_up)
 from .session import LiveSession
 from .speech import BARGE_IN_WORDS, KYUTAI_BLOCK, KYUTAI_SR, KyutaiTurns, SilentTTS, check_tts
 
@@ -332,6 +333,50 @@ def front_history(check: Checker) -> None:
     got = filtered(["[", "x" * 500, " tail"])
     check(got[0].startswith("[x") and got[0].endswith("tail"), "speech filter: a lone '[' in long text is spoken")
 
+    raw = json.dumps({"say": 'On it, "quick" fix: café \\ done.', "delegate": "Fix parser.py"})
+    for size in (1, 3, 7, len(raw)):
+        t = TurnStream()
+        out = "".join(t.push(raw[i:i + size]) for i in range(0, len(raw), size))
+        if out != 'On it, "quick" fix: café \\ done.' or t.fields.get("delegate") != "Fix parser.py":
+            break
+    check(out == 'On it, "quick" fix: café \\ done.' and t.fields == {"say": out, "delegate": "Fix parser.py"},
+          f"json turn: say streams as decoded text in any chunking, delegate is read whole {out!r} {t.fields}")
+    t = TurnStream()
+    out = t.push(json.dumps({"say": "you're welcome'}{", "delegate": ""}))
+    check(out == "you're welcome'", f"json turn: braces echoed inside say are not spoken {out!r}")
+    t = TurnStream()
+    first = t.push('{"say": "Hel')
+    check(first == "Hel" and "say" not in t.fields, "json turn: speech starts before the field closes")
+    t = TurnStream()
+    out = t.push("  ") + t.push("Plain reply.") + t.push(" More.")
+    check(out == "Plain reply. More." and t.plain and not t.fields, "json turn: a reply not starting with { is plain")
+    b = LlamaCppBrain("sys", "http://127.0.0.1:9", "")
+    b.begin("fix it")
+    b.current.request = "Fix it now"
+    b.commit("", True)
+    b.begin("hi")
+    b.commit("Hello.", False)
+    check([json.loads(m["content"]) for m in b.history if m["role"] == "assistant"]
+          == [{"say": "", "delegate": "Fix it now"}, {"say": "Hello.", "delegate": ""}]
+          and b.history[2]["content"] == f"{INTERRUPTED} hi" and b.system.endswith(LlamaCppBrain.PROTOCOL),
+          "json turn: history keeps each turn as JSON, a delegation even when nothing was heard")
+    b = LlamaCppBrain("sys", "http://127.0.0.1:9", "")
+    b.begin("fix it")
+    late = b.current
+    b.commit("On it, I'll...", True)  # cut before the delegate field arrived
+    b.begin("wait")
+    quiet = b.current
+    b.commit("", True)  # cut before anything was heard
+    b.begin("next")
+    late.request, quiet.request = "Fix it", "Wait for it"
+    b._amend(late)
+    b._amend(quiet)
+    contents = [m["content"] for m in b.history]
+    check(json.loads(contents[1]) == {"say": "On it, I'll...", "delegate": "Fix it"}
+          and json.loads(contents[3]) == {"say": "", "delegate": "Wait for it"}
+          and contents[4] == f"{INTERRUPTED} next",
+          f"json turn: a delegation landing after its turn was cut joins that turn's place in history {contents}")
+
 
 def units() -> int:
     check = Checker()
@@ -507,9 +552,15 @@ def echo_units(check: Checker) -> None:
 # self-test
 # =============================================================================================================
 def fake_front() -> tuple[str, list[dict[str, Any]]]:
-    """An OpenAI-compatible SSE server whose reply depends on the last message: delegates 'fix', relays
-    [task finished], fails on 'boom' (500), sends a malformed line on 'garbled', bad tool JSON on 'badargs'."""
+    """An OpenAI-compatible SSE server answering in the front's JSON turn, in small pieces as a model streams, with a
+    reply that depends on the last message: delegates 'fix', relays [task finished], fails on 'boom' (500), sends a
+    malformed line on 'garbled', a broken JSON turn on 'badargs', plain text on 'plaintext'."""
     seen: list[dict[str, Any]] = []
+
+    def turn(say: str, delegate: str = "", lead: str = "", cut: int = 0) -> list[dict[str, Any]]:
+        text = lead + json.dumps({"say": say, "delegate": delegate})
+        text = text[:-cut] if cut else text
+        return [{"content": text[i:i + 7]} for i in range(0, len(text), 7)]
 
     class H(BaseHTTPRequestHandler):
         def log_message(self, *_: Any) -> None:
@@ -534,31 +585,33 @@ def fake_front() -> tuple[str, list[dict[str, Any]]]:
             self.send_header("Content-Type", "text/event-stream")
             self.end_headers()
             raw: list[str] = []
-            if last["role"] == "tool":
-                deltas = [{"content": "I'll let you know."}]
-            elif text.startswith(EVENT):
-                deltas = [{"content": "All the tests pass now."}]
+            delay = 0.0
+            if text.startswith(EVENT):
+                deltas = turn("All the tests pass now.")
             elif "goodbye" in text.lower():
-                deltas = [{"content": "Goodbye."}]
+                deltas = turn("Goodbye.")
             elif "thinking leak" in text:
-                deltas = [{"content": "<think>\n\n</th"}, {"content": "ink>\n\nHello there."}]
+                deltas = turn('Hello "there", été.', lead="<think>\n\n</think>\n\n")  # \\u escapes, quotes
             elif "notecall" in text:
-                deltas = [{"content": "Sure. [delegated: Rebuild"}, {"content": " the index]"}]
+                deltas = turn("Sure. [delegated: Rebuild the index]")
             elif "garbled" in text:
-                raw, deltas = ["data: {not json"], [{"content": "Still here."}]
+                raw, deltas = ["data: {not json"], turn("Still here.")
             elif "badargs" in text:
-                deltas = [{"tool_calls": [{"index": 0, "id": "c9", "function": {"name": "delegate", "arguments": "{not json"}}]}]
+                deltas = turn("I'll let you know.", "Never sent", cut=8)
+            elif "plaintext" in text:
+                deltas = [{"content": "Plain words. "}, {"content": "No JSON here."}]
+            elif "slow work" in text:  # a long "on it", then the delegate field: cut while it is spoken
+                deltas = turn("".join(f"Working on part {i} of it now. " for i in range(8)), "Rebuild the cache")
+                delay = 0.03
             elif "fix" in text:
-                args = json.dumps({"request": "Fix the failing test in parser.py"})
-                deltas = [{"content": "On it. "},
-                          {"tool_calls": [{"index": 0, "id": "c1", "function": {"name": "delegate", "arguments": args[:20]}}]},
-                          {"tool_calls": [{"index": 0, "function": {"arguments": args[20:]}}]}]
+                deltas = turn("On it.", "Fix the failing test in parser.py")
             else:
-                deltas = [{"content": f"This is sentence number {i} of a long answer. "} for i in range(12)]
+                deltas = turn("".join(f"This is sentence number {i} of a long answer. " for i in range(12)))
             for r in raw:
                 self.wfile.write(f"{r}\n\n".encode())
             for d in deltas:
                 self.wfile.write(f"data: {json.dumps({'choices': [{'delta': d}]})}\n\n".encode())
+                time.sleep(delay)
             self.wfile.write(b"data: [DONE]\n\n")
 
     srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
@@ -623,9 +676,26 @@ async def selftest_sessions(check: Checker) -> None:
     assert isinstance(brain, LlamaCppBrain)
     check(await warm_up(brain), "front: warm-up reaches the server")
     w = seen[-1]
-    check([t["function"]["name"] for t in w["tools"]] == ["delegate"] and w["chat_template_kwargs"] == {"enable_thinking": False}
-          and w["max_tokens"] == 1 and "one assistant" in w["messages"][0]["content"],
-          "front: warm-up sends the front prompt, only delegate, thinking off")
+    schema = w["response_format"]["json_schema"]["schema"]
+    check("tools" not in w and schema["required"] == ["say", "delegate"]
+          and w["chat_template_kwargs"] == {"enable_thinking": False} and w["max_tokens"] == 1 and "one assistant" in w["messages"][0]["content"]
+          and '"delegate"' in w["messages"][0]["content"],
+          "front: warm-up sends the front prompt with the JSON turn's schema, no tools, thinking off")
+
+    def said(k: int = -1) -> str:
+        """What the front said in history message k: its JSON turn's "say", or plain text."""
+        content = brain.history[k]["content"] if len(brain.history) >= -k else ""
+        try:
+            turn = json.loads(content)
+        except (TypeError, ValueError):
+            return str(content)
+        return str(turn.get("say", "")) if isinstance(turn, dict) else str(content)
+
+    def delegated(k: int = -1) -> str:
+        try:
+            return str(json.loads(brain.history[k]["content"]).get("delegate", ""))
+        except (TypeError, ValueError, AttributeError):
+            return ""
 
     tts, player = TimedTTS(), TimedPlayer()
     voice = Voice(tts, player, threading.Event())
@@ -656,10 +726,9 @@ async def selftest_sessions(check: Checker) -> None:
     await until(lambda: emitted("delegate"))
     await turn_done()
     check(emitted("delegate") == [{"type": "delegate", "text": "Fix the failing test in parser.py"}], f"front: utterance -> delegate {emitted('delegate')}")
-    asked, answer, words = brain.history[-3:]
-    check(asked.get("tool_calls", [{}])[0].get("function", {}).get("name") == "delegate" and answer["role"] == "tool"
-          and answer["tool_call_id"] == asked["tool_calls"][0]["id"] and words["content"] == "On it. I'll let you know.",
-          f"front: the delegation is a tool call and result in history, the words carry no note {brain.history[-3:]}")
+    check([m["role"] for m in brain.history] == ["user", "assistant"] and said() == "On it."
+          and delegated() == "Fix the failing test in parser.py" and "[" not in said(),
+          f"front: history keeps the turn as the model answers it, words and delegation apart {brain.history}")
     check([o["role"] for o in emitted("transcript")] == ["user", "front"], "front: transcript, user then front")
 
     n = len(brain.history)
@@ -679,15 +748,15 @@ async def selftest_sessions(check: Checker) -> None:
     await until(lambda: sess.user_talking)
     r = await asyncio.to_thread(post, port, "/event", "Fixed parser.py; all 41 tests pass.", token)
     await asyncio.sleep(0.5)
-    held = not sess.turn_running() and not brain.history[-1]["content"].startswith("All the tests")
+    held = not sess.turn_running() and not said().startswith("All the tests")
     hearing["on"] = True  # still transcribing
     sess.post("discard", None)
     await asyncio.sleep(0.4)
     held = held and not sess.turn_running()
     hearing["on"] = False
-    await until(lambda: brain.history[-1]["content"] == "All the tests pass now.")
+    await until(lambda: said() == "All the tests pass now.")
     check(r == 204 and held, "announcer: a result waits while the user talks and while speech is transcribed")
-    check(brain.history[-2]["content"].startswith(f"{EVENT} Fixed parser.py") and brain.history[-1]["content"] == "All the tests pass now.",
+    check(brain.history[-2]["content"].startswith(f"{EVENT} Fixed parser.py") and said() == "All the tests pass now.",
           "announcer: then the front relays it as a [task finished] turn")
 
     tts.started.clear()
@@ -699,7 +768,7 @@ async def selftest_sessions(check: Checker) -> None:
           "voice: the next sentence is synthesized while the current one plays")
     sess.post("speech_start", 1.0)
     await turn_done()
-    spoken = brain.history[-1]["content"]
+    spoken = said()
     check(brain.interrupted and spoken.endswith("...") and "sentence number 0 of a long answer." in spoken
           and "number 11" not in spoken, f"barge-in: cuts the front, commits only what was heard {spoken!r}")
     sess.post("discard", None)
@@ -710,7 +779,7 @@ async def selftest_sessions(check: Checker) -> None:
     await asyncio.sleep(0.3)
     r = await asyncio.to_thread(post, port, "/stop", "", token)
     await turn_done()
-    check(r == 204 and brain.interrupted and brain.history[-1]["content"].endswith("..."), "POST /stop cuts the front")
+    check(r == 204 and brain.interrupted and said().endswith("..."), "POST /stop cuts the front")
 
     out.clear()
     utter("boom")
@@ -723,31 +792,56 @@ async def selftest_sessions(check: Checker) -> None:
     out.clear()
     utter("garbled")
     await turn_done()
-    await until(lambda: brain.history[-1]["content"] == "Still here.", 3)
-    check(brain.history[-1]["content"] == "Still here." and not emitted("delegate")
+    await until(lambda: said() == "Still here.", 3)
+    check(said() == "Still here." and not emitted("delegate")
           and any("malformed" in o["text"] for o in emitted("log")), "front: a malformed stream line is skipped, the turn goes on")
 
     out.clear()
     utter("thinking leak")
     await turn_done()
-    await until(lambda: brain.history[-1]["content"] == "Hello there.", 3)
-    check(brain.history[-1]["content"] == "Hello there." and sess.turn_spoken == ["Hello there."],
-          f"front: a leaked think block is not spoken {sess.turn_spoken}")
+    await until(lambda: said().startswith("Hello"), 3)
+    check(sess.turn_spoken == ['Hello "there", \u00e9t\u00e9.'] and said() == sess.turn_spoken[0],
+          f"front: a think block ahead of the JSON turn is not spoken; escapes decode {sess.turn_spoken}")
 
     out.clear()
     utter("notecall")
     await until(lambda: emitted("delegate"), 3)
     await turn_done()
     check(emitted("delegate") == [{"type": "delegate", "text": "Rebuild the index"}] and sess.turn_spoken[0] == "Sure."
-          and not any("[" in t for t in sess.turn_spoken) and brain.history[-3].get("tool_calls"),
+          and not any("[" in t for t in sess.turn_spoken) and delegated() == "Rebuild the index",
           f"front: a written delegation note is silent and still delegates {sess.turn_spoken}")
 
     out.clear()
     utter("badargs")
-    await until(lambda: brain.history[-1]["content"] == "I'll let you know.", 5)
-    tool_msg = [m for m in seen[-1]["messages"] if m["role"] == "tool"][-1]  # earlier turns' results come first
-    check(not emitted("delegate") and tool_msg["content"].startswith("error") and brain.history[-1]["content"] == "I'll let you know.",
-          "front: a tool call with bad JSON gets an error result, the session goes on")
+    await until(lambda: said() == "I'll let you know.", 5)
+    await turn_done()
+    check(not emitted("delegate") and said() == "I'll let you know." and not delegated(),
+          "front: a JSON turn cut short still speaks, and an unfinished delegate field hands off nothing")
+
+    out.clear()
+    utter("plaintext")
+    await until(lambda: said() == "Plain words. No JSON here.", 5)
+    await turn_done()
+    check(said() == "Plain words. No JSON here." and any("plain text" in o["text"] for o in emitted("log")),
+          "front: a server that ignores response_format is spoken as plain text, with a log line")
+
+    out.clear()
+    utter("slow work please")
+    await until(lambda: sess.state == "speaking", 5)
+    await asyncio.sleep(0.2)
+    sess.post("speech_start", 1.0)  # barge in while "on it" is spoken, before the delegate field has streamed
+    await turn_done()
+    cut_early = not emitted("delegate")
+    await until(lambda: emitted("delegate"), 5)
+    asked = next(i for i, m in enumerate(brain.history) if m["content"] == f"{INTERRUPTED} slow work please"
+                 or m["content"] == "slow work please")
+    entry = json.loads(brain.history[asked + 1]["content"]) if len(brain.history) > asked + 1 else {}
+    check(cut_early and emitted("delegate") == [{"type": "delegate", "text": "Rebuild the cache"}]
+          and entry.get("delegate") == "Rebuild the cache" and "Working on part 0" in str(entry.get("say", ""))
+          and "part 7" not in str(entry.get("say", "")),
+          f"front: a turn cut while 'on it' is spoken still hands off its delegate field, and history shows it {entry}")
+    sess.post("discard", None)
+    await until(lambda: sess.state == "listening")
 
     dead = make_brain("llamacpp", "http://127.0.0.1:9", "")
     assert dead is not None
