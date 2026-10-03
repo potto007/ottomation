@@ -158,6 +158,15 @@ async function onSidecar($: EngineInterface, msg: Record<string, unknown>) {
   }
 }
 
+// With frontUrl empty the sidecar runs its own llama-server; these settings point it at files already on disk.
+function frontServerArgv(options: PluginOptions) {
+  const argv: string[] = []
+  if (options.frontServerBin) argv.push('--front-server-bin', String(options.frontServerBin))
+  if (options.frontServerModel) argv.push('--front-server-model', String(options.frontServerModel))
+  if (options.frontServerLog) argv.push('--front-server-log', String(options.frontServerLog))
+  return argv
+}
+
 // The sidecar lives for the session: the loop runs on after the hook returns and ends with the child or the module.
 function startSidecar($: EngineInterface, options: PluginOptions, mode: LiveMode, vibeBefore: boolean) {
   void (async () => {
@@ -175,7 +184,7 @@ function startSidecar($: EngineInterface, options: PluginOptions, mode: LiveMode
     if (options.speaker) argv.push('--speaker', String(options.speaker))
     if (mode === 'livevibe') {
       argv.push('--front-backend', String(options.frontBackend), '--front-url', String(options.frontUrl),
-        '--switch-pattern', SPOKEN_SWITCH.source)
+        '--switch-pattern', SPOKEN_SWITCH.source, ...frontServerArgv(options))
       if (options.frontModel) argv.push('--front-model', String(options.frontModel))
     }
     const child = $.process.spawn({ argv })
@@ -235,7 +244,7 @@ function setupVoice($: EngineInterface, options: PluginOptions) {
     const argv = ['uv', 'run', '--script', `${$.plugin.root}/bin/sidecar/main.py`, '--setup',
       '--stt', String(options.stt), '--asr', String(options.asr), '--tts', String(options.tts),
       '--end-silence-ms', String(options.endSilenceMs), '--front-backend', String(options.frontBackend),
-      '--front-url', String(options.frontUrl)]
+      '--front-url', String(options.frontUrl), ...frontServerArgv(options)]
     if (options.voice) argv.push('--voice', String(options.voice))
     if (options.mic) argv.push('--mic', String(options.mic))
     if (options.speaker) argv.push('--speaker', String(options.speaker))
@@ -298,16 +307,18 @@ async function servedModels($: EngineInterface, url: string) {
 // /livevibe model|url [value]: list what the front server offers, or point the front elsewhere. The model name is
 // sent as each request's `model`, so a router (llama-swap, llama-server's multi-model mode) loads it on demand and a
 // plain llama-server ignores it. The value is stored as this plugin's own userConfig field (`$.config.set` takes
-// `<plugin>.<field>`), so it survives the session.
+// `<plugin>.<field>`), so it survives the session. `/livevibe url managed` empties frontUrl: the sidecar's own server.
 async function frontSetting($: EngineInterface, options: PluginOptions, field: 'model' | 'url', value: string) {
-  const url = String(options.frontUrl).replace(/\/+$/, '')
+  const url = String(options.frontUrl ?? '').replace(/\/+$/, '')
   if (!value) {
-    const current = `Front: ${String(options.frontBackend)} at ${url}, model ${String(options.frontModel) || '(server default)'}.`
-    if (field === 'url') return { text: `${current} Change it with /livevibe url <url>.` }
+    const at = url ? `at ${url}` : `on a managed llama-server (${String(options.frontServerModel || 'the default model')})`
+    const current = `Front: ${String(options.frontBackend)} ${at}, model ${String(options.frontModel) || '(server default)'}.`
+    if (field === 'url') return { text: `${current} Change it with /livevibe url <url>, or /livevibe url managed.` }
+    if (!url) return { text: `${current} The managed server serves one model; frontServerModel picks it.` }
     return { text: `${current} ${await servedModels($, url)} Pick one with /livevibe model <name>; /livevibe model default clears it.` }
   }
-  if (field === 'url' && !/^https?:\/\/\S+$/.test(value)) return { text: `Not a URL: ${value}` }
-  const next = field === 'model' && value === 'default' ? '' : value
+  if (field === 'url' && value !== 'managed' && !/^https?:\/\/\S+$/.test(value)) return { text: `Not a URL: ${value}` }
+  const next = (field === 'model' && value === 'default') || (field === 'url' && value === 'managed') ? '' : value
   const { deny } = await $.config.set({ key: field === 'url' ? 'live-vibe.frontUrl' : 'live-vibe.frontModel', value: next })
   if (deny) return { text: `Front ${field} not changed: ${deny}` }
   const l = await read($, live)
@@ -315,15 +326,15 @@ async function frontSetting($: EngineInterface, options: PluginOptions, field: '
     // ponytail: a restart reloads Whisper and Kokoro too; a sidecar endpoint that hot-swaps the front brain is the upgrade.
     await stopLive($)
     await startLiveVibe($, { ...options, [field === 'url' ? 'frontUrl' : 'frontModel']: next }, l.vibeBefore)
-    return { text: `Front ${field} set to ${next || '(server default)'}; the voice restarts on it.` }
+    return { text: `Front ${field} set to ${next || (field === 'url' ? '(managed llama-server)' : '(server default)')}; the voice restarts on it.` }
   }
-  return { text: `Front ${field} set to ${next || '(server default)'}.` }
+  return { text: `Front ${field} set to ${next || (field === 'url' ? '(managed llama-server)' : '(server default)')}.` }
 }
 
 export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: 'live', description: 'Toggle live voice mode: speak to Claude, hear the answers. /live setup installs and tests what it needs', argumentHint: '[setup]' })
-    await $.command.register({ name: 'livevibe', description: 'Toggle live vibe: talk with a fast voice front that hands the work to Claude as vibe director', argumentHint: '[model [name] | url [url]]' })
+    await $.command.register({ name: 'livevibe', description: 'Toggle live vibe: talk with a fast voice front that hands the work to Claude as vibe director', argumentHint: '[model [name] | url [url|managed]]' })
     await $.command.register({ name: 'vibe', description: 'Toggle vibe mode: Claude directs worker subagents instead of editing itself', argumentHint: '[first request]' })
     const l = await read($, live)
     if (l.isOn) startSidecar($, options, l.mode === 'livevibe' ? 'livevibe' : 'live', Boolean(l.vibeBefore)) // a hot reload killed the child; bring it back
@@ -351,7 +362,7 @@ export const register: Register = (on, options) => {
   on('command.run', { command: 'livevibe' }, async ($, e) => {
     const sub = /^(model|url)(?:\s+(\S+))?$/.exec(e.args.trim())
     if (sub) return frontSetting($, options, sub[1] === 'url' ? 'url' : 'model', sub[2] ?? '')
-    if (e.args.trim()) return { text: 'Usage: /livevibe toggles; /livevibe model [name]; /livevibe url [url].' }
+    if (e.args.trim()) return { text: 'Usage: /livevibe toggles; /livevibe model [name]; /livevibe url [url|managed].' }
     const l = await read($, live)
     await stopLive($) // off, or switching over from /live
     if (l.isOn && l.mode === 'livevibe') return { text: 'Live vibe off: voice front stopped, vibe mode back as it was.' }

@@ -127,7 +127,7 @@ test("live vibe: Claude's answer goes to the front's /event, never /speak", asyn
   sidecar.release()
 })
 
-test('/livevibe model lists what the front server serves, and /livevibe model foo sets the field', async ($, on) => {
+test('/livevibe model lists what the front server serves, and /livevibe model foo sets the field', { options: { frontUrl: 'http://127.0.0.1:8080' } }, async ($, on) => {
   const fetched: string[] = []
   on('http.fetch', (_$, e) => {
     fetched.push(e.url)
@@ -171,6 +171,31 @@ test('/livevibe model foo while live vibe is on restarts the front on foo, vibe 
   expect(argvs[1]?.join(' ')).toContain('--front-model foo')
   sidecar.release()
 })
+
+test('frontUrl empty: a managed llama-server, its settings reach the sidecar, /livevibe url managed clears the URL',
+  { options: { frontServerBin: '/opt/llama/llama-server', frontServerLog: '/tmp/x.log' } }, async ($, on) => {
+    const fetched: string[] = []
+    on('http.fetch', (_$, e) => { fetched.push(e.url); return ok })
+    const sets: { key: string; value: unknown }[] = []
+    on('config.set', (_$, e) => { sets.push({ key: e.key, value: e.value }); return { value: e.value } })
+    const sidecar = fakeSidecar(4321)
+    const argv = new Promise<string>(resolve =>
+      on('process.spawn', async function* (_$, e) { resolve(e.argv.join(' ')); return yield* sidecar.spawn() }))
+    on('tool.call', () => ({ result: 'ran' }))
+
+    expect((await $.command.run({ command: 'livevibe', ...typed, args: 'model' })).text).toMatch(/managed llama-server \(the default model\)/)
+    expect(fetched).toEqual([])
+    expect((await $.command.run({ command: 'livevibe', ...typed, args: 'url managed' })).text).toMatch(/managed llama-server/)
+    expect(sets).toEqual([{ key: 'live-vibe.frontUrl', value: '' }])
+    await $.command.run({ command: 'livevibe', ...typed })
+    const got = await argv
+    expect(got).toContain('--front-url  --switch-pattern')
+    expect(got).toContain('--front-server-bin /opt/llama/llama-server --front-server-log /tmp/x.log')
+    expect(got).not.toContain('--front-server-model')
+    await sidecar.isUp
+    await $.command.run({ command: 'livevibe', ...typed })
+    sidecar.release()
+  })
 
 test('stt defaults to kyutai, tts to kokoro', async ($, on) => {
   const argvs: string[] = []

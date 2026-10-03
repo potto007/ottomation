@@ -66,8 +66,26 @@
     "frontUrl": {
       "type": "string",
       "title": "Live vibe: front server URL",
-      "description": "Base URL of the OpenAI-compatible server for the llamacpp backend. May be another host, e.g. http://gpu-box:8080.",
-      "default": "http://127.0.0.1:8080"
+      "description": "Empty: /livevibe runs its own llama.cpp llama-server (/live setup downloads it and a small model) and stops it with live vibe. Set it to use a server you run instead, such as http://127.0.0.1:8080 or http://gpu-box:8080; then nothing starts locally.",
+      "default": ""
+    },
+    "frontServerBin": {
+      "type": "string",
+      "title": "Live vibe: managed server binary",
+      "description": "With frontUrl empty: an existing llama-server to run (e.g. ~/src/llama.cpp/build/bin/llama-server). Empty means the pinned llama.cpp release /live setup downloads (CUDA 12 on Linux with an Nvidia GPU, Metal on Apple silicon).",
+      "default": ""
+    },
+    "frontServerModel": {
+      "type": "string",
+      "title": "Live vibe: managed server model",
+      "description": "With frontUrl empty: an existing GGUF file to serve. Empty means the default small model, which /live setup downloads (Qwen3-4B-Instruct-2507 Q4_K_M, 2.5 GB).",
+      "default": ""
+    },
+    "frontServerLog": {
+      "type": "string",
+      "title": "Live vibe: managed server log",
+      "description": "With frontUrl empty: the file the server's output is appended to. Empty means ~/.cache/duplex_voice/front-server.log (LIVE_VIBE_CACHE or XDG_CACHE_HOME move it).",
+      "default": ""
     },
     "frontModel": {
       "type": "string",

@@ -8,7 +8,7 @@ stdout and a loopback HTTP port guarded by a per-run token.
 |---|---|
 | `/live` | Full-duplex voice with Claude. The mic stays open; you can talk over an answer to cut it off. What you say goes to Claude, and Claude's final answer is read aloud. Saying "switch to sonnet" runs `/model`. |
 | `/vibe [request]` | Director mode. Claude reads and directs worker subagents; every other tool is denied on the main loop. |
-| `/livevibe` | You talk with a small, fast voice model (the front). It chats with you directly, hands real work to Claude in vibe mode, and tells you the result in a sentence or two when it comes back. `/livevibe model [name]` lists or picks the front model; `/livevibe url [url]` points it at another server. |
+| `/livevibe` | You talk with a small, fast voice model (the front). It chats with you directly, hands real work to Claude in vibe mode, and tells you the result in a sentence or two when it comes back. `/livevibe model [name]` lists or picks the front model; `/livevibe url [url]` points it at a server you run (`/livevibe url managed` goes back to the built-in one). |
 
 `/live` and `/livevibe` turn each other off. `/livevibe` off puts vibe mode back the way it was.
 
@@ -26,7 +26,8 @@ stdout and a loopback HTTP port guarded by a per-run token.
 
 Run `/live setup` once on each machine. uv installs the Python packages, then the sidecar downloads the models your
 settings name and tests each piece: PortAudio and the mic and speaker, espeak-ng, the synthesizer, the recognizer
-(it speaks a sentence into it and checks what comes back), one sentence through the speaker, and the front server.
+(it speaks a sentence into it and checks what comes back), one sentence through the speaker, and the front server
+(with `frontUrl` empty it downloads llama-server and the front model, starts the server once and stops it).
 Progress shows in the status line, and a report with a ✓, ! or ✗ per step lands in the transcript. Installing the
 plugin installs none of this, and setup never installs system packages: a ✗ line names the command to run (`uv`
 itself, `espeak-ng`, `libportaudio2`). Change a setting, run it again.
@@ -46,12 +47,54 @@ Kyutai STT about 2.4 GB (Apple silicon, or Linux with an Nvidia GPU), the Whispe
 | `speaker` | empty | Output device, the same way. |
 | `endSilenceMs` | 1500 | Whisper: the pause that ends your turn. Kyutai: only a cap on a pause between words. |
 | `frontBackend` | `llamacpp` | `llamacpp` (any OpenAI-compatible server) or `anthropic` (needs `ANTHROPIC_API_KEY` or `ant auth login`). |
-| `frontUrl` | `http://127.0.0.1:8080` | The front's server. It can be another host, such as a GPU box. |
+| `frontUrl` | empty | Empty: a managed llama-server (below). Set: the front's server, which can be another host, such as a GPU box; nothing starts locally. |
+| `frontServerBin` | empty | Managed server: an existing `llama-server` to run instead of the download. |
+| `frontServerModel` | empty | Managed server: an existing GGUF to serve instead of the default model. |
+| `frontServerLog` | empty | Managed server: where its stdout and stderr go; empty means `~/.cache/duplex_voice/front-server.log`. |
 | `frontModel` | empty | Sent as `model` on every request. Empty means the server's own model (or `claude-haiku-4-5` for anthropic). |
 
 ## The front server
 
-Any OpenAI-compatible chat server with tool calling works. With llama.cpp:
+### Managed (the default)
+
+With `frontUrl` empty and the `llamacpp` backend, `/livevibe` runs its own llama.cpp `llama-server`. `/live setup`
+downloads a pinned prebuilt release (llama.cpp v0.5.0, build `b11146`, checked against GitHub's sha256 digests) and the
+default model, Qwen3-4B-Instruct-2507 Q4_K_M (2.5 GB, checked against the Hugging Face sha256), into
+`~/.cache/duplex_voice`, starts the server once, and reports `front: managed llama-server <version> with <model> on
+<GPU|CPU>`. After that, nothing goes to the network. Which build it downloads:
+
+| Machine | Build | Download |
+|---|---|---|
+| macOS, Apple silicon | Metal | 11 MB |
+| Linux x86_64 with an Nvidia GPU (`nvidia-smi` works, WSL2 too) | CUDA 12.8 plus its runtime libraries | 760 MB |
+| Linux x86_64, no Nvidia GPU, a Vulkan loader, not WSL | Vulkan | 31 MB |
+| Other Linux x86_64 or arm64, macOS Intel | CPU | 11 to 17 MB |
+| Windows x86_64 (untested) | CUDA 12.4 with an Nvidia GPU, else CPU | 645 / 19 MB |
+
+CUDA 12.8 rather than 13: 12.8 already has Blackwell kernels, while CUDA 13 needs a newer driver and drops pre-Turing
+GPUs, and the rest of the sidecar (PyTorch for Kyutai, onnxruntime for Kokoro) runs CUDA 12 anyway. Vulkan is not used
+on WSL2, which has no Nvidia Vulkan driver.
+
+Each `/livevibe` start picks a free port on 127.0.0.1 and runs
+`llama-server -m <model> --host 127.0.0.1 --port <port> --jinja -c 16384 -np 1 --no-webui -ngl 99`, waits for
+`/health`, and points the front at it; the server stops when live vibe stops or the sidecar exits. If the sidecar is
+killed outright, Linux takes the server down with it (`PR_SET_PDEATHSIG`); elsewhere the next start stops a server
+whose sidecar is gone. The log (`frontServerLog`) gets a header with the command line, port, model and placement at
+every start. The server only answers requests that carry a key made fresh for each start (passed in `LLAMA_API_KEY`, never
+on the command line), since llama-server otherwise accepts calls from any web page.
+
+GPU memory is shared with the voice models through one budget. The front asks first, before the recognizer and
+Kokoro, since a front model on the CPU costs seconds on every reply, while the recognizer falls back to Whisper and
+Kokoro is fine on the CPU. Its need is worked out from the GGUF (weights, f16 KV cache at the context, about 0.75 GB
+for the CUDA context): 5.3 GiB for the default model. If the GPU would keep less than 3 GiB free, the server runs on
+the CPU (`-ngl 0 --device none`) with one warning that replies will be slow. On Apple silicon it always uses Metal.
+
+To skip the downloads, point `frontServerBin` at a `llama-server` you built and `frontServerModel` at a GGUF you have.
+If anything fails, the warning says why and speech goes straight to Claude, as when any front server is down.
+
+### Your own server
+
+Set `frontUrl` (or `/livevibe url <url>`). Any OpenAI-compatible chat server with tool calling works. With llama.cpp:
 
 ```sh
 llama-server -m Qwen3-8B-Q4_K_M.gguf --jinja --port 8080   # --jinja is required for tool calls
