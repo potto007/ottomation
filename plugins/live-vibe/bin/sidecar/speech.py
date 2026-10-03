@@ -53,11 +53,12 @@ def is_apple_silicon() -> bool:
 # -- STT: the recognizer and its turn detector, built on the listener thread -------------------------------------
 def recognizer(stt: str, asr: str, end_silence_ms: int, speaking: Callable[[], bool],
                end_silence_long_ms: int = Tuning.end_silence_long_ms,
-               guard: Any = None) -> tuple[Detector, Callable[[Any], str]]:
+               guard: Any = None, experimental: bool = False) -> tuple[Detector, Callable[[Any], str]]:
     """(detector, transcribe). Kyutai brings its own end of turn and passes text through; Whisper pairs with
     Silero (or the energy gate) and transcribes the utterance audio. `guard` (an EchoGuard) lets the barge-in gate
-    cut on one word."""
-    tune = Tuning(end_silence_ms=end_silence_ms, end_silence_long_ms=end_silence_long_ms)
+    cut on one word. `experimental` turns on Kyutai's continuous end-of-turn wait and STT flush."""
+    tune = Tuning(end_silence_ms=end_silence_ms, end_silence_long_ms=end_silence_long_ms,
+                  eot_continuous=experimental, stt_flush=experimental)
     gate = BargeGate(tune, guard)
     try:
         if stt == "kyutai":
@@ -145,6 +146,12 @@ S2_EMA_KEEP = 0.5  # the cap tier reads the 2 s head through an EMA (about 3 ste
 CONTINUE_WORDS = frozenset(("and", "but", "or", "so", "because", "yet", "the", "a", "an", "to", "of", "in", "on",
                             "with", "like", "um", "uh"))  # a transcript ending on one of these is unfinished
 TERMINAL = {".": "period", "?": "question", "!": "exclaim"}
+# Tuning.eot_continuous: the shaped end-of-turn probability p behind the one wait (KyutaiTurns._p).
+P_UNFINISHED = 0.3  # an unfinished tail (comma, CONTINUE_WORDS) caps p here
+P_TERMINAL = 0.7  # terminal punctuation floors p here
+P_NO_HEADS = 0.5  # a model without pause heads: neither "more coming" nor "done"; the text alone moves p
+FLUSH_BLOCK = np.zeros(KYUTAI_BLOCK, np.float32)  # Tuning.stt_flush: 80 ms of silence; every backend's step() takes it
+MAX_EXTEND_STEP_S = 10  # past max_utterance_s, a turn still forecast to go on is re-judged this often
 
 
 def turn_tail(text: str) -> str:
@@ -256,7 +263,8 @@ class KyutaiSTT:
         return self.gen.step_idx
 
     def step(self, block: np.ndarray) -> tuple[str | None, Pauses]:
-        """One 1920-sample block -> (word piece or None, pause probabilities)."""
+        """One 1920-sample block -> (word piece or None, pause probabilities). A zero block (FLUSH_BLOCK, the
+        flush) is an ordinary step: mx.array copies the input."""
         mx = self._mx
         codes = self.mimi.encode_step(mx.array(block, dtype=mx.float32)[None, None])
         token, heads = self.gen.step_with_extra_heads(codes.transpose(0, 2, 1)[0, :, :self.cfg.other_codebooks])
@@ -288,11 +296,23 @@ class KyutaiTurns:
       max_utterance_s; short is never above normal. The industry's tiers: LiveKit 0.3 s / 2.5 s on
       P(end) < unlikely_threshold, OpenAI semantic_vad medium 4 s, AssemblyAI conservative 3.6 s, Pipecat Smart
       Turn 3 s fallback.
-    - max: max_utterance_s.
+    - max: max_utterance_s, if the end-of-turn probability (_p) is at least END_OF_TURN or the model has no
+      heads; otherwise the limit moves MAX_EXTEND_STEP_S at a time, up to max_utterance_extend_s, where the turn
+      ends regardless. The log line carries extended=<s past max_utterance_s>.
     - backchannel: a turn that cut the assistant and is only backchannel words so far (audio.is_backchannel) ends
       after backchannel_quiet_ms without a new piece, so the paused voice can resume.
     Each end writes one 'kyutai turn end' line to the log file (trigger, cap tier, tail token, length, heads; no
-    other text)."""
+    other text).
+
+    Tuning.eot_continuous (experimental) replaces the three silence tiers with one wait, re-read every step:
+    wait_ms = eot_wait_base_ms + (1 - p) * eot_wait_span_ms, at most max_utterance_s; the turn ends (trigger
+    silence, cap continuous) once quiet_ms >= wait_ms. p is the s2 EMA clamped to [0, 1] (P_NO_HEADS without
+    heads), shaped by the text and the 0.5 s head (_p). The semantic trigger stays as the early exit.
+
+    Tuning.stt_flush (experimental): at the first step of a high-heads run (s2 and s05 above END_OF_TURN, no
+    piece) in an active turn, _flush steps delay_steps + 1 silent blocks at once; the triggers above then read
+    that silence as quiet until the next piece. A flushed piece aborts it. The log line gains
+    flush=<steps>/<compute ms> and quiet_ms includes the flushed silence."""
 
     IN_BLOCK = KYUTAI_BLOCK * SR // KYUTAI_SR  # 1280 input samples per 80 ms step
     MS_PER_STEP = 1000 * KYUTAI_BLOCK / KYUTAI_SR  # 80
@@ -303,6 +323,7 @@ class KyutaiTurns:
         self.buf = np.zeros(0, np.float32)
         self.prev = 0.0
         self.active = False  # a turn has started (speech_start sent)
+        self.skew = 0  # flushed model steps since the last model reset (_flush)
         self._clear()
 
     def _clear(self) -> None:
@@ -311,6 +332,10 @@ class KyutaiTurns:
         self.gate.reset()
         self.peak = Pauses()
         self.s2_ema: float | None = None
+        self.extended = 0.0  # seconds this turn runs past max_utterance_s
+        self.flushed, self.flush_ms = 0, 0.0  # this turn's flushed steps and their compute time
+        self.credit = 0  # flushed steps since the last piece: silence the model heard, counted as quiet
+        self.flush_armed = True  # one completed flush per pause; a piece re-arms it
 
     def _cap(self) -> tuple[str, float, str]:
         """(tier, cap in ms, turn_tail) for the silence cap now; see the class docstring."""
@@ -321,6 +346,23 @@ class KyutaiTurns:
         if tail in TERMINAL.values():
             return "short", min(t.end_silence_short_ms, t.end_silence_ms), tail
         return "normal", t.end_silence_ms, tail
+
+    def _p(self, s05: float) -> float:
+        """The end-of-turn probability for the continuous wait: the s2 EMA clamped to [0, 1]; an unfinished tail
+        caps it at P_UNFINISHED, terminal punctuation floors it at P_TERMINAL; above END_OF_TURN it also needs the
+        0.5 s head above END_OF_TURN, else it reads END_OF_TURN."""
+        p = min(1.0, max(0.0, self.s2_ema)) if any(self.peak) and self.s2_ema is not None else P_NO_HEADS
+        tail = turn_tail(self.text)
+        if tail == "comma" or tail in CONTINUE_WORDS:
+            p = min(p, P_UNFINISHED)
+        elif tail in TERMINAL.values():
+            p = max(p, P_TERMINAL)
+        return END_OF_TURN if p > END_OF_TURN and s05 <= END_OF_TURN else p
+
+    def _wait(self, p: float) -> int:
+        """The continuous wait in ms for end-of-turn probability p, never above max_utterance_s."""
+        t = self.t
+        return min(round(t.eot_wait_base_ms + (1 - p) * t.eot_wait_span_ms), round(t.max_utterance_s * 1000))
 
     def _resample(self, block: np.ndarray) -> np.ndarray:
         x = np.concatenate([[self.prev], block])  # 16 kHz -> 24 kHz, linear, continuous across blocks
@@ -339,9 +381,10 @@ class KyutaiTurns:
     def _step(self, block: np.ndarray) -> list[tuple[str, Any]]:
         if self.stt.steps >= self.stt.MAX_STEPS - 1 or (self.started_at is None and self.stt.steps > 3000):
             self.stt.reset()
+            self.skew = 0
         piece, pauses = self.stt.step(block)
-        step = self.stt.steps
-        if step <= HEADS_IGNORE_STEPS:
+        step = self.stt.steps - self.skew  # real time: flushed steps took none
+        if self.stt.steps <= HEADS_IGNORE_STEPS:
             pauses = Pauses()
         events: list[tuple[str, Any]] = []
         if piece is not None:
@@ -349,7 +392,7 @@ class KyutaiTurns:
                 self.started_at = step
             self.text += piece.replace("▁", " ")
             self.words += piece.startswith("▁")
-            self.last_word = step
+            self.last_word, self.credit, self.flush_armed = step, 0, True
             if not self.active:
                 speaking = self.speaking()
                 if not speaking or self.gate.decide(self.text, self.words) == "cut":
@@ -357,19 +400,28 @@ class KyutaiTurns:
                     events.append(("speech_start", 1.0 - pauses.s2))
         if self.started_at is None:
             return events
-        self.peak = Pauses(*map(max, self.peak, pauses))
-        self.s2_ema = pauses.s2 if self.s2_ema is None else S2_EMA_KEEP * self.s2_ema + (1 - S2_EMA_KEEP) * pauses.s2
-        high = pauses.s2 > END_OF_TURN and pauses.s05 > END_OF_TURN
-        self.ends = self.ends + 1 if high and piece is None else 0  # a new piece restarts the count
-        quiet_ms = (step - self.last_word) * self.MS_PER_STEP
+        self._heads(piece, pauses)
+        if (self.t.stt_flush and self.flush_armed and self.active and piece is None and self.ends == 1
+                and self.stt.steps + self.stt.delay_steps + 1 < self.stt.MAX_STEPS - 1):
+            pauses = self._flush(step)
+        quiet_ms = (step - self.last_word + self.credit) * self.MS_PER_STEP
         cap, cap_ms, tail = self._cap()
+        p = wait_ms = None
+        if self.t.eot_continuous:
+            p = self._p(pauses.s05)
+            wait_ms = self._wait(p)
+            cap, cap_ms = "continuous", wait_ms
         if self.ends >= self.stt.delay_steps and quiet_ms >= self.t.eot_drain_ms:
             trigger, cap = "semantic", "semantic"
         elif self.barged and quiet_ms >= self.t.backchannel_quiet_ms and is_backchannel(self.text):
             trigger, cap = "backchannel", "backchannel"
         elif quiet_ms >= cap_ms:
             trigger = "silence"
-        elif (step - self.started_at) * self.MS_PER_STEP >= self.t.max_utterance_s * 1000:
+        elif (step - self.started_at) * self.MS_PER_STEP >= (self.t.max_utterance_s + self.extended) * 1000:
+            room = max(self.t.max_utterance_s, self.t.max_utterance_extend_s) - self.t.max_utterance_s - self.extended
+            if room > 0 and any(self.peak) and (p if p is not None else self._p(pauses.s05)) < END_OF_TURN:
+                self.extended += min(MAX_EXTEND_STEP_S, room)  # still speaking: no mid-sentence cut yet
+                return events
             trigger = "max"
         else:
             return events
@@ -380,13 +432,58 @@ class KyutaiTurns:
             events.append(("utterance", text) if ok else ("discard", text or None))  # a session may want "okay."
             sent = events[-1][0]
         heads = " ".join(f"{k}={pk:.2f}/{v:.2f}" for k, pk, v in zip(Pauses._fields, self.peak, pauses))
-        file_log("INFO", f"kyutai turn end: trigger={trigger} cap={cap} tail={tail} sent={sent} "
-                         f"len_ms={(step - self.started_at + 1) * self.MS_PER_STEP:.0f} quiet_ms={quiet_ms:.0f} "
+        ext = f" extended={self.extended:.0f}" if trigger == "max" else ""
+        cont = f" wait_ms={wait_ms} p={p:.2f}" if p is not None else ""
+        flush = f" flush={self.flushed}/{self.flush_ms:.0f}ms" if self.t.stt_flush else ""
+        file_log("INFO", f"kyutai turn end: trigger={trigger}{ext} cap={cap}{cont} tail={tail} sent={sent} "
+                         f"len_ms={(step - self.started_at + 1) * self.MS_PER_STEP:.0f} quiet_ms={quiet_ms:.0f}{flush} "
                          f"words={self.words} peak/final {heads}")
         self.active = False
         self._clear()
         return events
 
+    def _heads(self, piece: str | None, pauses: Pauses) -> None:
+        """One step's pause heads into the turn: peak, the s2 EMA, and the run of high steps without a piece."""
+        self.peak = Pauses(*map(max, self.peak, pauses))
+        self.s2_ema = pauses.s2 if self.s2_ema is None else S2_EMA_KEEP * self.s2_ema + (1 - S2_EMA_KEEP) * pauses.s2
+        high = pauses.s2 > END_OF_TURN and pauses.s05 > END_OF_TURN
+        self.ends = self.ends + 1 if high and piece is None else 0  # a new piece restarts the count
+
+    def _flush(self, step: int) -> Pauses:
+        """Tuning.stt_flush (Kyutai Unmute's flush): the semantic end just became plausible, so step delay_steps + 1
+        silent blocks now, at compute speed, to push out the text that trails the audio, and return the last
+        flushed step's heads. Their heads join the turn, and the flushed steps count as quiet (`credit`) until the
+        next piece, as if that much silence had passed. A flushed piece means the user was not done: the flush
+        stops there, the piece stays in the text, stamped at the current real step (quiet restarts from now, no
+        credit), and a 'kyutai flush' line is logged. One completed flush per pause: a piece re-arms it.
+
+        Model time and real time: flushed steps advance stt.steps but take no real time, so `skew` counts them
+        until the next model reset and the turn's clock (len_ms, the max timer, last_word) reads stt.steps - skew.
+        Mic audio that arrives meanwhile waits in the Listener's queue and in self.buf and is fed after, so the
+        model hears [audio, flushed silence, audio]: nothing is dropped."""
+        n, pauses, ran, cut = self.stt.delay_steps + 1, Pauses(), 0, False
+        t0 = time.perf_counter()
+        for ran in range(1, n + 1):
+            piece, pauses = self.stt.step(FLUSH_BLOCK)
+            if self.stt.steps <= HEADS_IGNORE_STEPS:
+                pauses = Pauses()
+            self._heads(piece, pauses)
+            if piece is not None:
+                self.text += piece.replace("▁", " ")
+                self.words += piece.startswith("▁")
+                cut = True
+                break
+        ms = (time.perf_counter() - t0) * 1000
+        self.skew += ran
+        self.flushed += ran
+        self.flush_ms += ms
+        if cut:
+            self.last_word, self.credit = step, 0
+            file_log("INFO", f"kyutai flush: aborted at step {ran}/{n} ms={ms:.0f}")
+        else:
+            self.credit += ran
+            self.flush_armed = False
+        return pauses
 
 class NoSpeech:
     """A detector that never hears anything: --fake-audio, for the lifecycle self-test."""

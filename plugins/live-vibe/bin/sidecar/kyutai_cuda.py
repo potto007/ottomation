@@ -42,7 +42,10 @@ class KyutaiStepper(Protocol):
 
     def reset(self) -> None: ...
 
-    def step(self, block: np.ndarray) -> tuple[str | None, speech.Pauses]: ...
+    def step(self, block: np.ndarray) -> tuple[str | None, speech.Pauses]:
+        """One 1920-sample block of 24 kHz audio. Takes speech.FLUSH_BLOCK (zeros) too, several back to back
+        at compute speed, without copying it into state it keeps: the STT flush (Tuning.stt_flush)."""
+        ...
 
     def transcribe(self, payload: Any) -> str: ...
 
@@ -133,9 +136,8 @@ class KyutaiCudaSTT:
             self.gen = LMGen(self.lm, temp=0, temp_text=0)
             self.mimi.streaming_forever(1)
             self.gen.streaming_forever(1)
-            silence = np.zeros(speech.KYUTAI_BLOCK, np.float32)
-            for _ in range(self.WARMUP_STEPS):
-                self.step(silence)
+            for _ in range(self.WARMUP_STEPS):  # the CUDA graphs are captured on the flush's own input
+                self.step(speech.FLUSH_BLOCK)
             torch.cuda.synchronize()
         self.reset()
         mib = torch.cuda.memory_allocated() / 2**20
@@ -158,7 +160,8 @@ class KyutaiCudaSTT:
         return self._steps
 
     def step(self, block: np.ndarray) -> tuple[str | None, speech.Pauses]:
-        """One 1920-sample block -> (word piece or None, pause probabilities)."""
+        """One 1920-sample block -> (word piece or None, pause probabilities). A zero block (the flush) is an
+        ordinary step: the input is copied to the device, never written."""
         torch = self._torch
         with torch.no_grad():
             x = torch.from_numpy(np.ascontiguousarray(block, np.float32))
