@@ -24,7 +24,14 @@ stdout and a loopback HTTP port guarded by a per-run token.
 
 ## First run
 
-The first `/live` or `/livevibe` downloads models, and the status line shows `loading` until they are ready:
+Run `/live setup` once on each machine. uv installs the Python packages, then the sidecar downloads the models your
+settings name and tests each piece: PortAudio and the mic and speaker, espeak-ng, the synthesizer, the recognizer
+(it speaks a sentence into it and checks what comes back), one sentence through the speaker, and the front server.
+Progress shows in the status line, and a report with a ✓, ! or ✗ per step lands in the transcript. Installing the
+plugin installs none of this, and setup never installs system packages: a ✗ line names the command to run (`uv`
+itself, `espeak-ng`, `libportaudio2`). Change a setting, run it again.
+
+Without setup, the first `/live` or `/livevibe` downloads the models, and the status line shows `loading` until they are ready:
 Kyutai STT about 2.4 GB (Apple silicon), the Whisper model (75 to 500 MB), Kokoro about 330 MB, and Silero VAD about 2 MB. Later starts take a few seconds. Kokoro and Silero are cached in `~/.cache/duplex_voice` (`LIVE_VIBE_CACHE` overrides it); Kyutai and Whisper use the Hugging Face cache.
 
 ## Settings (`/config`)
@@ -56,6 +63,7 @@ To switch between small models without keeping a big one in memory, put a router
 
 ```sh
 uv run --script bin/sidecar/main.py --list-devices   # the indexes and names for mic and speaker
+uv run --script bin/sidecar/main.py --setup          # what /live setup runs (with the default settings)
 uv run --script bin/sidecar/main.py --unit           # pure unit checks
 uv run --script bin/sidecar/main.py --selftest       # both modes, no mic, speaker or network
 ```

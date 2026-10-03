@@ -196,3 +196,31 @@ test('stt: whisper reaches the sidecar argv', { options: { stt: 'whisper' } }, a
   await $.command.run({ command: 'live', ...typed })
   sidecar.release()
 })
+
+test('/live setup runs the sidecar --setup and logs its report', async ($, on) => {
+  on('process.run', () => ({ value: { exitCode: 0, stdout: 'uv 0.9.0\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  const argvs: string[] = []
+  on('process.spawn', async function* (_$, e) {
+    argvs.push(e.argv.join(' '))
+    yield { stream: 'stdout' as const, text: '{"type":"progress","text":"Kokoro: loading"}\n{"type":"check","name":"audio","status":"ok","text":"mic A"}\n' }
+    yield { stream: 'stdout' as const, text: '{"type":"check","name":"espeak-ng","status":"fail","text":"brew install espeak-ng"}\n{"type":"done","ok":false}\n' }
+    return { value: { code: 1, signal: null } }
+  })
+  const statuses: (string | undefined)[] = []
+  on('ui.status', (_$, e) => { statuses.push(e.text); return { value: undefined } })
+  const report = new Promise<string>(resolve => on('ui.log', (_$, e) => { if (e.to !== 'debug') resolve(e.text); return { value: undefined } }))
+
+  expect((await $.command.run({ command: 'live', ...typed, args: 'setup' })).text).toMatch(/Setting up live voice/)
+  const text = await report
+  expect(argvs[0]).toContain('--setup')
+  expect(text).toMatch(/fix the ✗ lines/)
+  expect(text).toContain('✓ audio: mic A')
+  expect(text).toContain('✗ espeak-ng: brew install espeak-ng')
+  expect(statuses).toContain('setup: Kokoro: loading')
+})
+
+test('/live setup without uv says how to install it; /live with other words shows usage', async ($, on) => {
+  on('process.run', () => { throw new Error('spawn uv ENOENT') })
+  expect((await $.command.run({ command: 'live', ...typed, args: 'setup' })).text).toMatch(/uv is not installed/)
+  expect((await $.command.run({ command: 'live', ...typed, args: 'please' })).text).toMatch(/Usage/)
+})

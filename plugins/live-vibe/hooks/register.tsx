@@ -201,7 +201,79 @@ function startSidecar($: EngineInterface, options: PluginOptions, mode: LiveMode
       await update($, live, l => ({ ...l, port: 0 }))
       await stopLive($)
     }
-  })().catch(err => $.ui.toast(`live: sidecar failed: ${String(err).slice(0, 120)}`))
+  })().catch(err => sidecarFailed($, err).catch(() => {})) // a module unloading mid-loop lands here too: stay quiet
+}
+
+// The child never started (no uv, most often) or the loop broke: say why, and turn off a mode that never got going.
+async function sidecarFailed($: EngineInterface, err: unknown) {
+  $.ui.toast(await hasUv($) ? `live: sidecar failed: ${String(err).slice(0, 120)}. /live setup checks everything.` : `live: ${UV_FIX}`, { timeoutMs: 15000 })
+  const l = await read($, live)
+  if (l.isOn && !l.port) await stopLive($)
+}
+
+const UV_FIX = 'uv is not installed, or not on the PATH Claude Code started with. Install it (curl -LsSf https://astral.sh/uv/install.sh | sh; macOS also brew install uv; Windows: powershell -c "irm https://astral.sh/uv/install.ps1 | iex"), restart Claude Code, then /live setup.'
+
+async function hasUv($: EngineInterface) {
+  try {
+    return (await $.process.run(['uv', '--version'])).exitCode === 0
+  } catch {
+    return false
+  }
+}
+
+const MARK: Record<string, string> = { ok: '✓', warn: '!', fail: '✗' }
+let isSettingUp = false // one at a time; a reload kills the child and starts this over
+
+// /live setup: the sidecar's --setup installs the Python packages (uv does, before Python starts), downloads the
+// models the settings name, and tests the mic, speaker, synthesizer, recognizer and front. Progress goes to the
+// status line; the report is one transcript row when it ends. System packages stay the person's to install: the
+// report names the command.
+function setupVoice($: EngineInterface, options: PluginOptions) {
+  isSettingUp = true
+  void (async () => {
+    $.ui.status('setup: installing the Python packages (a minute or two on first run)')
+    const argv = ['uv', 'run', '--script', `${$.plugin.root}/bin/sidecar/main.py`, '--setup',
+      '--stt', String(options.stt), '--asr', String(options.asr), '--tts', String(options.tts),
+      '--end-silence-ms', String(options.endSilenceMs), '--front-backend', String(options.frontBackend),
+      '--front-url', String(options.frontUrl)]
+    if (options.voice) argv.push('--voice', String(options.voice))
+    if (options.mic) argv.push('--mic', String(options.mic))
+    if (options.speaker) argv.push('--speaker', String(options.speaker))
+    if (options.frontModel) argv.push('--front-model', String(options.frontModel))
+    const rows: string[] = []
+    const errTail: string[] = []
+    let ok: boolean | null = null
+    let buf = ''
+    for await (const chunk of $.process.spawn({ argv })) {
+      if (!('stream' in chunk)) break
+      if (chunk.stream === 'stderr') {
+        $.ui.log(chunk.text, { to: 'debug' })
+        errTail.push(...chunk.text.split('\n').filter(x => x.trim()))
+        errTail.splice(0, Math.max(0, errTail.length - 8))
+        continue
+      }
+      buf += chunk.text
+      const lines = buf.split('\n')
+      buf = lines.pop() ?? ''
+      for (const line of lines) {
+        let msg: Record<string, unknown>
+        try { msg = JSON.parse(line) } catch { continue }
+        const text = String(msg.text ?? '')
+        if (msg.type === 'progress') $.ui.status(`setup: ${text}`)
+        else if (msg.type === 'check') rows.push(`${MARK[String(msg.status)] ?? '?'} ${String(msg.name)}: ${text}`)
+        else if (msg.type === 'warn') rows.push(`! ${text}`)
+        else if (msg.type === 'log' && /^(download|kyutai):/.test(text)) $.ui.status(`setup: ${text}`)
+        else if (msg.type === 'done') ok = Boolean(msg.ok)
+      }
+    }
+    const head = ok ? 'Live voice setup: ready. /live or /livevibe to start.'
+      : ok === false ? 'Live voice setup: fix the ✗ lines, then /live setup again.'
+        : 'Live voice setup stopped before it finished. The last output:'
+    $.ui.log([head, ...rows, ...(ok === null ? errTail : [])].join('\n'))
+    $.ui.toast(ok ? 'live setup: ready' : 'live setup: needs attention (see the transcript)')
+  })()
+    .catch(err => $.ui.toast(`live setup failed: ${String(err).slice(0, 160)}`))
+    .finally(() => { isSettingUp = false; void status($).catch(() => {}) })
 }
 
 // Live vibe on: vibe mode joins the voice front, and stopLive later hands vibe back as `vibeBefore` had it.
@@ -250,7 +322,7 @@ async function frontSetting($: EngineInterface, options: PluginOptions, field: '
 
 export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
-    await $.command.register({ name: 'live', description: 'Toggle live voice mode: speak to Claude, hear the answers' })
+    await $.command.register({ name: 'live', description: 'Toggle live voice mode: speak to Claude, hear the answers. /live setup installs and tests what it needs', argumentHint: '[setup]' })
     await $.command.register({ name: 'livevibe', description: 'Toggle live vibe: talk with a fast voice front that hands the work to Claude as vibe director', argumentHint: '[model [name] | url [url]]' })
     await $.command.register({ name: 'vibe', description: 'Toggle vibe mode: Claude directs worker subagents instead of editing itself', argumentHint: '[first request]' })
     const l = await read($, live)
@@ -259,12 +331,21 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  on('command.run', { command: 'live' }, async $ => {
+  on('command.run', { command: 'live' }, async ($, e) => {
+    const args = e.args.trim()
+    if (args && args !== 'setup') return { text: 'Usage: /live toggles live voice; /live setup checks and installs what it needs.' }
+    if (args === 'setup') {
+      if ((await read($, live)).isOn) return { text: 'Turn /live or /livevibe off first: setup loads the same models.' }
+      if (isSettingUp) return { text: 'Setup is already running; progress is in the status line.' }
+      if (!(await hasUv($))) return { text: UV_FIX }
+      setupVoice($, options)
+      return { text: 'Setting up live voice: Python packages, models, then a test of the mic, speaker and voice. Progress is in the status line; the report lands here.' }
+    }
     const l = await read($, live)
     await stopLive($) // off, or switching over from live vibe
     if (l.isOn && l.mode === 'live') return { text: 'Live voice off.' }
     startSidecar($, options, 'live', false)
-    return { text: 'Live voice on: loading the models, then listening. Say what you want; /live again turns it off.' }
+    return { text: 'Live voice on: loading the models, then listening. Say what you want; /live again turns it off. First run on this machine? /live setup shows progress.' }
   })
 
   on('command.run', { command: 'livevibe' }, async ($, e) => {

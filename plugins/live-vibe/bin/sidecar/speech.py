@@ -82,6 +82,7 @@ class WhisperASR:
         from faster_whisper import WhisperModel
 
         self.lang = "en" if size.endswith(".en") else None
+        self.device = "cuda"
         if _cuda_devices() > 0:
             try:
                 self.model = WhisperModel(size, device="cuda", compute_type="float16")
@@ -92,6 +93,7 @@ class WhisperASR:
                 warn(f"Whisper on CUDA failed ({type(e).__name__}: {str(e)[:120]}); using the CPU. Fix: install "
                      "CUDA 12 cuBLAS and cuDNN 9 (the CUDA toolkit, or pip nvidia-cublas-cu12 and "
                      "nvidia-cudnn-cu12 in the sidecar's environment).")
+        self.device = "cpu"
         self.model = WhisperModel(size, device="cpu", compute_type="int8")
         log(f"asr: faster-whisper {size} on CPU int8")
 

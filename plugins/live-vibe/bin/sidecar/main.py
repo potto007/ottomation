@@ -39,6 +39,7 @@ HTTP on 127.0.0.1:N:  POST /speak <text> (live)   POST /event <text> (front)   P
 A missing system piece (PortAudio, a mic or speaker, espeak-ng off macOS, say off macOS) is one warn naming the
 fix and exit code 2; a backend that fails to load otherwise falls back with a warn.
 
+  uv run --script bin/sidecar/main.py --setup       /live setup: check the system, fetch the models, test the voice
   uv run --script bin/sidecar/main.py --unit        pure checks, a second, no models
   uv run --script bin/sidecar/main.py --selftest    both modes end to end: no mic, speaker or network
 """
@@ -81,6 +82,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--front-model", default="", help="empty: the server's model, or claude-haiku-4-5 for anthropic")
     ap.add_argument("--switch-pattern", default="", help="regex whose group 1 is a model a spoken switch names")
     ap.add_argument("--list-devices", action="store_true")
+    ap.add_argument("--setup", action="store_true", help="check the system, fetch the models, test the voice")
     ap.add_argument("--unit", action="store_true", help="pure unit checks")
     ap.add_argument("--selftest", action="store_true", help="both modes without mic, speaker or network")
     ap.add_argument("--fake-audio", action="store_true", help=argparse.SUPPRESS)  # the self-test's lifecycle child
@@ -184,6 +186,10 @@ def main() -> int:
         print(audio.load_sounddevice().query_devices())
         return 0
     protocol.claim_stdout()
+    if args.setup:
+        from sidecar import prepare
+
+        return prepare.run(args)
     life = protocol.Lifecycle()
     life.install()
     from sidecar.audio import CannotStart
