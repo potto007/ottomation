@@ -34,7 +34,7 @@ from .front import (ACK, EVENT, EVENT_CHARS, HISTORY_MAX, HOLD, INTERRUPTED, RET
                     acknowledgement, event_message, held_answer, is_turn_start, make_brain, parse_sse,
                     report_brief, retellable, spoken_model, warm_up)
 from .session import LiveSession
-from .speech import BARGE_IN_WORDS, KYUTAI_BLOCK, KYUTAI_SR, KyutaiTurns, SilentTTS, check_tts
+from .speech import BARGE_IN_WORDS, KYUTAI_BLOCK, KYUTAI_SR, KyutaiTurns, Pauses, SilentTTS, check_tts
 
 MAIN = Path(__file__).with_name("main.py")
 # The mod's SPOKEN_SWITCH source, as register.tsx passes it in --switch-pattern.
@@ -71,26 +71,28 @@ def run_detector(probs: list[float], speaking: bool = False) -> list[tuple[int, 
 
 
 class FakeKyutai:
-    """KyutaiSTT's stepping interface over a script of (piece, p_end) per 80 ms step."""
+    """KyutaiSTT's stepping interface over a script of (piece, pauses) per 80 ms step. A float for pauses stands
+    for all four heads at that value."""
 
     MAX_STEPS = 4096
     delay_steps = 6
 
-    def __init__(self, script: list[tuple[str | None, float]]):
+    def __init__(self, script: list[tuple[str | None, float | Pauses]]):
         self.script, self.steps = list(script), 0
 
     def reset(self) -> None:
-        pass
+        self.steps = 0
 
-    def step(self, block) -> tuple[str | None, float]:
+    def step(self, block) -> tuple[str | None, Pauses]:
         self.steps += 1
-        return self.script.pop(0) if self.script else (None, 0.0)
+        piece, p = self.script.pop(0) if self.script else (None, 0.0)
+        return piece, p if isinstance(p, Pauses) else Pauses(p, p, p, p)
 
     def transcribe(self, payload: Any) -> str:
         return payload if isinstance(payload, str) else ""
 
 
-def run_kyutai(script: list[tuple[str | None, float]], speaking: bool = False) -> list[tuple[int, str, Any]]:
+def run_kyutai(script: list[tuple[str | None, float | Pauses]], speaking: bool = False) -> list[tuple[int, str, Any]]:
     turns = KyutaiTurns(FakeKyutai(script), Tuning(end_silence_ms=1500), lambda: speaking)
     block = KYUTAI_BLOCK * SR // KYUTAI_SR
     return [(i, k, v) for i in range(len(script) + 25) for k, v in turns.feed(np.zeros(block, np.float32))]

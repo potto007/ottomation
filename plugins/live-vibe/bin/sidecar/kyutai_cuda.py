@@ -4,8 +4,8 @@ package) for Linux with an Nvidia GPU.
 load_kyutai() picks the backend for --stt kyutai: MLX on Apple silicon (KyutaiSTT in
 speech.py), CUDA PyTorch when torch sees a GPU with room for the model, else None and
 the caller falls back to Whisper. Both backends step the same model and weights
-(kyutai/stt-1b-en_fr-candle: the plain PyTorch repo has no extra heads, and extra head
-2 carries the semantic end of turn) behind the interface KyutaiTurns drives: steps,
+(kyutai/stt-1b-en_fr-candle: the plain PyTorch repo has no extra heads, and extra heads
+0..3 are the pause predictors behind the semantic end of turn) behind the interface KyutaiTurns drives: steps,
 MAX_STEPS, delay_steps, reset(), step(block) and transcribe().
 
 The CUDA stepping follows kyutai-labs/delayed-streams-modeling
@@ -42,7 +42,7 @@ class KyutaiStepper(Protocol):
 
     def reset(self) -> None: ...
 
-    def step(self, block: np.ndarray) -> tuple[str | None, float]: ...
+    def step(self, block: np.ndarray) -> tuple[str | None, speech.Pauses]: ...
 
     def transcribe(self, payload: Any) -> str: ...
 
@@ -96,8 +96,8 @@ def load_kyutai() -> KyutaiStepper | None:
 
 
 class KyutaiCudaSTT:
-    """Kyutai STT 1B on CUDA: 80 ms of 24 kHz audio in, at most one word piece and an
-    end-of-turn probability out. Built and stepped on the listener thread only (the CUDA
+    """Kyutai STT 1B on CUDA: 80 ms of 24 kHz audio in, at most one word piece and the
+    pause probabilities (speech.Pauses) out. Built and stepped on the listener thread only (the CUDA
     graphs are captured there)."""
 
     where = "CUDA"
@@ -157,8 +157,8 @@ class KyutaiCudaSTT:
     def steps(self) -> int:
         return self._steps
 
-    def step(self, block: np.ndarray) -> tuple[str | None, float]:
-        """One 1920-sample block -> (word piece or None, P(end of turn))."""
+    def step(self, block: np.ndarray) -> tuple[str | None, speech.Pauses]:
+        """One 1920-sample block -> (word piece or None, pause probabilities)."""
         torch = self._torch
         with torch.no_grad():
             x = torch.from_numpy(np.ascontiguousarray(block, np.float32))
@@ -166,16 +166,14 @@ class KyutaiCudaSTT:
             out = self.gen.step_with_extra_heads(codes)
         self._steps += 1
         if out is None:  # still filling the model's delays; none for this model
-            return None, 0.0
+            return None, speech.Pauses()
         tokens, heads = out
-        p_end = (
-            heads[2][0, 0, 0] if len(heads) > 2 else torch.zeros((), device=self.device)
-        )
-        token, p = torch.stack(
-            [tokens[0, 0, 0].float(), p_end.float()]
+        token, *p = torch.stack(
+            [tokens[0, 0, 0].float()] + [h[0, 0, 0].float() for h in heads[:4]]
         ).tolist()  # one sync
         token = int(token)
-        return (None if token in (0, 3) else self.tok.id_to_piece(token)), float(p)
+        piece = None if token in (0, 3) else self.tok.id_to_piece(token)
+        return piece, speech.Pauses.of(p)
 
     def transcribe(self, payload: Any) -> str:
         return payload if isinstance(payload, str) else ""

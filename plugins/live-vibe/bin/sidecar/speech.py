@@ -17,7 +17,7 @@ import time
 import urllib.request
 import wave
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 import numpy as np
 
@@ -172,8 +172,24 @@ def _fetch(repo: str, name: str) -> str:
         log(f"kyutai: {name} ready in {time.monotonic() - t:.0f}s")
 
 
+class Pauses(NamedTuple):
+    """Kyutai's four pause predictors for one step (extra heads 0..3, class 0): the probability that no new word
+    comes within the next 0.5, 1, 2 and 3 s. A forecast, not a silence detector; shorter horizons are more
+    aggressive. All 0.0 when the model lacks a head."""
+
+    s05: float = 0.0
+    s1: float = 0.0
+    s2: float = 0.0
+    s3: float = 0.0
+
+    @classmethod
+    def of(cls, values: list[float]) -> Pauses:
+        """The first four head values, zero-padded."""
+        return cls(*(list(values)[:4] + [0.0] * (4 - min(4, len(values)))))
+
+
 class KyutaiSTT:
-    """Kyutai STT 1B: 80 ms of 24 kHz audio in, at most one word piece and an end-of-turn probability out.
+    """Kyutai STT 1B: 80 ms of 24 kHz audio in, at most one word piece and the pause probabilities out.
     Words trail the audio by about half a second. transcribe() passes KyutaiTurns' text through."""
 
     MAX_STEPS = 4096  # ~5.5 min of LmGen history; reset() before it, when nobody is talking
@@ -209,13 +225,15 @@ class KyutaiSTT:
     def steps(self) -> int:
         return self.gen.step_idx
 
-    def step(self, block: np.ndarray) -> tuple[str | None, float]:
-        """One 1920-sample block -> (word piece or None, P(end of turn))."""
-        codes = self.mimi.encode_step(self._mx.array(block, dtype=self._mx.float32)[None, None])
+    def step(self, block: np.ndarray) -> tuple[str | None, Pauses]:
+        """One 1920-sample block -> (word piece or None, pause probabilities)."""
+        mx = self._mx
+        codes = self.mimi.encode_step(mx.array(block, dtype=mx.float32)[None, None])
         token, heads = self.gen.step_with_extra_heads(codes.transpose(0, 2, 1)[0, :, :self.cfg.other_codebooks])
+        p = [h[0, 0, 0] for h in heads[:4]]
+        mx.eval(token, *p)  # one evaluation for the token and the heads
         token = token[0].item()
-        p_end = heads[2][0, 0, 0].item() if len(heads) > 2 else 0.0
-        return (None if token in (0, 3) else self.tok.id_to_piece(token)), p_end
+        return (None if token in (0, 3) else self.tok.id_to_piece(token)), Pauses.of([x.item() for x in p])
 
     def transcribe(self, payload: Any) -> str:
         return payload if isinstance(payload, str) else ""
@@ -256,7 +274,8 @@ class KyutaiTurns:
     def _step(self, block: np.ndarray) -> list[tuple[str, Any]]:
         if self.stt.steps >= self.stt.MAX_STEPS - 1 or (self.started_at is None and self.stt.steps > 3000):
             self.stt.reset()
-        piece, p_end = self.stt.step(block)
+        piece, pauses = self.stt.step(block)
+        p_end = pauses.s2
         step = self.stt.steps
         events: list[tuple[str, Any]] = []
         if piece is not None:
