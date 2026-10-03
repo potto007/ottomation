@@ -14,7 +14,7 @@
     "stt": {
       "type": "string",
       "title": "Speech recognizer",
-      "description": "kyutai: Kyutai STT 1B on MLX (Apple silicon only; elsewhere whisper runs instead), streaming words that ends your turn on what you said rather than on a fixed pause; downloads about 2.4 GB on first use. whisper: Silero VAD plus faster-whisper (on an Nvidia GPU when CUDA works, else the CPU), sized by the next setting; also the automatic fallback.",
+      "description": "kyutai: Kyutai STT 1B on MLX (Apple silicon) or CUDA PyTorch (Linux with an Nvidia GPU; elsewhere whisper runs instead), streaming words that ends your turn on what you said rather than on a fixed pause; downloads about 2.4 GB on first use. whisper: Silero VAD plus faster-whisper (on an Nvidia GPU when CUDA works, else the CPU), sized by the next setting; also the automatic fallback.",
       "options": ["kyutai", "whisper"],
       "default": "kyutai"
     },

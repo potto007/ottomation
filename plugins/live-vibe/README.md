@@ -19,7 +19,7 @@ stdout and a loopback HTTP port guarded by a per-run token.
 - A microphone and speaker on the machine running Claude Code. A headless or SSH-only box cannot use voice; `/vibe` still works there. Headphones are best, because the mic stays open while the assistant speaks. On open speakers, the sidecar cancels the assistant's echo from the mic (WebRTC AEC3, through the `livekit` package), keeps barge-in strict until the speaker has gone quiet, and drops utterances that only repeat what it just said. Pick devices with the `mic` and `speaker` settings; `--list-devices` (below) shows the choices.
 - Per OS:
   - **macOS (Apple silicon):** `brew install espeak-ng` for Kokoro. Kyutai STT runs on MLX.
-  - **Linux:** `sudo apt install espeak-ng libportaudio2`. Kyutai STT is Apple-silicon only, so Whisper runs instead. It uses an Nvidia GPU when CTranslate2 finds one and CUDA 12 cuBLAS and cuDNN 9 are installed; otherwise it uses the CPU. On x86_64, Kokoro runs on an Nvidia GPU through onnxruntime-gpu, whose CUDA and cuDNN wheels (about 2 GB) uv installs with the sidecar; without a GPU it runs on the CPU. The log line `tts: Kokoro ... on CUDAExecutionProvider` (or `CPUExecutionProvider`) says which.
+  - **Linux:** `sudo apt install espeak-ng libportaudio2`. On x86_64, uv also installs PyTorch with CUDA and Kyutai's `moshi` package (about 3 GB the first time), and Kyutai STT runs on an Nvidia GPU (about 3.2 GB of VRAM; it needs 5 GB free when it starts, else Whisper runs). Without a usable GPU, Whisper runs instead: on an Nvidia GPU when CTranslate2 finds one, CUDA 12 cuBLAS and cuDNN 9 are installed and the GPU has room, otherwise on the CPU. Kokoro runs on the GPU through onnxruntime-gpu, whose CUDA and cuDNN wheels (about 2 GB) uv installs with the sidecar, when about 1.4 GB of VRAM still leaves 3 GB free; otherwise on the CPU, which is fast enough. Every GPU backend checks free VRAM first, so a GPU already busy with another model (a local LLM server) does not get pushed into paging; the log says where each one runs (`tts: Kokoro ... on CUDAExecutionProvider` or `CPUExecutionProvider`).
   - **Windows / WSL:** not tested. WSL needs working audio (WSLg) plus the Linux packages above.
 
 ## First run
@@ -32,13 +32,13 @@ plugin installs none of this, and setup never installs system packages: a ✗ li
 itself, `espeak-ng`, `libportaudio2`). Change a setting, run it again.
 
 Without setup, the first `/live` or `/livevibe` downloads the models, and the status line shows `loading` until they are ready:
-Kyutai STT about 2.4 GB (Apple silicon), the Whisper model (75 to 500 MB), Kokoro about 330 MB, and Silero VAD about 2 MB. Later starts take a few seconds. Kokoro and Silero are cached in `~/.cache/duplex_voice` (`LIVE_VIBE_CACHE` overrides it); Kyutai and Whisper use the Hugging Face cache.
+Kyutai STT about 2.4 GB (Apple silicon, or Linux with an Nvidia GPU), the Whisper model (75 to 500 MB), Kokoro about 330 MB, and Silero VAD about 2 MB. Later starts take a few seconds. Kokoro and Silero are cached in `~/.cache/duplex_voice` (`LIVE_VIBE_CACHE` overrides it); Kyutai and Whisper use the Hugging Face cache.
 
 ## Settings (`/config`)
 
 | Field | Default | Meaning |
 |---|---|---|
-| `stt` | `kyutai` | `kyutai` (streaming, ends your turn on what you said) or `whisper` (Silero VAD + faster-whisper). |
+| `stt` | `kyutai` | `kyutai` (streaming, ends your turn on what you said; MLX on Apple silicon, CUDA on Linux with an Nvidia GPU, else Whisper) or `whisper` (Silero VAD + faster-whisper). |
 | `asr` | `base.en` | Whisper size: `tiny.en`, `base.en`, `small.en`. |
 | `tts` | `kokoro` | `kokoro`, or `say` (macOS only). |
 | `voice` | empty | A Kokoro voice (`af_heart`) or a macOS `say` voice. |

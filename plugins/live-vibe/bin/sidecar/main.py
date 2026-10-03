@@ -11,6 +11,7 @@
 #   "httpx>=0.28",
 #   "anthropic>=1.11",
 #   "moshi-mlx>=0.3.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+#   "moshi>=0.2.11,<0.3; sys_platform == 'linux' and platform_machine == 'x86_64'",
 #   "livekit>=1.0",
 # ]
 # [tool.uv]
@@ -28,10 +29,11 @@
 Echo: --aec on runs WebRTC AEC3 (livekit) on the mic with what the speaker played as its reference; with
 or without it, barge-in stays strict for a tail after playback and utterances that repeat recent speech are dropped.
 
-Backends: --stt kyutai (Kyutai STT 1B on MLX, Apple silicon; streaming words and its own end of turn; about
-2.4 GB of weights on first use; elsewhere it falls back to whisper) or whisper (Silero VAD + faster-whisper,
-CUDA when there is a GPU); --tts kokoro (needs espeak-ng; CUDA through onnxruntime-gpu on Linux x86_64 when
-there is a GPU, see --tts-device) or say (macOS).
+Backends: --stt kyutai (Kyutai STT 1B on MLX on Apple silicon, or on CUDA PyTorch on Linux with an Nvidia GPU;
+streaming words and its own end of turn; about 2.4 GB of weights on first use; elsewhere it falls back to
+whisper) or whisper (Silero VAD + faster-whisper, CUDA when there is a GPU); --tts kokoro (needs espeak-ng;
+CUDA through onnxruntime-gpu on Linux x86_64 when there is a GPU, see --tts-device) or say (macOS). Each GPU
+backend loads only when the GPU keeps enough memory free after it (gpu.py); otherwise it runs on the CPU.
 
 stdout carries only these JSON lines (library output goes to stderr):
   {"type":"ready","port":N,"token":"..."}                every POST must send X-Live-Token: <token>

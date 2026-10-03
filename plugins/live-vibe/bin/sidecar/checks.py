@@ -1,10 +1,11 @@
 """--unit: the pure pieces (protocol encoder, stdout guard, SentenceSplitter, TurnDetector, KyutaiTurns' turn logic,
-SSE parsing, the spoken-switch pattern). --selftest: --unit, then both sessions end to end against a fake front
-server with a silent player, the token guard, the process lifecycle in a child, and the real speech backends
+the Kyutai backend choice and its Whisper fallback, SSE parsing, the spoken-switch pattern). --selftest: --unit,
+then both sessions end to end against a fake front server with a silent player, the token guard, the process lifecycle in a child, and the real speech backends
 when their weights are already downloaded. No mic, no speaker, no network after the first downloads."""
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import os
 import re
@@ -15,6 +16,8 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Iterator
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
@@ -79,11 +82,94 @@ class FakeKyutai:
         self.steps += 1
         return self.script.pop(0) if self.script else (None, 0.0)
 
+    def transcribe(self, payload: Any) -> str:
+        return payload if isinstance(payload, str) else ""
+
 
 def run_kyutai(script: list[tuple[str | None, float]], speaking: bool = False) -> list[tuple[int, str, Any]]:
     turns = KyutaiTurns(FakeKyutai(script), Tuning(end_silence_ms=1500), lambda: speaking)
     block = KYUTAI_BLOCK * SR // KYUTAI_SR
     return [(i, k, v) for i in range(len(script) + 25) for k, v in turns.feed(np.zeros(block, np.float32))]
+
+
+@contextmanager
+def patched(*patches: tuple[Any, str, Any]) -> Iterator[None]:
+    """Set (object, attribute, value) for the block, then put the originals back."""
+    saved = [(o, a, getattr(o, a)) for o, a, _ in patches]
+    try:
+        for o, a, v in patches:
+            setattr(o, a, v)
+        yield
+    finally:
+        for o, a, v in reversed(saved):
+            setattr(o, a, v)
+
+
+def kyutai_choice(check: Checker) -> None:
+    """--stt kyutai: MLX on Apple silicon, CUDA where torch sees a GPU, else Whisper with a
+    log line; a backend that throws while loading is a warn and Whisper. No models load."""
+    from . import kyutai_cuda as kc
+    from . import speech
+
+    def boom() -> None:
+        raise RuntimeError("no kernel image is available")
+
+    class FakeWhisper:
+        def __init__(self, size: str) -> None:
+            self.size = size
+
+        def transcribe(self, audio: Any) -> str:
+            return "whisper"
+
+    def choose(apple: bool, cuda_why: str | None, mlx: Any = FakeKyutai, cuda: Any = FakeKyutai):
+        out: list[dict[str, Any]] = []
+        protocol.capture(out)
+        try:
+            with patched((speech, "is_apple_silicon", lambda: apple), (kc, "cuda_unavailable", lambda: cuda_why),
+                         (speech, "KyutaiSTT", lambda: mlx([])), (kc, "KyutaiCudaSTT", lambda: cuda([])),
+                         (speech, "WhisperASR", FakeWhisper), (speech, "load_vad", lambda: ScriptedVAD([]))):
+                backend = kc.kyutai_backend()
+                det, transcribe = speech.recognizer("kyutai", "base.en", 1500, lambda: False)
+        finally:
+            protocol.capture(None)
+        return backend, det, transcribe, " | ".join(str(m.get("text")) for m in out), [m["type"] for m in out]
+
+    class Mlx(FakeKyutai):
+        pass
+
+    backend, det, _, said, _ = choose(apple=True, cuda_why="never asked", mlx=Mlx)
+    check(backend == ("mlx", "") and isinstance(det, KyutaiTurns) and isinstance(det.stt, Mlx),
+          f"kyutai choice: Apple silicon runs MLX {backend}")
+    backend, det, transcribe, said, _ = choose(apple=False, cuda_why=None)
+    check(backend == ("cuda", "") and isinstance(det, KyutaiTurns) and transcribe("hi") == "hi",
+          f"kyutai choice: Linux with a CUDA GPU runs PyTorch {backend}")
+    backend, det, transcribe, said, kinds = choose(apple=False, cuda_why="PyTorch sees no CUDA GPU")
+    check(backend == (None, "PyTorch sees no CUDA GPU") and isinstance(det, TurnDetector)
+          and transcribe(None) == "whisper" and kinds == ["log"] and "no CUDA GPU" in said and "using Whisper" in said,
+          f"kyutai choice: no GPU falls back to Whisper and Silero with a log line {said!r}")
+    backend, det, transcribe, said, kinds = choose(apple=False, cuda_why=None, cuda=lambda _: boom())
+    check(isinstance(det, TurnDetector) and kinds == ["warn"] and "CUDA unavailable" in said and "no kernel image" in said,
+          f"kyutai choice: a CUDA load failure warns and falls back to Whisper {said!r}")
+    backend, det, _, said, kinds = choose(apple=True, cuda_why=None, mlx=lambda _: boom())
+    check(isinstance(det, TurnDetector) and kinds == ["warn"] and "MLX unavailable" in said,
+          f"kyutai choice: an MLX load failure warns and falls back to Whisper {said!r}")
+    with patched((speech, "WhisperASR", FakeWhisper), (speech, "load_vad", lambda: ScriptedVAD([])),
+                 (kc, "load_kyutai", boom)):
+        det, _ = speech.recognizer("whisper", "base.en", 1500, lambda: False)
+    check(isinstance(det, TurnDetector), "kyutai choice: --stt whisper never looks for Kyutai")
+
+    if importlib.util.find_spec("torch") is not None:
+        import torch
+
+        free = int((kc.MIN_FREE_GIB - 1) * 2**30)
+        with patched((torch.cuda, "is_available", lambda: True), (torch.cuda, "mem_get_info", lambda *a: (free, 32 * 2**30))):
+            why = kc.cuda_unavailable()
+        check(why is not None and "GiB of GPU memory free" in why, f"kyutai choice: a busy GPU is no GPU {why!r}")
+        with patched((torch.cuda, "is_available", lambda: False)):
+            why = kc.cuda_unavailable()
+        check(why == "PyTorch sees no CUDA GPU", f"kyutai choice: torch without CUDA {why!r}")
+    else:
+        print("SKIP  kyutai choice: torch not installed here (not Linux x86_64), CUDA probe not exercised", flush=True)
 
 
 def units() -> int:
@@ -178,6 +264,7 @@ def units() -> int:
     finally:
         sys.platform = real
     check("macOS only" in msg and "apt install espeak-ng" in msg, f"say off macOS: one fatal message naming the fix {msg!r}")
+    kyutai_choice(check)
 
     echo_units(check)
     print("UNIT: ALL PASS" if check.ok else "UNIT: SOME CHECKS FAILED", flush=True)
@@ -682,12 +769,15 @@ def selftest_backends(check: Checker) -> None:
     else:
         print("SKIP  kokoro: model not downloaded", flush=True)
 
-    if not speech.is_apple_silicon() or not speech.kyutai_cached():
-        print("SKIP  kyutai backend: weights not downloaded (or not Apple silicon)", flush=True)
+    from .kyutai_cuda import KyutaiCudaSTT, kyutai_backend
+
+    backend, why = kyutai_backend()
+    if backend is None or not speech.kyutai_cached():
+        print(f"SKIP  kyutai backend: {why or 'weights not downloaded'}", flush=True)
         return
     t = time.monotonic()
-    stt = speech.KyutaiSTT()
-    print(f"      kyutai STT loaded in {time.monotonic() - t:.1f}s", flush=True)
+    stt = speech.KyutaiSTT() if backend == "mlx" else KyutaiCudaSTT()
+    print(f"      kyutai STT on {backend.upper()} loaded in {time.monotonic() - t:.1f}s", flush=True)
     stt.reset()
     t = time.monotonic()
     ev = frames_of(KyutaiTurns(stt, Tuning(end_silence_ms=1500), lambda: False), signal_)

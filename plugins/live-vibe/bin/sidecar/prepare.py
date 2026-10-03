@@ -114,10 +114,11 @@ def synthesizer(check: Report, args: argparse.Namespace):
 
 def recognizer(check: Report, args: argparse.Namespace):
     from . import speech
+    from .kyutai_cuda import kyutai_backend
 
-    kyutai = args.stt == "kyutai" and speech.is_apple_silicon()
-    if kyutai:
-        progress("Kyutai STT: loading (downloads about 2.4 GB on first run)")
+    backend, why = kyutai_backend() if args.stt == "kyutai" else (None, "")
+    if backend:
+        progress(f"Kyutai STT on {backend.upper()}: loading (downloads about 2.4 GB on first run)")
     else:
         progress(f"Whisper {args.asr} and Silero VAD: loading (downloads about 150 MB on first run)")
     t = time.monotonic()
@@ -128,13 +129,14 @@ def recognizer(check: Report, args: argparse.Namespace):
         return None
     took = time.monotonic() - t
     if isinstance(det, speech.KyutaiTurns):
-        check("recognizer", "ok", f"Kyutai STT 1B on MLX, ready in {took:.0f}s")
+        where = getattr(det.stt, "where", "MLX")
+        check("recognizer", "ok", f"Kyutai STT 1B on {where}, ready in {took:.0f}s")
     else:
         w = getattr(transcribe, "__self__", None)
         where = "an Nvidia GPU (CUDA float16)" if getattr(w, "device", "") == "cuda" else "the CPU (int8)"
         vad = "Silero VAD" if isinstance(getattr(det, "vad", None), speech.SileroVAD) else "an energy gate (Silero failed)"
-        note = "; Kyutai is Apple silicon only" if args.stt == "kyutai" else ""
-        status = "warn" if args.stt == "kyutai" and speech.is_apple_silicon() else "ok"
+        note = f"; Kyutai needs Apple silicon or an Nvidia GPU: {why}" if why else ""
+        status = "warn" if backend else "ok"  # Kyutai could run here but failed to load
         check("recognizer", status, f"Whisper {args.asr} on {where} with {vad}, ready in {took:.0f}s{note}")
     return det, transcribe
 
