@@ -1,7 +1,7 @@
 {
   "name": "live-vibe",
   "displayName": "Live Vibe",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "description": "/live: full-duplex voice (Kyutai streaming STT with semantic end of turn, or Silero and Whisper; Kokoro TTS) through a sidecar; /vibe: director mode that delegates all work to subagents; /livevibe: talk with a fast voice front that hands the work to Claude as director.",
   "author": {
     "name": "Paul Otto",
