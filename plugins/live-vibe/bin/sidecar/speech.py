@@ -290,13 +290,20 @@ def check_tts(kind: str) -> None:
         raise CannotStart(f"tts 'say' is macOS only. Use kokoro; it needs espeak-ng: {espeak_fix()}.")
 
 
-def make_tts(kind: str, voice: str):
+def make_tts(kind: str, voice: str, device: str = "auto"):
     """Kokoro, or on macOS say when Kokoro cannot speak; elsewhere a Kokoro failure is fatal, since nothing else
-    could read the answers."""
+    could read the answers. Kokoro that fails on CUDA is retried on the CPU."""
     if kind == "kokoro":
         try:
-            t = KokoroTTS(voice or "af_heart")
-            t.synth("warm up")  # loads the graph and surfaces a broken phonemizer now, not on the first answer
+            t = KokoroTTS(voice or "af_heart", device=device)
+            try:
+                t.synth("warm up")  # loads the graph and surfaces a broken phonemizer now, not on the first answer
+            except Exception as e:  # noqa: BLE001
+                if t.provider != "CUDAExecutionProvider":
+                    raise
+                log(f"tts: Kokoro failed on CUDA ({type(e).__name__}: {str(e)[:120]}); using the CPU")
+                t = KokoroTTS(voice or "af_heart", device="cpu")
+                t.synth("warm up")
             return t
         except Exception as e:  # noqa: BLE001
             fix = f" Fix: {espeak_fix()}." if find_espeak() is None else ""
@@ -336,20 +343,51 @@ def find_espeak() -> tuple[str, str] | None:
     return None
 
 
+KOKORO_CPU_THREADS = 4  # measured on a Ryzen 9700X: as fast as all 16, and leaves cores for the mic and player
+# Measured on an RTX 5090 (WSL2): RTF ~0.02 on CUDA vs ~0.13 on 4 CPU threads, ~1.4 GiB of VRAM. Exhaustive cuDNN
+# search costs little here (first call per length within 2x), and kSameAsRequested keeps the arena from doubling.
+KOKORO_CUDA = {"arena_extend_strategy": "kSameAsRequested", "cudnn_conv_use_max_workspace": "0"}
+
+
+def kokoro_session(model: str, device: str) -> Any:
+    """An onnxruntime session for Kokoro: CUDA when `device` allows it and onnxruntime-gpu sees a GPU (its cuDNN
+    and cuBLAS come from the nvidia wheels, loaded by preload_dlls), else the CPU."""
+    import onnxruntime as ort
+
+    so = ort.SessionOptions()
+    so.intra_op_num_threads = KOKORO_CPU_THREADS
+    if device != "cpu" and "CUDAExecutionProvider" in ort.get_available_providers():
+        try:
+            if hasattr(ort, "preload_dlls"):
+                ort.preload_dlls()
+            return ort.InferenceSession(model, so, providers=[("CUDAExecutionProvider", KOKORO_CUDA),
+                                                              "CPUExecutionProvider"])
+        except Exception as e:  # noqa: BLE001
+            log(f"tts: Kokoro cannot use CUDA ({type(e).__name__}: {str(e)[:160]}); using the CPU")
+    elif device == "cuda":
+        log(f"tts: no CUDA in this onnxruntime ({', '.join(ort.get_available_providers())}); using the CPU")
+    return ort.InferenceSession(model, so, providers=["CPUExecutionProvider"])
+
+
 class KokoroTTS:
-    """Kokoro-82M via onnx; about 330 MB downloaded on first use."""
+    """Kokoro-82M via onnx; about 330 MB downloaded on first use. `device`: auto (CUDA when available), cuda, or
+    cpu."""
 
     sample_rate = 24_000
 
-    def __init__(self, voice: str = "af_heart", speed: float = 1.05):
+    def __init__(self, voice: str = "af_heart", speed: float = 1.05, device: str = "auto"):
         from kokoro_onnx import Kokoro
         from kokoro_onnx.config import EspeakConfig
 
         model = download("kokoro-v1.0.onnx", KOKORO_URL + "kokoro-v1.0.onnx")
         voices = download("voices-v1.0.bin", KOKORO_URL + "voices-v1.0.bin")
         found = find_espeak()
-        log(f"tts: Kokoro voice {voice}, espeak-ng {found[0] if found else 'from the espeakng-loader wheel'}")
-        self.k = Kokoro(str(model), str(voices), espeak_config=EspeakConfig(*found) if found else None)
+        espeak = EspeakConfig(*found) if found else None
+        sess = kokoro_session(str(model), device)
+        self.provider = sess.get_providers()[0]
+        log(f"tts: Kokoro voice {voice} on {self.provider}, espeak-ng "
+            f"{found[0] if found else 'from the espeakng-loader wheel'}")
+        self.k = Kokoro.from_session(sess, str(voices), espeak_config=espeak)
         self.voice, self.speed = voice, speed
 
     def synth(self, text: str) -> np.ndarray:
