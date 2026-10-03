@@ -192,6 +192,70 @@ def kyutai_end_of_turn(check: Checker) -> None:
           f"kyutai turns: 30 s of words ends at max_utterance_s {ev[1][0] if len(ev) > 1 else ev} {logs}")
 
 
+
+def kyutai_silence_tiers(check: Checker) -> None:
+    """KyutaiTurns' silence cap by tier: long (4000) when the 2 s head forecasts more speech or the text is
+    unfinished, short (1000) after terminal punctuation while unsure, normal (3000) otherwise; semantic first."""
+    tails = {"": "none", "so I think,": "comma", "are you there?": "question", "Stop!": "exclaim", "Done.": "period",
+             "Wait...": "ellipsis", "and the": "the", "I want to": "to", "And.": "period", "open the file": "word",
+             "Um": "um", "I went and": "and", "go with \"like\"": "like"}
+    got = {t: turn_tail(t) for t in tails}
+    check(got == tails, f"kyutai tiers: turn_tail classes the transcript's last token {got}")
+
+    pad = [(None, 0.0)] * 12
+    logs: list[str] = []
+    ev = run_kyutai(pad + [("▁I", 0.0), ("▁went", 0.0), ("▁and", 0.0), (",", 0.0)] + [(None, 0.2)] * 60, logs=logs)
+    check([k for _, k, _ in ev] == ["speech_start", "utterance"] and ev[1][2] == "I went and," and ev[1][0] == 15 + 50
+          and len(logs) == 1 and "cap=long tail=comma " in logs[0] and "quiet_ms=4000 " in logs[0],
+          f"kyutai tiers: s2 low after 'and,' holds the turn past 1500 and 3000 ms, ends at 4000 {ev} {logs}")
+    pattern = (r"INFO kyutai turn end: trigger=silence cap=long tail=comma sent=utterance len_ms=4320 quiet_ms=4000 "
+               r"words=3 peak/final s05=0\.20/0\.20 s1=0\.20/0\.20 s2=0\.20/0\.20 s3=0\.20/0\.20")
+    check(len(logs) == 1 and re.fullmatch(pattern, logs[0]) and "went" not in logs[0],
+          f"kyutai tiers: the log line names the cap and the tail token, no other text {logs}")
+    logs = []
+    ev = run_kyutai(pad + [("▁I", 0.0), ("▁went", 0.0), ("▁and", 0.0)] + [(None, 0.5)] * 60, logs=logs)
+    check([k for _, k, _ in ev] == ["speech_start", "utterance"] and ev[1][0] == 14 + 50
+          and "cap=long tail=and " in logs[0],
+          f"kyutai tiers: an unfinished last word is the long cap even with s2 unsure {ev} {logs}")
+
+    logs = []
+    ev = run_kyutai(pad + [("▁are", 0.0), ("▁you", 0.0), ("▁there", 0.0), ("?", 0.0)] + [(None, 0.5)] * 30, logs=logs)
+    check([k for _, k, _ in ev] == ["speech_start", "utterance"] and ev[1][2] == "are you there?"
+          and ev[1][0] == 15 + 13 and "trigger=silence cap=short tail=question " in logs[0]
+          and "quiet_ms=1040 " in logs[0],
+          f"kyutai tiers: s2 unsure after '?' ends at the 1000 ms short cap {ev} {logs}")
+
+    logs = []
+    ev = run_kyutai(pad + [("▁open", 0.0), ("▁the", 0.0), ("▁file", 0.0)] + [(None, 0.5)] * 45, logs=logs)
+    check([k for _, k, _ in ev] == ["speech_start", "utterance"] and ev[1][0] == 14 + 38
+          and "trigger=silence cap=normal tail=word " in logs[0] and "quiet_ms=3040 " in logs[0],
+          f"kyutai tiers: s2 unsure with no punctuation ends at the 3000 ms normal cap {ev} {logs}")
+    logs = []
+    ev = run_kyutai(pad + [("▁open", 0.0), ("▁the", 0.0), ("▁file", 0.0)] + [(None, 0.0)] * 45, logs=logs)
+    check([k for _, k, _ in ev] == ["speech_start", "utterance"] and ev[1][0] == 14 + 38 and "cap=normal " in logs[0],
+          f"kyutai tiers: a model without heads (all 0) is not read as 'more coming' {ev} {logs}")
+
+    for words, tail in (([("▁are", 0.0), ("▁you", 0.0), ("▁there", 0.0), ("?", 0.0)], "question"),
+                        ([("▁I", 0.0), ("▁went", 0.0), ("▁and", 0.0)], "and")):
+        logs = []
+        ev = run_kyutai(pad + words + [(None, 0.9)] * 10, logs=logs)
+        last = len(pad) + len(words) - 1
+        check([k for _, k, _ in ev] == ["speech_start", "utterance"] and ev[1][0] == last + 6
+              and f"trigger=semantic cap=semantic tail={tail} " in logs[0] and "quiet_ms=480 " in logs[0],
+              f"kyutai tiers: a held end-of-turn forecast still ends at 480 ms (tail {tail}) {ev} {logs}")
+
+    short = Tuning(end_silence_ms=3000, end_silence_long_ms=60_000, max_utterance_s=5.0)
+    logs = []
+    ev = run_kyutai(pad + [("▁so", 0.0)] + [(None, 0.1)] * 80, logs=logs, tune=short)
+    turns = KyutaiTurns(FakeKyutai([]), short, lambda: False)
+    turns.text = " so"
+    low = KyutaiTurns(FakeKyutai([]), Tuning(end_silence_ms=5000, end_silence_long_ms=2000), lambda: False)
+    low.text = " and"
+    check([k for _, k, _ in ev] == ["speech_start", "utterance"] and ev[1][0] == 12 + 63 and "cap=long " in logs[0]
+          and "len_ms=5120 " in logs[0] and turns._cap() == ("long", 5000.0, "so") and low._cap()[:2] == ("long", 5000),
+          f"kyutai tiers: the long cap never exceeds max_utterance_s nor falls below the normal cap {ev} {logs} "
+          f"{turns._cap()} {low._cap()}")
+
 @contextmanager
 def patched(*patches: tuple[Any, str, Any]) -> Iterator[None]:
     """Set (object, attribute, value) for the block, then put the originals back."""
@@ -580,6 +644,7 @@ def units() -> int:
     check([k for _, k, _ in ev] == ["speech_start", "utterance"] and ev[1][0] == 38,
           f"kyutai turns: 3000 ms without a word caps the turn while the model is unsure {ev}")
     kyutai_end_of_turn(check)
+    kyutai_silence_tiers(check)
 
     check(spoken_model(SWITCH, "Okay, switch to Sonnet.") == "sonnet" and spoken_model(SWITCH, "Use opus to review this.") is None,
           "spoken switch: the mod's pattern over the mod's normalization")
