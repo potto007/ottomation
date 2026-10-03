@@ -940,6 +940,7 @@ def units() -> int:
     front_server_units(check)
     echo_units(check)
     winplayer_units(check)
+    experimental_units(check)
     print("UNIT: ALL PASS" if check.ok else "UNIT: SOME CHECKS FAILED", flush=True)
     return 0 if check.ok else 1
 
@@ -1852,3 +1853,330 @@ def selftest() -> int:
     selftest_backends(check)
     print("ALL PASS" if check.ok else "SOME CHECKS FAILED", flush=True)
     return 0 if check.ok else 1
+
+
+# =============================================================================================================
+# the experimental voice path (Tuning.experimental): stable front prefix, relay as commentary, speculation,
+# backchannels
+# =============================================================================================================
+def experimental_units(check: Checker) -> None:
+    from . import front
+
+    experimental_trim(check, front)
+    experimental_relay(check, front)
+    experimental_watch(check, front)
+    asyncio.run(experimental_sessions(check, front))
+
+
+def experimental_trim(check: Checker, front: Any) -> None:
+    """L1: one block trim from past HISTORY_MAX down to about HISTORY_KEEP, at a turn start only."""
+    def turn_pairs(b: Brain, n: int) -> None:
+        for i in range(n):
+            b.begin(f"u{i}")
+            b.record({"role": "assistant", "content": None, "tool_calls": [
+                {"id": f"c{i}", "type": "function", "function": {"name": "delegate", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": f"c{i}", "content": "ok"})
+            b.commit(f"a{i}", False)
+
+    b = Brain()
+    b.experimental = True
+    turn_pairs(b, 10)  # 4 messages a turn: 40, at HISTORY_MAX
+    before = list(b.history)
+    check(not b.compact() and b.history == before and len(b.history) == front.HISTORY_MAX,
+          f"stable prefix: at {front.HISTORY_MAX} messages nothing is trimmed")
+    b.begin("u10")  # 41: the per-turn trim no longer shifts the prefix
+    check(len(b.history) == front.HISTORY_MAX + 1 and b.history[:front.HISTORY_MAX] == before,
+          "stable prefix: begin() past HISTORY_MAX keeps the prefix (experimental)")
+    b.commit("a10", False)
+    trimmed = b.compact()
+    # 42 messages; HISTORY_KEEP back from the end is index 22, u5's tool result: the cut moves on to u6
+    check(trimmed and len(b.history) <= front.HISTORY_KEEP and is_turn_start(b.history[0])
+          and tool_pairs_ok(b.history) and b.history[0]["content"] == "u6" and b.history[-1]["content"] == "a10",
+          f"stable prefix: past {front.HISTORY_MAX}, one trim to {len(b.history)} messages from a turn start, "
+          f"no orphan tool call or result {b.history[0]}")
+    b = Brain()
+    b.experimental = True
+    turn_pairs(b, 10)
+    b.begin("u10")
+    b.commit("a10", False)
+    b.begin("u11")  # 43 messages: HISTORY_KEEP back from the end is a5, the words of a delegating turn
+    cut_on = b.history[len(b.history) - front.HISTORY_KEEP]
+    b.compact()
+    check(cut_on == {"role": "assistant", "content": "a5"} and is_turn_start(b.history[0])
+          and b.history[0]["content"] == "u6" and tool_pairs_ok(b.history) and len(b.history) < front.HISTORY_KEEP,
+          f"stable prefix: a cut that lands inside a turn moves forward to the next user message {b.history[:2]}")
+    j = LlamaCppBrain("sys", "http://127.0.0.1:9", "")
+    j.experimental = True
+    for i in range(21):
+        j.begin(f"fix {i}")
+        j.current.request = f"Fix {i}" if i % 2 else ""
+        j.commit(f"On it {i}.", False)
+    j.compact()
+    pairs = [(j.history[k]["role"], j.history[k + 1]["role"]) for k in range(0, len(j.history), 2)]
+    check(len(j.history) == front.HISTORY_KEEP and set(pairs) == {("user", "assistant")}
+          and json.loads(j.history[1]["content"])["delegate"] == "Fix 11",
+          f"stable prefix: a delegation keeps its user message (llama.cpp JSON turns) {pairs[:2]}")
+    off = Brain()
+    turn_pairs(off, 11)
+    check(len(off.history) <= front.HISTORY_MAX and not off.experimental,
+          "stable prefix: off, the per-turn trim of 0.6.4 is unchanged")
+
+
+def experimental_relay(check: Checker, front: Any) -> None:
+    """L4: the Status line and its sentences are retold, the rest is silent context, both capped at 500 tokens."""
+    answer = ("I read both logs. The sidecar picked the Windows player; the front ran on CUDA.\n\n"
+              "- sidecar.log: no warnings\n- front-server.log: f_keep 1.0\n\n"
+              "Status: done\nThe logs show no errors. The Windows player is in use. Whether the static is gone needs "
+              "your ears. Anything else is on screen.")
+    status, spoken, rest = front.split_status(answer)
+    check(status == "done" and spoken == "The logs show no errors. The Windows player is in use. Whether the static "
+          "is gone needs your ears." and rest.startswith("I read both logs") and "Status" not in rest,
+          f"relay: the last Status line, at most three sentences after it, the rest apart {status!r} {spoken!r}")
+    check([front.split_status(t)[0] for t in ("**Status:** working. A worker runs.", "status: Cancelled",
+                                              "Status: canceled", "The status: done is a word", "No status here.")]
+          == ["working", "cancelled", "cancelled", "", ""], "relay: Status lines in Markdown and either spelling")
+    r = front.relay_of(["Started the review.\n\nStatus: working\nA worker reviews the diff.", answer])
+    check(r.status == "done" and r.retold.startswith("Status: working. A worker reviews the diff.\n\nStatus: done.")
+          and "I read both logs" in r.notes and "Started the review." in r.notes and "Status" not in r.spoken,
+          f"relay: results announced together, the newest status wins, notes kept apart {r}")
+    plain = front.relay_of(["Fixed it.\n\nDetails:\n\n- a.py\n\nNot pushed."])
+    check(plain.status == "" and plain.retold == report_brief("Fixed it.\n\nDetails:\n\n- a.py\n\nNot pushed.")
+          and "- a.py" in plain.notes and "Fixed it." not in plain.notes,
+          f"relay: without a Status line, report_brief is retold and the rest is notes {plain}")
+    long_ = " ".join(f"Sentence {i} of a long spoken report." for i in range(400))
+    capped = front.cap_tokens(long_, front.estimate_tokens(long_))
+    check(front.estimate_tokens(capped) <= front.TOKENS_MAX and capped.endswith(".") and long_.startswith(capped)
+          and front.cap_tokens("short.", 3) == "short.",
+          f"relay: the retold part is cut to {front.TOKENS_MAX} tokens at a sentence end ({len(capped)} chars)")
+    msgs = r.messages(front.RETELL_STATUS)
+    check(len(msgs) == 2 and msgs[0]["content"].startswith(front.NOTES) and msgs[1]["content"].startswith(EVENT)
+          and all(is_turn_start(m) for m in msgs), "relay: the notes go into history ahead of the report to retell")
+    check(front.FRONT_PROMPT_EXPERIMENTAL != front.FRONT_PROMPT and front._STATUS_ASK in front.FRONT_PROMPT
+          and front._STATUS_ASK not in front.FRONT_PROMPT_EXPERIMENTAL and front.NOTES in front.FRONT_PROMPT_EXPERIMENTAL
+          and "{workspace}" in front.FRONT_PROMPT_EXPERIMENTAL,
+          "relay: the experimental front prompt answers status questions from the latest Status report")
+    d = Delegator()
+    d.handed = 2
+    d.saw_status("working")
+    fresh = d.status_fresh
+    d.handed = 3
+    check(fresh and not d.status_fresh and not Delegator().status_fresh,
+          "relay: a Status report is fresh until the next delegation")
+    got = [front.status_reply(t) for t in ("It's still running; a worker reviews the diff. More soon. And more.",
+                                           "It was likely the cache.", "")]
+    check(got == ["It's still running; a worker reviews the diff. More soon.", HOLD, HOLD],
+          f"relay: a fresh status answers a question in two sentences, never a guess {got}")
+
+
+def experimental_watch(check: Checker, front: Any) -> None:
+    """TurnWatch over KyutaiTurns: eot_likely once per text, retracted by a new piece; listening_pause during long
+    dictation; a non-Kyutai detector passes through."""
+    pad = [(None, 0.0)] * 12
+    script = (pad + [("▁fix", 0.0), ("▁the", 0.0), ("▁test", 0.0)] + [(None, 0.9)] * 3 + [("▁now", 0.0)]
+              + [(None, 0.9)] * 12)
+    watch = front.TurnWatch(KyutaiTurns(FakeKyutai(script), Tuning(end_silence_ms=3000), lambda: False))
+    block = np.zeros(KYUTAI_BLOCK * SR // KYUTAI_SR, np.float32)
+    from . import speech
+
+    with patched((speech, "file_log", lambda level, text: None)):
+        ev = [(i, k, v) for i in range(len(script) + 5) for k, v in watch.feed(block)]
+    kinds = [(k, v) for _, k, v in ev]
+    check(kinds[:4] == [("speech_start", 1.0), ("eot_likely", "fix the test"), ("eot_retract", None),
+                        ("eot_likely", "fix the test now")] and kinds[-1] == ("utterance", "fix the test now")
+          and ev[1][0] < ev[-1][0], f"turn watch: a likely end before the real one, retracted by a new word {kinds}")
+    talk = pad + [(f"▁w{i}" if i % 2 == 0 else None, Pauses(0.9, 0.0, 0.1, 0.0)) for i in range(120)]
+    watch = front.TurnWatch(KyutaiTurns(FakeKyutai(talk), Tuning(end_silence_ms=3000), lambda: False),
+                            backchannels=True)
+    with patched((speech, "file_log", lambda level, text: None)):
+        ev = [(i, k, v) for i in range(len(talk)) for k, v in watch.feed(block)]
+    cues = [v for _, k, v in ev if k == "listening_pause"]
+    check(cues and cues[0] > front.TurnWatch.BACKCHANNEL_AFTER_S and all(b - a >= 1.0 for a, b in zip(cues, cues[1:]))
+          and not any(k == "eot_likely" for _, k, _ in ev),
+          f"turn watch: pauses with more speech coming, after 6 s, at most once a second {cues[:3]}")
+    det = TurnDetector(ScriptedVAD([0.9] * 10 + [0.0] * 30), Tuning(), lambda: False)
+    plain = front.TurnWatch(det)
+    ev = [k for _ in range(40) for k, _ in plain.feed(np.zeros(FRAME, np.float32))]
+    check(plain.tap is None and ev == ["speech_start", "utterance"], f"turn watch: Whisper's detector passes through {ev}")
+
+
+class FakeBlipVoice:
+    """Voice's surface for the front session, recording blip() calls."""
+
+    def __init__(self) -> None:
+        self.speaking = threading.Event()
+        self.blips: list[tuple[str, int]] = []
+        self.paused = False
+        self.tts = SilentTTS()
+
+    async def blip(self, text: str, audio: Any, cancel: threading.Event) -> bool:
+        self.blips.append((text, len(audio)))
+        return True
+
+    async def speak(self, sentences, heard, on_play=lambda: None) -> bool:
+        async for s in sentences:
+            on_play()
+            heard.append(s)
+        return False
+
+    def pause(self) -> bool:
+        return False
+
+    def resume(self) -> bool:
+        return False
+
+
+async def experimental_sessions(check: Checker, front: Any) -> None:
+    logs: list[str] = []
+    out: list[dict[str, Any]] = []
+    with patched((front, "file_log", lambda level, text: logs.append(text))):
+        protocol.capture(out)
+        try:
+            await experimental_warm(check, front, logs)
+            await experimental_speculation(check, front, logs, out)
+            await experimental_backchannels(check, front, logs)
+        finally:
+            protocol.capture(None)
+
+
+async def experimental_warm(check: Checker, front: Any, logs: list[str]) -> None:
+    """L1: the warm request after a trim is skipped while the user speaks and cancelled when they start."""
+    class WarmBrain(Brain):
+        def __init__(self) -> None:
+            super().__init__()
+            self.warmed = 0
+            self.cancelled = 0
+
+        async def warm_prefix(self) -> None:
+            self.warmed += 1
+            try:
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                self.cancelled += 1
+                raise
+
+    brain = WarmBrain()
+    sess = FrontSession(FakeBlipVoice(), lambda: False, brain, None, lambda: None, Tuning(experimental=True))
+    sess.user_talking = True
+    sess.warm_prefix(brain)
+    await asyncio.sleep(0.05)
+    check(brain.warmed == 0 and sess.warm is None and "front warm: skipped, the user is speaking" in logs,
+          f"warm request: skipped while the user speaks {logs[-1:]}")
+    sess.user_talking = False
+    hearing = {"on": True}
+    sess.hearing = lambda: hearing["on"]
+    sess.warm_prefix(brain)
+    check(sess.warm is None, "warm request: skipped while speech is still being transcribed")
+    hearing["on"] = False
+    sess.warm_prefix(brain)
+    await asyncio.sleep(0.05)
+    started = brain.warmed == 1 and sess.warm is not None and not sess.warm.done()
+    await sess.handle("speech_start", 1.0)
+    await asyncio.sleep(0.05)
+    check(started and brain.cancelled == 1 and sess.warm.done() and "front warm: cancelled, the user spoke" in logs,
+          "warm request: runs on a free floor, cancelled when the user starts talking")
+    sess.user_talking = False
+
+
+async def experimental_speculation(check: Checker, front: Any, logs: list[str], out: list[dict[str, Any]]) -> None:
+    """L6: a speculation hands off and speaks nothing until the final text takes it; a discarded or cancelled one
+    never delegates and never speaks."""
+    url, seen = fake_front()
+    brain = front.make_brain("llamacpp", url, "", experimental=True)
+    voice = FakeBlipVoice()
+    sess = FrontSession(voice, lambda: False, brain, SWITCH, lambda: None, Tuning(experimental=True))
+
+    async def settle() -> None:
+        await asyncio.sleep(0.05)
+        await until(lambda: not sess.turn_running(), 5)
+
+    def emitted(kind: str) -> list[dict[str, Any]]:
+        return [o for o in out if o["type"] == kind]
+
+    # discarded: speculated on "fix" (a delegation), the final words were small talk
+    out.clear()
+    logs.clear()
+    await sess.handle("speech_start", 1.0)
+    await sess.handle("eot_likely", "Please fix the failing test")
+    spec = sess.spec
+    await until(lambda: spec is not None and spec.done, 5)
+    buffered = bool(spec and spec.buf) and not emitted("delegate") and not sess.turn_running()
+    await sess.handle("utterance", "How are you today?")
+    await settle()
+    check(buffered and not emitted("delegate") and sess.turn_spoken == ["I'm doing well, thanks!"]
+          and not any("fix" in str(m["content"]).lower() for m in brain.history)
+          and any(t.startswith("front speculate: discarded saved_ms=0") for t in logs),
+          f"speculation: a discarded one never delegates and never speaks {emitted('delegate')} {sess.turn_spoken} "
+          f"{logs}")
+    # cancelled: a new word piece arrives
+    out.clear()
+    logs.clear()
+    n = len(brain.history)
+    await sess.handle("speech_start", 1.0)
+    await sess.handle("eot_likely", "Please fix the failing test")
+    await sess.handle("eot_retract", None)
+    await asyncio.sleep(0.2)
+    check(sess.spec is None and not emitted("delegate") and len(brain.history) == n and not sess.turn_running()
+          and any(t.startswith("front speculate: cancelled") for t in logs),
+          f"speculation: a new word cancels it, nothing handed off or spoken {logs}")
+    # used: the final words are the speculated ones
+    out.clear()
+    logs.clear()
+    await sess.handle("eot_likely", "Please fix the failing test.")
+    spec = sess.spec
+    await until(lambda: spec is not None and spec.done, 5)
+    requests = len(seen)
+    await sess.handle("utterance", "Please fix the failing test.")
+    await settle()
+    check(len(seen) == requests and emitted("delegate") == [{"type": "delegate", "text": "Fix the failing test in "
+          "parser.py", "said": "Please fix the failing test."}] and sess.turn_spoken == ["On it."]
+          and any(t.startswith("front speculate: used saved_ms=") for t in logs)
+          and any(t.startswith("front turn: eot_to_first_token_ms=0 ") for t in logs),
+          f"speculation: an unchanged final text releases the held reply, no second request {logs}")
+    # never while a model switch or an unfinished sentence would not be a front turn
+    await sess.handle("eot_likely", "Okay, switch to Sonnet.")
+    switch = sess.spec is None
+    await sess.handle("eot_likely", "And then we need")
+    check(switch and sess.spec is None, "speculation: none on a model switch or an unfinished sentence")
+    await brain.aclose()
+
+
+async def experimental_backchannels(check: Checker, front: Any, logs: list[str]) -> None:
+    """L7: one cached "mm-hm" per 8 s, only past 6 s into a turn, not over the front or after its question, and
+    off unless both switches are on."""
+    voice = FakeBlipVoice()
+    sess = FrontSession(voice, lambda: False, None, None, lambda: None,
+                        Tuning(experimental=True, backchannels=True))
+    await sess.render_backchannel()
+    sess.user_talking = True
+    for seconds in (2.5, 6.5, 7.0):
+        await sess.handle("listening_pause", seconds)
+    first = list(voice.blips)
+    sess.backchannel_at -= front.BACKCHANNEL_EVERY_S
+    await sess.handle("listening_pause", 15.0)
+    check(len(first) == 1 and first[0][0] == front.BACKCHANNEL_TEXT and first[0][1] > 0 and len(voice.blips) == 2,
+          f"backchannels: a cached clip, after 6 s into the turn, at most one per {front.BACKCHANNEL_EVERY_S:.0f} s "
+          f"{voice.blips}")
+    sess.backchannel_at -= front.BACKCHANNEL_EVERY_S
+    sess.asked = True
+    await sess.handle("listening_pause", 20.0)
+    sess.asked = False
+    voice.speaking.set()
+    await sess.handle("listening_pause", 20.0)
+    voice.speaking.clear()
+    check(len(voice.blips) == 2, "backchannels: none while the user answers the front's question or over its voice")
+    for tune in (Tuning(experimental=False, backchannels=True), Tuning(experimental=True, backchannels=False)):
+        quiet = FakeBlipVoice()
+        off = FrontSession(quiet, lambda: False, None, None, lambda: None, tune)
+        await off.render_backchannel()
+        off.user_talking = True
+        await off.handle("listening_pause", 10.0)
+        check(not quiet.blips, "backchannels: off unless experimental and backchannels are both on "
+                             f"(experimental={tune.experimental}, backchannels={tune.backchannels})")
+    guard = EchoGuard(lambda: False)
+    player = RecordingPlayer()
+    real = Voice(RampTTS(), player, threading.Event(), guard)
+    played = await real.blip("Mm-hmm.", np.arange(1600, dtype=np.float32), threading.Event())
+    check(played and player.calls == [(0, 1600, 1600)] and guard.timeline and guard.timeline[-1][1] == ["mm", "hmm"]
+          and not real.speaking.is_set(),
+          f"backchannels: played through the voice's own player (the echo reference's path), words in the guard "
+          f"{player.calls}")
