@@ -29,7 +29,7 @@ from .checks_front_server import front_server_units
 from .checks_winplayer import winplayer_units
 from .audio import FRAME, SR, CannotStart, Player, check_devices, SentenceSplitter, Tuning, TurnDetector, Voice, speakable
 from .echo import EchoCanceller, EchoGuard, EchoReference
-from .front import (ACK, EVENT, EVENT_CHARS, HISTORY_MAX, INTERRUPTED, RETELL, _FALLBACKS, _NO_EFFORT, Brain,
+from .front import (ACK, EVENT, EVENT_CHARS, HISTORY_MAX, INTERRUPTED, RETELL, WAITING, _FALLBACKS, _NO_EFFORT, Brain,
                     Delegator, FrontSession, LlamaCppBrain, SpeechFilter, TurnStream, acknowledgement, event_message,
                     is_turn_start, make_brain, parse_sse, report_brief, spoken_model, warm_up)
 from .session import LiveSession
@@ -703,8 +703,12 @@ def fake_front() -> tuple[str, list[dict[str, Any]]]:
             delay = 0.0
             if text.startswith(EVENT) and "next steps" in text:  # a small model re-delegating a result's to-dos
                 deltas = turn("I'll get the test sentences playing.", "Play the test sentences and report back")
+            elif text.startswith(EVENT) and "long report" in text:
+                deltas = turn("".join(f"Report sentence {i} goes on for a while here. " for i in range(10)))
             elif text.startswith(EVENT):
                 deltas = turn("All the tests pass now.")
+            elif "what happened" in text:
+                deltas = turn("It finished with no errors.")
             elif "goodbye" in text.lower():
                 deltas = turn("Goodbye.")
             elif "thinking leak" in text:
@@ -890,6 +894,51 @@ async def selftest_sessions(check: Checker) -> None:
     check(r == 204 and not emitted("delegate") and delegated() == ""
           and any("announces a result" in o["text"] for o in emitted("log")),
           "announcer: a result listing next steps is reported, never re-delegated (no delegation loop)")
+
+    def events_since(n: int) -> list[str]:
+        """The [task finished] messages the front was asked to announce since request n."""
+        return [str(b["messages"][-1]["content"]) for b in seen[n:]
+                if str(b["messages"][-1]["content"]).startswith(EVENT)]
+
+    out.clear()
+    sess.post("speech_start", 1.0)  # a result lands while the user talks, and then the user asks about it
+    await until(lambda: sess.user_talking)
+    n = len(seen)
+    r = await asyncio.to_thread(post, port, "/event", "The worker finished: no errors in the logs.", token)
+    sess.post("transcribing", None)
+    sess.post("utterance", "so what happened")
+    await until(lambda: said() == "It finished with no errors.", 5)
+    await turn_done()
+    await asyncio.sleep(0.4)
+    asked = seen[n]["messages"] if len(seen) > n else [{"content": ""}, {"content": ""}]
+    check(r == 204 and asked[-1]["content"] == "so what happened"
+          and asked[-2]["content"].startswith(f'{EVENT} "The worker finished') and WAITING in asked[-2]["content"]
+          and not events_since(n) and sess.results.empty(),
+          "announcer: a result that came in while the user talked goes into the user's turn, not a later announcement")
+
+    sess.post("speech_start", 1.0)  # two results wait for the floor together
+    await until(lambda: sess.user_talking)
+    n = len(seen)
+    await asyncio.to_thread(post, port, "/event", "First result: the build passed.", token)
+    await asyncio.to_thread(post, port, "/event", "Second result: the docs are updated.", token)
+    sess.post("discard", None)
+    await until(lambda: len(seen) > n, 5)
+    await turn_done()
+    await asyncio.sleep(0.4)
+    events = events_since(n)
+    check(len(events) == 1 and 0 <= events[0].find("First result") < events[0].find("Second result"),
+          f"announcer: results that waited together are one announcement, oldest first {events}")
+
+    n = len(seen)
+    await asyncio.to_thread(post, port, "/event", "A long report follows.", token)
+    await until(lambda: sess.state == "speaking", 5)
+    await asyncio.sleep(0.3)
+    sess.post("speech_start", 1.0)  # barge in on the announcement
+    await turn_done()
+    sess.post("discard", None)
+    await asyncio.sleep(0.6)
+    check(len(events_since(n)) == 1 and said().endswith("...") and sess.results.empty(),
+          f"announcer: an announcement cut by a barge-in is not announced again {len(events_since(n))}")
 
     tts.started.clear()
     player.ended.clear()

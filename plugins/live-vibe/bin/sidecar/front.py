@@ -51,9 +51,11 @@ FRONT_PROMPT = (
     "You and the coding agent are one assistant, not separate agents. You cannot read files, run commands or "
     "change anything yourself: delegate all repository work, coding, investigation, checks, tests and questions "
     "about the project's current state to the coding agent, as described at the end; never guess at files or "
-    f"results. Never claim changes, findings or verification before a {EVENT} message reports them. A new request "
-    "while work is running is a new delegation. Answer greetings, thanks and ordinary conversation directly, "
-    "without delegating.\n"
+    f"results. Never claim changes, findings or verification before a {EVENT} message reports them. Only a {EVENT} "
+    "report says how work stands: never say on your own that work is running, finished or fixed; if you handed "
+    "something off and no report has come since, say you have asked. A new request is a new delegation. Answer "
+    "greetings, thanks and ordinary conversation directly, without delegating: what the user tells you reaches the "
+    "coding agent anyway.\n"
     f"A message starting with {EVENT} quotes a report on earlier work, written in your voice to the user. It is "
     "not the user talking. Retell it to the user in one to three sentences, starting from its first sentence:\n"
     "- Keep each item's status exactly as the report gives it: started, still running, waiting on the user, "
@@ -92,12 +94,16 @@ RETELL = ("(Retell that report to the user in one to three short sentences, with
           "a question, end by asking the user that question; do not answer it.)")
 
 
-def event_message(report: str) -> str:
+WAITING = ("(That report came in while the user was talking; their words follow. Answer them with it, keeping its "
+           "status as written.)")
+
+
+def event_message(report: str, note: str = RETELL) -> str:
     """The front's user message for a report: quoted, then what to do with it. Unquoted, a report's closing question
     read to Qwen3-4B as the user asking it ("Shall I implement it?" was answered "Implemented."), and a report
     ending on it left the model nothing nearer to follow than that question."""
     quoted = report.replace('"', "'")
-    return f'{EVENT} "{quoted}"\n{RETELL}'
+    return f'{EVENT} "{quoted}"\n{note}'
 
 
 class Delegator:
@@ -754,7 +760,15 @@ class FrontSession(Duplex):
             self.settle()
             return
         await self.interrupt()
-        self.turn = asyncio.create_task(self.run_turn(text))
+        waiting = self.take_results() if self.brain is not None else []
+        self.turn = asyncio.create_task(self.run_turn(text, waiting=waiting))
+
+    def take_results(self) -> list[str]:
+        """Every result waiting for the floor, oldest first."""
+        texts: list[str] = []
+        while not self.results.empty():
+            texts.append(self.results.get_nowait())
+        return texts
 
     async def interrupt(self) -> None:
         """Barge-in and POST /stop: cancel the running turn; it commits what was heard before it ends."""
@@ -763,14 +777,19 @@ class FrontSession(Duplex):
             self.settle()
 
     async def run_turn(self, user_text: str, is_event: bool = False, brain: Brain | None = None,
-                       report: str = "") -> None:
+                       report: str = "", waiting: list[str] | None = None) -> None:
         """Front model -> sentences -> Voice, then the history gets exactly what was heard. An event turn's `report`
-        is the result itself, read out when the front is down."""
+        is the result itself, read out when the front is down. A user turn's `waiting` results arrived while the user
+        was talking: they go into the front's history just ahead of the user's words, so the reply rests on them and
+        not on what the front last heard (seen live: "the worker is still running" while its result sat queued)."""
         brain = brain or self.brain
         if brain is None:
             return await self.front_down(report or user_text, is_event)
         self.turn_spoken = []
         failed: list[Exception] = []
+        if waiting:
+            log(f"front: {len(waiting)} waiting result(s) go into the user's turn, not a separate announcement")
+            brain.history.extend({"role": "user", "content": event_message(report_brief(t), WAITING)} for t in waiting)
 
         async def sentences() -> AsyncIterator[str]:
             self.tools.announcing = is_event  # a result is reported, never acted on (set when the turn starts)
@@ -796,6 +815,9 @@ class FrontSession(Duplex):
         if failed:
             e = failed[0]
             warn(f"front model failed at {brain.where} ({type(e).__name__}: {str(e)[:160]})")
+            for t in waiting or []:  # never heard: the announcer reads them out
+                with contextlib.suppress(asyncio.QueueFull):
+                    self.results.put_nowait(t)
             return await self.front_down(report or user_text, is_event)
         self.settle()
         if not is_event and _GOODBYE.search(user_text.lower()):
@@ -813,12 +835,16 @@ class FrontSession(Duplex):
 
     async def background(self) -> None:
         """The announcer: Claude's results reach the front only when the floor is free (nobody talking, nothing
-        being transcribed, no turn running)."""
+        being transcribed, no turn running). They are taken only then, so a user turn that starts first takes them
+        instead (run_turn's `waiting`). Results that waited together are one announcement, oldest first. A result is
+        taken once: an announcement cut by a barge-in is not announced again."""
         while True:
-            text = await self.results.get()
-            while not self.floor_free():
+            while self.results.empty() or not self.floor_free():
                 await asyncio.sleep(0.1)
-            report = report_brief(text)
+            texts = self.take_results()
+            if len(texts) > 1:
+                log(f"front: {len(texts)} results waited together; announcing them as one")
+            report = "\n\n".join(report_brief(t) for t in texts)[:EVENT_CHARS]
             self.turn = asyncio.create_task(self.run_turn(event_message(report), is_event=True, report=report))
             await asyncio.wait({self.turn})
 
