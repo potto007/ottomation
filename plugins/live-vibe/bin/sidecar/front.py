@@ -11,19 +11,25 @@ import contextlib
 import difflib
 import json
 import re
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, ClassVar
 
-from .audio import SentenceSplitter, Voice, split_all
-from .protocol import Route, emit, log, warn
+from .audio import SentenceSplitter, Tuning, Voice, split_all
+from .protocol import Route, emit, file_log, log, warn
 from .session import Duplex, cancel_and_wait
 
 EVENT = "[task finished]"
 INTERRUPTED = "(you were interrupted)"  # leads the next user message after a cut: user text, so never imitated
 EVENT_CHARS = 6000  # a long report is cut for the small front model; Claude's full answer is on screen
 HISTORY_MAX = 40  # ponytail: the front keeps its last 40 messages; summarize older ones if long sessions forget
+HISTORY_KEEP = 20  # experimental: past HISTORY_MAX, one trim after a turn keeps about this many (a stable prefix)
+HISTORY_HARD = 2 * HISTORY_MAX  # experimental: the per-turn trim's ceiling, should the block trim never run
+TOKENS_MAX = 500  # experimental: the most of Claude's answer retold, and of its notes kept as silent context
+CHARS_PER_TOKEN = 4  # the token estimate where no tokenizer answers
+NOTES = "[agent notes]"  # experimental: a user message of the coding agent's background notes, never read out
 TOOL_ROUNDS = 4
 NO_REQUEST = {"", "none", "n/a", "null", "no"}  # what a small model writes in an empty delegate field
 RESULTS_MAX = 32  # Claude results waiting for the floor
@@ -75,6 +81,19 @@ FRONT_PROMPT = (
 )  # each brain appends its PROTOCOL: how a delegation is made
 
 
+# Experimental (L4): the latest report's Status line lets the front answer a status question itself.
+_STATUS_ASK = ("If the user asks how things are going, where things stand, or whether something was received, say only "
+               "'Let me check.'; the coding agent answers.\n")
+FRONT_PROMPT_EXPERIMENTAL = FRONT_PROMPT.replace(_STATUS_ASK, (
+    "If the user asks how things are going or where things stand, answer in one or two short sentences from the "
+    f"latest {EVENT} report's status and the {NOTES} before it, keeping that status exactly; if you handed something "
+    "off after that report, or no report has come, say only 'Let me check.'; the coding agent answers.\n")) + (
+    f"\nA {EVENT} report starts with its status, 'Status: working', 'done', 'failed' or 'cancelled': say it in plain "
+    "words (still running, done, failed, cancelled), never the word 'Status'. A user message starting with "
+    f"{NOTES} holds the coding agent's background notes on its work: never read them out or retell them on their "
+    "own; use them only to answer the user's questions.")
+
+
 HANDED_OFF = "Handed off"
 
 _HEADING = re.compile(r"^\s{0,3}#{1,6}\s.*$", re.M)
@@ -92,6 +111,84 @@ def report_brief(text: str) -> str:
     return (paras[0] if tail is None else f"{paras[0]}\n\n{tail}")[:EVENT_CHARS]
 
 
+_STATUS_LINE = re.compile(r"^[ \t>*_]*status[*_]*\s*:\s*[*_`]*\s*(working|done|failed|cancell?ed)\b[*_`]*[.!]?[ \t]*(.*)$",
+                          re.I | re.M)
+RELAY_SPOKEN = 3  # the sentences after a Status line that are retold
+
+
+@dataclass
+class Relay:
+    """Experimental (L4): Claude's answers split as GPT-Live splits commentary from thinking. `retold` is what the
+    front retells: the last `Status:` line and up to RELAY_SPOKEN sentences after it, or, without one, report_brief.
+    `spoken` is those sentences alone (read out when the front is down). `notes` is the rest of the answer, which
+    goes into the front's history as silent context, so a later status question needs no Claude turn."""
+
+    status: str
+    retold: str
+    spoken: str
+    notes: str
+
+    def messages(self, note: str) -> list[dict[str, Any]]:
+        """The front's history entries for this relay: the notes, then the report to retell, with `note`."""
+        out = [{"role": "user", "content": notes_message(self.notes)}] if self.notes else []
+        return out + [{"role": "user", "content": event_message(self.retold, note)}]
+
+
+def notes_message(notes: str) -> str:
+    quoted = notes.replace('"', "'")
+    return (f'{NOTES} "{quoted}"\n(Background from the coding agent, not said to the user. Never read it out; use it '
+            "only to answer the user's later questions.)")
+
+
+def split_status(text: str) -> tuple[str, str, str]:
+    """(status, the sentences after the last Status line, the answer before it); status '' when there is none."""
+    found = list(_STATUS_LINE.finditer(text))
+    if not found:
+        return "", "", text
+    m = found[-1]
+    status = m.group(1).lower().replace("canceled", "cancelled")
+    spoken = " ".join(split_all(f"{m.group(2)}\n{text[m.end():]}".strip())[:RELAY_SPOKEN])
+    return status, spoken, text[:m.start()].strip()
+
+
+def relay_of(texts: list[str]) -> Relay:
+    """Results announced together, oldest first, as one Relay (uncapped: see cap_tokens). The status is the newest
+    one given."""
+    statuses, retold, spoken, notes = [], [], [], []
+    for t in texts:
+        status, said, rest = split_status(t)
+        if status:
+            statuses.append(status)
+            retold.append(f"Status: {status}. {said}".strip())
+            spoken.append(said)
+        else:
+            brief = report_brief(t)
+            retold.append(brief)
+            spoken.append(brief)
+            kept = set(re.split(r"\n\s*\n", brief))
+            rest = "\n\n".join(p for p in (q.strip() for q in re.split(r"\n\s*\n", _HEADING.sub("", t)))
+                               if p and p not in kept)
+        if rest.strip():
+            notes.append(rest.strip())
+    return Relay(statuses[-1] if statuses else "", "\n\n".join(r for r in retold if r),
+                 "\n\n".join(s for s in spoken if s), "\n\n".join(notes))
+
+
+def estimate_tokens(text: str) -> int:
+    return -(-len(text) // CHARS_PER_TOKEN)
+
+
+def cap_tokens(text: str, tokens: int, limit: int = TOKENS_MAX) -> str:
+    """`text` cut to about `limit` of its `tokens` tokens, back to a sentence end (or a word) inside the cut."""
+    if tokens <= limit:
+        return text
+    cut = text[:int(len(text) * limit / tokens)]
+    end = max(cut.rfind(". "), cut.rfind("? "), cut.rfind("! "), cut.rfind("\n"))
+    if end > len(cut) // 2:
+        return cut[:end + 1].rstrip()
+    return cut.rsplit(None, 1)[0] if " " in cut else cut
+
+
 _ASIDE = re.compile(r"\[[^\]]*\]|\([^)]*\)")
 
 
@@ -102,6 +199,10 @@ def retellable(report: str) -> bool:
 
 RETELL = ("(Retell that report to the user in one or two short sentences, with its status as written; never read it "
           "out whole. If it asks a question, end by asking the user that question; do not answer it.)")
+
+RETELL_STATUS = ("(Retell that report to the user in one or two short sentences, saying its status in plain words, never "
+                 "the word 'Status'; never read it out whole. If it asks a question, end by asking the user that "
+                 "question; do not answer it.)")
 
 RELAY_SENTENCES = 2  # what a retelling speaks at most, whatever the model writes, plus a closing question
 RELAY_CHARS = 280
@@ -200,6 +301,17 @@ class Delegator:
         self.sent: list[tuple[float, str]] = []
         self.handed = 0  # delegations sent so far: a user turn that adds none is passed on as a note
         self.results_seen = False  # a result was announced or taken into a user turn
+        self.status = ""  # experimental: the latest report's Status (working, done, failed, cancelled)
+        self.status_handed = -1  # `handed` when that report came
+
+    @property
+    def status_fresh(self) -> bool:
+        """Experimental: a Status report came and nothing was handed off since, so it says how the work stands."""
+        return bool(self.status) and self.handed == self.status_handed
+
+    def saw_status(self, status: str) -> None:
+        if status:
+            self.status, self.status_handed = status, self.handed
 
     @property
     def work_in_session(self) -> bool:
@@ -327,6 +439,7 @@ class Brain:
     name = "base"
     model = ""
     trimmed = False  # the last reply was held and cut: the user did not hear what it said
+    experimental = False  # the experimental voice path: block trims (compact) and status answers
 
     def __init__(self, system: str = ""):
         self.system = system
@@ -339,17 +452,39 @@ class Brain:
     def where(self) -> str:
         return self.name
 
+    def framed(self, user_text: str) -> str:
+        """The user message begin() would add for `user_text`, with no side effect."""
+        if self.interrupted and not user_text.startswith(EVENT):  # a report is not the user: the flag waits for them
+            return f"{INTERRUPTED} {user_text}"
+        return user_text
+
     def begin(self, user_text: str) -> None:
         self.user_said = user_text
-        if self.interrupted and not user_text.startswith(EVENT):  # a report is not the user: the flag waits for them
-            user_text = f"{INTERRUPTED} {user_text}"
+        framed = self.framed(user_text)
+        if framed != user_text:
             self.interrupted = False
         self.pending = []
-        self.history.append({"role": "user", "content": user_text})
-        if len(self.history) > HISTORY_MAX:  # whole turns go, so no tool result outlives its call
-            del self.history[: len(self.history) - HISTORY_MAX]
+        self.history.append({"role": "user", "content": framed})
+        # Experimental: compact() trims in one block after a turn; this per-turn trim is only its safety net.
+        cap = HISTORY_HARD if self.experimental else HISTORY_MAX
+        if len(self.history) > cap:  # whole turns go, so no tool result outlives its call
+            del self.history[: len(self.history) - cap]
             while self.history and not is_turn_start(self.history[0]):
                 del self.history[0]
+
+    def compact(self) -> bool:
+        """Experimental (L1): past HISTORY_MAX messages, drop the oldest in one block down to about HISTORY_KEEP,
+        cutting only where a turn starts, so no tool result loses its call and no delegation loses its user message.
+        Trimming a little every turn shifted everything after the system prompt and cost the server's prompt cache
+        on every request (f_keep 0.13 to 0.16, 3200 to 4300 tokens prefilled again); once per ~20 messages it costs
+        one prefill, which a warm request then pays while nobody talks. True when it trimmed."""
+        if len(self.history) <= HISTORY_MAX:
+            return False
+        cut = len(self.history) - HISTORY_KEEP
+        while cut < len(self.history) and not is_turn_start(self.history[cut]):
+            cut += 1
+        del self.history[:cut]
+        return cut > 0
 
     def record(self, *messages: dict[str, Any]) -> None:
         """Tool calls and their results, as the turn makes them."""
@@ -374,6 +509,12 @@ class Brain:
 
     async def warm_up(self) -> None:
         """One tiny request with the real system prompt, so the first spoken turn is not a cold one."""
+
+    async def warm_prefix(self) -> None:
+        """Experimental: one 1-token request over the whole history, so the server caches the new prefix."""
+
+    async def count_tokens(self, text: str) -> int:
+        return estimate_tokens(text)
 
     async def aclose(self) -> None:
         pass
@@ -429,6 +570,25 @@ def acknowledgement(say: str) -> str:
     """What a delegating turn speaks: its first sentence when that is a short "on it" with no claim about the work,
     otherwise ACK. The answer is Claude's to give; the front's memory of the work is stale by then."""
     return short_first(say) or ACK
+
+
+_GUESS = re.compile(r"\b(likely|probably|because|due to|seems?|must have)\b", re.I)
+
+
+def status_reply(say: str) -> str:
+    """Experimental: what a question speaks when the latest Status report is fresh (no delegation since): the
+    reply's first two sentences, which rest on that report and the notes; HOLD for an empty reply or a guess."""
+    first = " ".join(re.split(r"(?<=[.!?])\s+", say.strip())[:2]).strip()
+    return HOLD if not first or _GUESS.search(first) else first
+
+
+def timings_of(line: str) -> dict[str, Any] | None:
+    """llama-server's `timings` object (prompt_n, cache_n, prompt_ms...) from a stream line that carries one."""
+    try:
+        t = json.loads(line[5:].strip()).get("timings")
+    except (ValueError, AttributeError):
+        return None
+    return t if isinstance(t, dict) else None
 
 
 def held_answer(say: str, worked: bool) -> str:
@@ -519,6 +679,10 @@ class FrontTurn:
     committed: bool = False
     trimmed: bool = False  # the reply was held back and cut: an acknowledgement, a question's first sentence, HOLD
     worked: bool = False  # work was in session when the turn began: a question hears HOLD, never the model's answer
+    fresh_status: bool = False  # experimental: a Status report came after the last delegation (status_reply)
+    status_answer: bool = False  # experimental: a question was answered from that status, not held
+    first_token_at: float | None = None  # when the reply's first content arrived (a speculation's: maybe early)
+    timings: dict[str, Any] | None = None  # llama-server's `timings` from the stream's last chunk
 
 
 class LlamaCppBrain(Brain):
@@ -615,16 +779,28 @@ class LlamaCppBrain(Brain):
             turn.answer = {"role": "assistant", "content": content}
             self.history.insert(at + 1, turn.answer)
 
-    async def respond(self, user_text: str, tools: Delegator) -> AsyncIterator[str]:
+    def request_messages(self, user_text: str) -> list[dict[str, Any]]:
+        """What respond() would send for `user_text` now, with no side effect: a speculation's request."""
+        return [{"role": "system", "content": self.system}, *self.history,
+                {"role": "user", "content": self.framed(user_text)}]
+
+    def speculate(self, user_text: str) -> Prefetch:
+        """Experimental (L6): starts this request on a provisional user text, reading the reply into a buffer only.
+        Nothing is spoken and nothing is handed off until respond() takes it (see Prefetch)."""
+        return Prefetch(self, self.request_messages(user_text), user_text)
+
+    async def respond(self, user_text: str, tools: Delegator, prefetch: Prefetch | None = None) -> AsyncIterator[str]:
         """Speaks the reply's "say" as it streams. The reply is read by its own task, which hands off the delegate
-        field even when this turn is cut first: the user may already have heard "on it"."""
+        field even when this turn is cut first: the user may already have heard "on it". `prefetch` is a speculation
+        on this same request, whose buffered reply is read in place of a new one."""
         self.begin(user_text)
         msgs: list[dict[str, Any]] = [{"role": "system", "content": self.system}, *self.history]
         turn = self.current
         words: asyncio.Queue[str | None] = asyncio.Queue()
         announcing = bool(getattr(tools, "announcing", False))
         turn.worked = bool(getattr(tools, "work_in_session", False))
-        reader = asyncio.create_task(self._read(msgs, turn, words, tools, announcing))
+        turn.fresh_status = self.experimental and bool(getattr(tools, "status_fresh", False))
+        reader = asyncio.create_task(self._read(msgs, turn, words, tools, announcing, prefetch))
         finished = False
         try:
             while (said := await words.get()) is not None:
@@ -643,19 +819,28 @@ class LlamaCppBrain(Brain):
             e = task.exception()
             log(f"front: reading a cut turn's reply failed ({type(e).__name__}: {str(e)[:120]})")
 
+    async def _lines(self, msgs: list[dict[str, Any]], max_tokens: int = 400) -> AsyncIterator[str]:
+        """The reply's stream lines, from a new request."""
+        async with self.client.stream("POST", f"{self.url}/v1/chat/completions",
+                                      json=self._body(msgs, max_tokens, True)) as r:
+            if r.status_code >= 400:
+                await r.aread()
+                raise RuntimeError(f"HTTP {r.status_code}: {r.text[:160]}")
+            async for line in r.aiter_lines():
+                yield line
+
     async def _read(self, msgs: list[dict[str, Any]], turn: FrontTurn, words: asyncio.Queue[str | None],
-                    tools: Delegator, announcing: bool = False) -> None:
+                    tools: Delegator, announcing: bool = False, prefetch: Prefetch | None = None) -> None:
         # raw -> no think block (one can lead the JSON) -> the "say" field -> no notes or think blocks -> speech
         think, json_turn, speech, bad = SpeechFilter(notes=False), TurnStream(), SpeechFilter(), 0
         held: list[str] | None = None  # a delegating turn's say, kept back whole and cut to an acknowledgement
         spoke = handed = False
+        source = prefetch.lines() if prefetch is not None else self._lines(msgs)
         try:
-            async with self.client.stream("POST", f"{self.url}/v1/chat/completions",
-                                          json=self._body(msgs, 400, True)) as r:
-                if r.status_code >= 400:
-                    await r.aread()
-                    raise RuntimeError(f"HTTP {r.status_code}: {r.text[:160]}")
-                async for line in r.aiter_lines():
+            async with contextlib.aclosing(source) as lines:
+                async for line in lines:
+                    if '"timings"' in line:
+                        turn.timings = timings_of(line) or turn.timings
                     kind, delta = parse_sse(line)
                     if kind == "done":
                         break
@@ -663,6 +848,9 @@ class LlamaCppBrain(Brain):
                         bad += 1
                     text = (delta or {}).get("content")
                     if isinstance(text, str) and text:
+                        if turn.first_token_at is None:
+                            turn.first_token_at = (prefetch.first_token_at if prefetch is not None else None) \
+                                or time.monotonic()
                         said = speech.push(json_turn.push(think.push(text)))
                         if not handed and "delegate" in json_turn.fields:  # handed off before a word is spoken,
                             handed = True  # so a turn cut while it speaks has already delegated, or never will
@@ -688,14 +876,39 @@ class LlamaCppBrain(Brain):
                 await self._hand_off(request, turn, tools, announcing)
             if held is not None:  # handed off: an acknowledgement; a question kept: see held_answer
                 whole = "".join(held) + said
-                spoken = acknowledgement(whole) if turn.request else held_answer(whole, turn.worked)
+                if turn.request:
+                    spoken = acknowledgement(whole)
+                elif turn.fresh_status:  # experimental: the latest Status report answers it
+                    spoken = status_reply(whole)
+                    turn.status_answer = spoken != HOLD
+                else:
+                    spoken = held_answer(whole, turn.worked)
                 # a question's held reply, even a whole "Let me check.", told the user nothing of a waiting result
-                turn.trimmed = not turn.request or spoken != whole.strip()
+                turn.trimmed = (spoken != whole.strip() if turn.status_answer else
+                                not turn.request or spoken != whole.strip())
                 words.put_nowait(spoken)
             elif said:
                 words.put_nowait(said)
         finally:
+            if prefetch is not None:
+                prefetch.cancel()
             words.put_nowait(None)
+
+    async def warm_prefix(self) -> None:
+        msgs = [{"role": "system", "content": self.system}, *self.history]
+        async with contextlib.aclosing(self._lines(msgs, 1)) as lines:  # streamed: a cancel reaches the server
+            async for line in lines:
+                if parse_sse(line)[0] == "done":
+                    break
+
+    async def count_tokens(self, text: str) -> int:
+        """llama-server's own count (POST /tokenize); the estimate when it does not answer."""
+        try:
+            r = await self.client.post(f"{self.url}/tokenize", json={"content": text}, timeout=5.0)
+            r.raise_for_status()
+            return len(r.json()["tokens"])
+        except Exception:  # noqa: BLE001 - another OpenAI-compatible server may have no /tokenize
+            return estimate_tokens(text)
 
     async def _hand_off(self, request: str, turn: FrontTurn, tools: Delegator, announcing: bool) -> None:
         if not is_request(request):
@@ -792,12 +1005,156 @@ class AnthropicBrain(Brain):
         await self.client.close()
 
 
-def make_brain(backend: str, url: str, model: str) -> Brain | None:
-    system = FRONT_PROMPT.format(workspace=Path.cwd())
+class Prefetch:
+    """Experimental (L6): a front request started before the end of the user's turn, on its provisional text. Its
+    stream lines go into a buffer and nothing reads them: no speech, no delegation. respond() takes it when the
+    final text and the history match (the request is then exactly the one it would make) and reads the buffered
+    lines, then the rest as they come; otherwise it is cancelled, which closes the request so the server stops."""
+
+    def __init__(self, brain: LlamaCppBrain, msgs: list[dict[str, Any]], text: str):
+        self.text = text
+        self.key = json.dumps(msgs, sort_keys=True)  # the request: respond() takes it only when its own matches
+        self.buf: list[str] = []
+        self.done = False
+        self.error: BaseException | None = None
+        self.started = time.monotonic()
+        self.first_token_at: float | None = None
+        self._more = asyncio.Event()
+        self._task = asyncio.ensure_future(self._fetch(brain, msgs))
+
+    async def _fetch(self, brain: LlamaCppBrain, msgs: list[dict[str, Any]]) -> None:
+        try:
+            async with contextlib.aclosing(brain._lines(msgs)) as lines:
+                async for line in lines:
+                    if self.first_token_at is None and '"content"' in line:
+                        self.first_token_at = time.monotonic()
+                    self.buf.append(line)
+                    self._more.set()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 - raised to the turn that takes it
+            self.error = e
+        finally:
+            self.done = True
+            self._more.set()
+
+    def matches(self, brain: LlamaCppBrain, text: str) -> bool:
+        return text == self.text and json.dumps(brain.request_messages(text), sort_keys=True) == self.key
+
+    async def lines(self) -> AsyncIterator[str]:
+        i = 0
+        while True:
+            while i < len(self.buf):
+                i += 1
+                yield self.buf[i - 1]
+            if self.done:
+                if self.error is not None:
+                    raise self.error
+                return
+            self._more.clear()
+            if i == len(self.buf) and not self.done:
+                await self._more.wait()
+
+    def cancel(self) -> None:
+        if not self._task.done():
+            self._task.cancel()
+
+    def ran_ms(self) -> float:
+        return 1000 * (time.monotonic() - self.started)
+
+
+class _HeadTap:
+    """KyutaiSTT as KyutaiTurns uses it, keeping each step's word piece and pause heads for TurnWatch."""
+
+    def __init__(self, stt: Any):
+        self._stt = stt
+        self.last: tuple[str | None, Any] | None = None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stt, name)
+
+    def step(self, block: Any) -> tuple[str | None, Any]:
+        piece, pauses = self._stt.step(block)
+        self.last = (piece, pauses)
+        return piece, pauses
+
+
+class TurnWatch:
+    """Experimental: the recognizer's detector, watched on the listener thread for what the front needs and speech.py
+    does not send. Kyutai only (a detector with `stt` and `text`); anything else passes through unchanged.
+    - ("eot_likely", text): the first step of a turn on which the 2 s pause head's EMA (p, kept as KyutaiTurns keeps
+      it) is above LIKELY with no new word piece: the end of the turn is likely, so the front may speculate (L6).
+      Once per text; ("eot_retract", None) when a word piece arrives after it.
+    - ("listening_pause", seconds into the turn): a pause with more speech coming during long dictation (over
+      BACKCHANNEL_AFTER_S into the turn, the 0.5 s head above 0.8 and p below 0.4), at most once a second; the
+      session decides whether to say "mm-hm" (L7).
+    It reads only KyutaiTurns' public state (`active`, `text`) and the heads of each step, through _HeadTap."""
+
+    LIKELY = 0.6  # speech.END_OF_TURN
+    EMA_KEEP = 0.5  # speech.S2_EMA_KEEP
+    IGNORE_STEPS = 12  # speech.HEADS_IGNORE_STEPS: the heads jitter after a model reset
+    MS_PER_STEP = 80.0
+    PAUSE_S05 = 0.8
+    PAUSE_P = 0.4
+    BACKCHANNEL_AFTER_S = 6.0
+
+    def __init__(self, inner: Any, backchannels: bool = False):
+        self.inner, self.backchannels = inner, backchannels
+        self.tap: _HeadTap | None = None
+        if getattr(inner, "stt", None) is not None and hasattr(inner, "text"):
+            self.tap = _HeadTap(inner.stt)
+            inner.stt = self.tap
+        self._reset()
+
+    def _reset(self) -> None:
+        self.likely: str | None = None
+        self.p: float | None = None
+        self.steps = 0  # steps since this turn's speech_start
+        self.cue_at = -1_000
+
+    @property
+    def active(self) -> bool:
+        return bool(self.inner.active)
+
+    def feed(self, frame: Any) -> list[tuple[str, Any]]:
+        events = self.inner.feed(frame)
+        if self.tap is None:
+            return events
+        last, self.tap.last = self.tap.last, None
+        if any(k == "speech_start" for k, _ in events):
+            self._reset()
+        if any(k in ("utterance", "discard") for k, _ in events):
+            self._reset()
+            return events
+        if last is None or not self.inner.active:
+            return events
+        piece, pauses = last
+        self.steps += 1
+        if getattr(self.tap, "steps", 0) <= self.IGNORE_STEPS:
+            return events
+        s2, s05 = float(getattr(pauses, "s2", 0.0)), float(getattr(pauses, "s05", 0.0))
+        self.p = s2 if self.p is None else self.EMA_KEEP * self.p + (1 - self.EMA_KEEP) * s2
+        if piece is not None:
+            if self.likely is not None:
+                self.likely = None
+                events.append(("eot_retract", None))
+        elif self.likely is None and self.p > self.LIKELY and (text := str(self.inner.text).strip()):
+            self.likely = text
+            events.append(("eot_likely", text))
+        seconds = self.steps * self.MS_PER_STEP / 1000
+        if (self.backchannels and seconds > self.BACKCHANNEL_AFTER_S and s05 > self.PAUSE_S05
+                and self.p < self.PAUSE_P and self.steps - self.cue_at >= 1000 / self.MS_PER_STEP):
+            self.cue_at = self.steps
+            events.append(("listening_pause", round(seconds, 2)))
+        return events
+
+
+def make_brain(backend: str, url: str, model: str, experimental: bool = False) -> Brain | None:
+    system = (FRONT_PROMPT_EXPERIMENTAL if experimental else FRONT_PROMPT).format(workspace=Path.cwd())
     try:
-        if backend == "anthropic":
-            return AnthropicBrain(system, model)
-        return LlamaCppBrain(system, url, model)
+        brain: Brain = AnthropicBrain(system, model) if backend == "anthropic" else LlamaCppBrain(system, url, model)
+        brain.experimental = experimental
+        return brain
     except Exception as e:  # noqa: BLE001
         warn(f"front backend {backend} cannot start ({type(e).__name__}: {str(e)[:160]}). Anthropic needs "
              "ANTHROPIC_API_KEY or `ant auth login`; or set frontBackend to llamacpp. Speech goes straight to Claude.")
@@ -834,12 +1191,24 @@ def spoken_upto(heard: str) -> str:
     return " ".join(words[-UPTO_WORDS:])
 
 
+BACKCHANNEL_TEXT = "Mm-hmm."  # the front's listening sound, rendered once by the synthesizer (L7)
+BACKCHANNEL_EVERY_S = 8.0  # at most one backchannel this often
+BACKCHANNEL_AFTER_S = 6.0  # never in a turn's first seconds: only during long dictation
+
+
+def _ms(start: float | None, end: float | None) -> str:
+    return "n/a" if start is None or end is None else f"{max(0.0, 1000 * (end - start)):.0f}"
+
+
 # -- the session ------------------------------------------------------------------------------------------
 class FrontSession(Duplex):
     def __init__(self, voice: Voice, hearing: Callable[[], bool], brain: Brain | None,
-                 switch: re.Pattern[str] | None, goodbye: Callable[[], None]):
+                 switch: re.Pattern[str] | None, goodbye: Callable[[], None], tune: Tuning | None = None):
         super().__init__(voice, hearing)
         self.brain, self.switch, self.goodbye = brain, switch, goodbye
+        tune = tune or Tuning()
+        self.experimental = tune.experimental  # off: every experimental path below stays off (0.6.4)
+        self.backchannels = tune.experimental and tune.backchannels
         self.tools = Delegator()
         self.results: asyncio.Queue[str] = asyncio.Queue(maxsize=RESULTS_MAX)
         self.turn: asyncio.Task | None = None
@@ -848,6 +1217,13 @@ class FrontSession(Duplex):
         self.fragment: list[str] = []  # an unfinished utterance held for its rest (looks_unfinished)
         self.fragment_due: asyncio.Task | None = None
         self.fragment_gen = 0
+        self.eot_at: float | None = None  # when the last utterance arrived: the end of the user's turn
+        self.spec: Prefetch | None = None  # experimental: a front reply started on the provisional text (L6)
+        self.warm: asyncio.Task | None = None  # experimental: the warm request after a trim (L1)
+        self.asked = False  # the front's last reply ended on a question: no backchannel over its answer
+        self.backchannel_clip: Any = None  # the rendered BACKCHANNEL_TEXT
+        self.backchannel_at = -1e9  # loop time of the last one
+        self.backchannel_stop = threading.Event()
 
     def routes(self) -> dict[str, Route]:
         def event(body: str) -> bool:
@@ -870,8 +1246,16 @@ class FrontSession(Duplex):
         return not (self.user_talking or self.hearing() or self.turn_running() or self.fragment)
 
     async def handle(self, kind: str, payload: Any) -> None:
+        await self._handle(kind, payload)
+        if kind in ("utterance", "discard") and self.spec is not None:  # the turn ended, and nothing took it
+            self.drop_spec("discarded")
+
+    async def _handle(self, kind: str, payload: Any) -> None:
         if kind == "speech_start":
             self.user_talking = True
+            if self.warm is not None and not self.warm.done():  # the floor is the user's: the server too
+                self.warm.cancel()
+                file_log("INFO", "front warm: cancelled, the user spoke")
             if self.fragment_due is not None:  # the rest of a held utterance is coming: wait for it
                 self.fragment_due.cancel()
             if not self.barge_in():  # over the voice: paused until the words say backchannel or cut
@@ -887,8 +1271,16 @@ class FrontSession(Duplex):
             if self.fragment:
                 self.arm_fragment()
             self.settle()
+        elif kind == "eot_likely":
+            self.speculate(payload)
+        elif kind == "eot_retract":
+            if self.spec is not None:
+                self.drop_spec("cancelled")
+        elif kind == "listening_pause":
+            await self.backchannel_cue(payload)
         elif kind == "utterance":
             self.user_talking = False
+            self.eot_at = time.monotonic()
             if await self.barge_verdict(payload):
                 emit(type="transcript", role="user", text=payload)
                 self.backchannel(payload)
@@ -943,8 +1335,75 @@ class FrontSession(Duplex):
         """The user's whole utterance: on screen, then a front turn."""
         emit(type="transcript", role="user", text=text)
         await self.interrupt()
+        self.backchannel_stop.set()
+        self.asked = False
+        spec, self.spec = self.spec, None
+        eot, self.eot_at = self.eot_at, None
         waiting = self.take_results() if self.brain is not None else []
-        self.turn = asyncio.create_task(self.run_turn(text, waiting=waiting))
+        self.turn = asyncio.create_task(self.run_turn(text, waiting=waiting, prefetch=spec, eot=eot))
+
+    # -- experimental: speculation (L6), the warm prefix (L1), backchannels (L7) ------------------------------------
+    def speculate(self, text: str) -> None:
+        """The end of the user's turn is likely (TurnWatch): start the front's reply on the words so far, as the
+        whole utterance would go (any held fragment first). Not while anything else holds the floor or the server,
+        nor for what would not become a front turn (a model switch, an unfinished sentence). Never a Claude turn:
+        only the llama.cpp front speculates, and a speculation hands nothing off until the final text takes it."""
+        if not self.experimental or not isinstance(self.brain, LlamaCppBrain):
+            return
+        if self.spec is not None:
+            self.drop_spec("cancelled")
+        full = " ".join(p.strip() for p in [*self.fragment, text] if p.strip())
+        if (not full or self.turn_running() or self.pause is not None or not self.results.empty()
+                or spoken_model(self.switch, full) or looks_unfinished(full)):
+            return
+        self.spec = self.brain.speculate(full)
+
+    def drop_spec(self, why: str) -> None:
+        spec, self.spec = self.spec, None
+        if spec is None:
+            return
+        spec.cancel()
+        file_log("INFO", f"front speculate: {why} saved_ms=0 ran_ms={spec.ran_ms():.0f}")
+
+    def warm_prefix(self, brain: Brain) -> None:
+        """After a block trim (Brain.compact), one 1-token request over the new history while nobody talks, so the
+        next turn's prefill is cached. Skipped while the user speaks; cancelled when they start."""
+        if self.user_talking or self.hearing():
+            file_log("INFO", "front warm: skipped, the user is speaking")
+            return
+
+        async def warm() -> None:
+            t = time.monotonic()
+            try:
+                await brain.warm_prefix()
+                file_log("INFO", f"front warm: {len(brain.history)} messages in {1000 * (time.monotonic() - t):.0f} ms")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 - only the next turn's prefill is at stake
+                file_log("INFO", f"front warm: failed ({type(e).__name__}: {str(e)[:120]})")
+
+        self.warm = asyncio.ensure_future(warm())
+
+    async def render_backchannel(self) -> None:
+        try:
+            self.backchannel_clip = await asyncio.to_thread(self.voice.tts.synth, BACKCHANNEL_TEXT)
+        except Exception as e:  # noqa: BLE001 - no backchannels, nothing else lost
+            log(f"front: the backchannel clip did not render ({type(e).__name__}: {str(e)[:120]}); none are played")
+
+    async def backchannel_cue(self, seconds: Any) -> None:
+        """TurnWatch heard a pause with more speech coming, `seconds` into the user's turn: a short "mm-hm", at most
+        one per BACKCHANNEL_EVERY_S, never in a turn's first seconds, never over the front's own voice or a turn in
+        flight, and never while the user answers a question the front just asked."""
+        now = self.loop.time()
+        if not (self.backchannels and self.backchannel_clip is not None and self.user_talking):
+            return
+        if (float(seconds) <= BACKCHANNEL_AFTER_S or now - self.backchannel_at < BACKCHANNEL_EVERY_S or self.asked
+                or self.turn_running() or self.voice.speaking.is_set() or self.pause is not None):
+            return
+        self.backchannel_at = now
+        self.backchannel_stop = threading.Event()
+        played = await self.voice.blip(BACKCHANNEL_TEXT, self.backchannel_clip, self.backchannel_stop)
+        file_log("INFO", f"front backchannel: {'played' if played else 'skipped'} at_s={float(seconds):.1f}")
 
     def take_results(self) -> list[str]:
         """Every result waiting for the floor, oldest first. Once one is taken, work is in session."""
@@ -963,8 +1422,21 @@ class FrontSession(Duplex):
     async def cut(self) -> None:
         await self.interrupt()
 
+    async def relay(self, texts: list[str], brain: Brain | None) -> Relay:
+        """Experimental (L4): results as one Relay, its retold part and notes each held to TOKENS_MAX tokens (the
+        front server's own count when it gives one; a token is at least a character, so short text needs none)."""
+        r = relay_of(texts)
+        for field in ("retold", "notes"):
+            text = getattr(r, field)
+            if len(text) > TOKENS_MAX:
+                n = await brain.count_tokens(text) if brain is not None else estimate_tokens(text)
+                setattr(r, field, cap_tokens(text, n))
+        self.tools.saw_status(r.status)
+        return r
+
     async def run_turn(self, user_text: str, is_event: bool = False, brain: Brain | None = None,
-                       report: str = "", waiting: list[str] | None = None) -> None:
+                       report: str = "", waiting: list[str] | None = None, prefetch: Prefetch | None = None,
+                       eot: float | None = None) -> None:
         """Front model -> sentences -> Voice, then the history gets exactly what was heard. An event turn's `report`
         is the result itself, read out when the front is down. A user turn's `waiting` results arrived while the user
         was talking: they go into the front's history just ahead of the user's words, so the reply rests on them and
@@ -977,7 +1449,25 @@ class FrontSession(Duplex):
         handed = self.tools.handed
         if waiting:
             log(f"front: {len(waiting)} waiting result(s) go into the user's turn, not a separate announcement")
-            brain.history.extend({"role": "user", "content": event_message(report_brief(t), WAITING)} for t in waiting)
+            if self.experimental:
+                brain.history.extend((await self.relay(waiting, brain)).messages(WAITING))
+            else:
+                brain.history.extend({"role": "user", "content": event_message(report_brief(t), WAITING)}
+                                     for t in waiting)
+        if prefetch is not None:
+            if isinstance(brain, LlamaCppBrain) and prefetch.matches(brain, user_text):
+                file_log("INFO", f"front speculate: used saved_ms={prefetch.ran_ms():.0f}")
+            else:
+                prefetch.cancel()
+                file_log("INFO", f"front speculate: discarded saved_ms=0 ran_ms={prefetch.ran_ms():.0f}")
+                prefetch = None
+        started = time.monotonic()
+        audio_at: list[float] = []
+
+        def on_play() -> None:
+            if not audio_at:
+                audio_at.append(time.monotonic())
+            self.set_state("speaking")
 
         words: asyncio.Queue[str | None] = asyncio.Queue()
         written: list[str] = []
@@ -1004,7 +1494,8 @@ class FrontSession(Duplex):
 
             try:
                 try:
-                    async with contextlib.aclosing(brain.respond(user_text, self.tools)) as deltas:
+                    extra = {"prefetch": prefetch} if prefetch is not None else {}
+                    async with contextlib.aclosing(brain.respond(user_text, self.tools, **extra)) as deltas:
                         async for delta in deltas:
                             put(splitter.push(delta))
                 except Exception as e:  # noqa: BLE001 - connect error, 5xx, a broken stream: the turn ends cleanly
@@ -1028,7 +1519,7 @@ class FrontSession(Duplex):
         interrupted = True
         cancelled = False
         try:
-            interrupted = await self.voice.speak(sentences(), self.turn_spoken, lambda: self.set_state("speaking"))
+            interrupted = await self.voice.speak(sentences(), self.turn_spoken, on_play)
         except asyncio.CancelledError:
             cancelled = True
             raise
@@ -1038,6 +1529,14 @@ class FrontSession(Duplex):
             said = brain.commit(" ".join(self.turn_spoken), interrupted)
             if not shown and said:  # cut before the reply was whole, or failed: what was heard
                 show(said)
+            if isinstance(brain, LlamaCppBrain):
+                self.log_turn(brain.current, eot if not is_event and eot is not None else started,
+                              audio_at[0] if audio_at else None, is_event)
+            if brain is self.brain:
+                self.asked = said.rstrip().endswith("?")
+            if self.experimental and brain is self.brain and brain.compact():
+                file_log("INFO", f"front history: trimmed in one block to {len(brain.history)} messages")
+                self.warm_prefix(brain)
             if is_event and interrupted:  # Claude's answer was retold only in part: Claude hears where it stopped
                 emit(type="cut", heard=spoken_upto(said))
             if not (is_event or failed) and brain is self.brain:  # also when a barge-in cut the reply: the user's
@@ -1061,6 +1560,18 @@ class FrontSession(Duplex):
         self.settle()
         if not is_event and _GOODBYE.search(user_text.lower()):
             self.goodbye()
+
+    @staticmethod
+    def log_turn(turn: FrontTurn, eot: float, audio_at: float | None, is_event: bool) -> None:
+        """One sidecar-log line per front turn: from the end of the user's turn (or an announcement's start) to the
+        first token and the first audio, and what llama-server's timings say of its prompt cache: prompt_n is what
+        it prefilled, cache_n what it reused. f_keep is only in the server's own log; n/a unless a server sends it."""
+        t = turn.timings or {}
+        f_keep = f"{float(t['f_keep']):.2f}" if isinstance(t.get("f_keep"), (int, float)) else "n/a"
+        file_log("INFO", f"front turn: eot_to_first_token_ms={_ms(eot, turn.first_token_at)} "
+                         f"first_audio_ms={_ms(eot, audio_at)} f_keep={f_keep} "
+                         f"prefill_tokens={t.get('prompt_n', 'n/a')} cached_tokens={t.get('cache_n', 'n/a')} "
+                         f"kind={'event' if is_event else 'user'}")
 
     def front_kind(self, text: str, is_event: bool, handed: int) -> str:
         """What a front line is, for the mod's display: `relay` retells a report of Claude's (shown above it), `filler`
@@ -1089,7 +1600,9 @@ class FrontSession(Duplex):
         answer, self.question_open = self.question_open, False
         if self.tools.handed != handed:
             return
-        kind = {"answer": True} if answer else {"ask": True} if "?" in user_text else {}
+        from_status = bool(getattr(getattr(self.brain, "current", None), "status_answer", False))
+        # experimental: a status question the latest Status report answered needs no Claude turn
+        kind = {"answer": True} if answer else {"ask": True} if "?" in user_text and not from_status else {}
         emit(type="note", said=user_text, reply=said, **kind)
 
     async def front_down(self, text: str, is_event: bool) -> None:
@@ -1107,12 +1620,27 @@ class FrontSession(Duplex):
         being transcribed, no turn running). They are taken only then, so a user turn that starts first takes them
         instead (run_turn's `waiting`). Results that waited together are one announcement, oldest first. A result is
         taken once: an announcement cut by a barge-in is not announced again."""
+        if self.backchannels:
+            self.spawn(self.render_backchannel())
         while True:
             while self.results.empty() or not self.floor_free():
                 await asyncio.sleep(0.1)
             texts = self.take_results()
             if len(texts) > 1:
                 log(f"front: {len(texts)} results waited together; announcing them as one")
+            if self.experimental:
+                kept = [t for t in texts if retellable(report_brief(t))]
+                r = await self.relay(kept, self.brain) if kept else None
+                if r is None or not r.retold:
+                    log(f"front: {len(texts)} result(s) with nothing to say; not announced")
+                    continue
+                if self.brain is not None and r.notes:
+                    self.brain.history.append({"role": "user", "content": notes_message(r.notes)})
+                self.question_open = "?" in r.spoken
+                message = event_message(r.retold, RETELL_STATUS if r.status else RETELL)
+                self.turn = asyncio.create_task(self.run_turn(message, is_event=True, report=r.spoken or r.retold))
+                await asyncio.wait({self.turn})
+                continue
             report = "\n\n".join(b for t in texts if retellable(b := report_brief(t)))[:EVENT_CHARS]
             if not report:  # "(nothing to add)", or nothing at all: a turn on it would only invent something to say
                 log(f"front: {len(texts)} result(s) with nothing to say; not announced")
@@ -1124,6 +1652,9 @@ class FrontSession(Duplex):
     async def shutdown(self) -> None:
         if self.fragment_due is not None:
             self.fragment_due.cancel()
+        self.drop_spec("cancelled")
+        if self.warm is not None:
+            self.warm.cancel()
         await cancel_and_wait(self.turn)
         if self.brain is not None:
             with contextlib.suppress(Exception):
