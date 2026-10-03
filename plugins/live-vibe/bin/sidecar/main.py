@@ -112,6 +112,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--front-model", default="", help="empty: the server's model, or claude-haiku-4-5 for anthropic")
     ap.add_argument("--switch-pattern", default="", help="regex whose group 1 is a model a spoken switch names")
     ap.add_argument("--log-file", default="", help="persistent sidecar log; empty: <cache dir>/sidecar.log")
+    ap.add_argument("--experimental", action="store_true",
+                    help="the experimental voice path (stable front cache, commentary relay, speculative replies)")
+    ap.add_argument("--backchannels", action="store_true",
+                    help="front: a short 'mm-hm' during long dictation (needs --experimental)")
     ap.add_argument("--list-devices", action="store_true")
     ap.add_argument("--setup", action="store_true", help="check the system, fetch the models, test the voice")
     ap.add_argument("--unit", action="store_true", help="pure unit checks")
@@ -155,6 +159,14 @@ def run(args: argparse.Namespace, life: protocol.Lifecycle) -> int:
     else:
         build = lambda: speech.recognizer(args.stt, args.asr, args.end_silence_ms, guard.active,  # noqa: E731
                                           args.end_silence_long_ms, guard)
+        if args.mode == "front" and args.experimental:  # the front's view of the turn: speculation, backchannels
+            from sidecar.front import TurnWatch
+
+            recognize = build
+
+            def build():
+                detector, transcribe = recognize()
+                return TurnWatch(detector, tuning(args).backchannels), transcribe
     listener = audio.Listener(build, life.quit, guard, aec=sd is not None and args.aec == "on")
     if not args.fake_audio:  # the recognizer has the first claim on the GPU; Kokoro takes what is left
         gpu.hold("stt", speech.stt_gpu_need(args.stt))
@@ -202,15 +214,26 @@ def run(args: argparse.Namespace, life: protocol.Lifecycle) -> int:
         player.close()
 
 
+def tuning(args: argparse.Namespace):
+    """The settings the sessions read, from argv: off, --experimental leaves 0.6.4's behaviour; --backchannels
+    counts only with it."""
+    from sidecar.audio import Tuning
+
+    experimental = bool(getattr(args, "experimental", False))
+    return Tuning(end_silence_ms=args.end_silence_ms, end_silence_long_ms=args.end_silence_long_ms,
+                  experimental=experimental, backchannels=experimental and bool(getattr(args, "backchannels", False)))
+
+
 async def serve(args, life: protocol.Lifecycle, listener, voice, sd, mic, t0: float) -> int:
     from sidecar.front import FrontSession, make_brain, warm_up
     from sidecar.session import LiveSession
 
     brain = None
     if args.mode == "front":
-        brain = make_brain(args.front_backend, args.front_url, args.front_model)
+        tune = tuning(args)
+        brain = make_brain(args.front_backend, args.front_url, args.front_model, tune.experimental)
         switch = re.compile(args.switch_pattern) if args.switch_pattern else None
-        sess = FrontSession(voice, lambda: listener.active, brain, switch, lambda: life.request_quit("goodbye"))
+        sess = FrontSession(voice, lambda: listener.active, brain, switch, lambda: life.request_quit("goodbye"), tune)
     else:
         sess = LiveSession(voice, lambda: listener.active)
     listener.post = sess.post
