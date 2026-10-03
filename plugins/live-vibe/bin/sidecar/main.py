@@ -10,6 +10,7 @@
 #   "httpx>=0.28",
 #   "anthropic>=1.11",
 #   "moshi-mlx>=0.3.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+#   "moshi>=0.2.11,<0.3; sys_platform == 'linux' and platform_machine == 'x86_64'",
 # ]
 # ///
 """Audio sidecar for the live-vibe mod. It owns the mic and speaker in two modes:
@@ -20,9 +21,10 @@
                              tool, delegate, hands real work to Claude; Claude's answers come back through
                              POST /event and the front relays them once the floor is free.
 
-Backends: --stt kyutai (Kyutai STT 1B on MLX, Apple silicon; streaming words and its own end of turn; about
-2.4 GB of weights on first use; elsewhere it falls back to whisper) or whisper (Silero VAD + faster-whisper,
-CUDA when there is a GPU); --tts kokoro (needs espeak-ng) or say (macOS).
+Backends: --stt kyutai (Kyutai STT 1B on MLX on Apple silicon, or on CUDA PyTorch on Linux with an Nvidia GPU;
+streaming words and its own end of turn; about 2.4 GB of weights on first use; elsewhere it falls back to
+whisper) or whisper (Silero VAD + faster-whisper, CUDA when there is a GPU); --tts kokoro (needs espeak-ng) or
+say (macOS).
 
 stdout carries only these JSON lines (library output goes to stderr):
   {"type":"ready","port":N,"token":"..."}                every POST must send X-Live-Token: <token>

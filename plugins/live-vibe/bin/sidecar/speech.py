@@ -1,4 +1,4 @@
-"""Speech backends and their fallbacks: STT (Kyutai STT 1B on MLX, or Silero + faster-whisper) and TTS (Kokoro-82M,
+"""Speech backends and their fallbacks: STT (Kyutai STT 1B on MLX or CUDA, or Silero + faster-whisper) and TTS (Kokoro-82M,
 macOS say, or silence). Each loader degrades to the next with a warn naming the fix; none ends the process.
 
 WhisperASR, KokoroTTS and SayTTS are ported from proto/duplex_voice.py. The Kyutai loading and stepping follow
@@ -54,14 +54,11 @@ def recognizer(stt: str, asr: str, end_silence_ms: int, speaking: Callable[[], b
     Silero (or the energy gate) and transcribes the utterance audio."""
     tune = Tuning(end_silence_ms=end_silence_ms)
     if stt == "kyutai":
-        if not is_apple_silicon():  # the default everywhere, so a log rather than a toast on every start
-            log("stt: Kyutai STT runs on MLX, Apple silicon only; using Whisper.")
-        else:
-            try:
-                k = KyutaiSTT()
-                return KyutaiTurns(k, tune, speaking), k.transcribe
-            except Exception as e:  # noqa: BLE001
-                warn(f"Kyutai STT unavailable ({type(e).__name__}: {str(e)[:120]}); using Whisper.")
+        from .kyutai_cuda import load_kyutai
+
+        k = load_kyutai()  # MLX on Apple silicon, CUDA PyTorch on an Nvidia GPU, or None
+        if k is not None:
+            return KyutaiTurns(k, tune, speaking), k.transcribe
     w = WhisperASR(asr)
     return TurnDetector(load_vad(), tune, speaking), w.transcribe
 
