@@ -30,6 +30,8 @@
 
 Echo: --aec on runs WebRTC AEC3 (livekit) on the mic with what the speaker played as its reference; with
 or without it, barge-in stays strict for a tail after playback and utterances that repeat recent speech are dropped.
+Barge-in: with AEC3 running, the first word the echo guard does not place in what the speaker just played pauses
+the voice (three words without AEC3); a backchannel alone resumes it, anything else makes the pause the cut.
 
 Backends: --stt kyutai (Kyutai STT 1B on MLX on Apple silicon, or on CUDA PyTorch on Linux with an Nvidia GPU;
 streaming words and its own end of turn; about 2.4 GB of weights on first use; elsewhere it falls back to
@@ -43,6 +45,8 @@ stdout carries only these JSON lines (library output goes to stderr):
   {"type":"utterance","text":"..."}                      live: what the user said
   {"type":"barge_in"}                                    live: playback was stopped (speech over it, or /stop)
   {"type":"spoken","text":"...","cut":b}                 live: what was actually heard of one /speak
+  {"type":"note","said":"...","backchannel":true}       both: "mm-hm" over the voice, which played on
+  {"type":"cut","heard":"..."}                          front: a retelling cut by the user, up to its last words heard
   {"type":"delegate","text":"..."}                       front: work for Claude
   {"type":"switch_model","model":"sonnet"}               front: a spoken model switch, for Claude
   {"type":"transcript","role":"user|front","text":"..."} front: the voice conversation, for the screen
@@ -150,7 +154,7 @@ def run(args: argparse.Namespace, life: protocol.Lifecycle) -> int:
         build = lambda: (speech.NoSpeech(), str)  # noqa: E731
     else:
         build = lambda: speech.recognizer(args.stt, args.asr, args.end_silence_ms, guard.active,  # noqa: E731
-                                          args.end_silence_long_ms)
+                                          args.end_silence_long_ms, guard)
     listener = audio.Listener(build, life.quit, guard, aec=sd is not None and args.aec == "on")
     if not args.fake_audio:  # the recognizer has the first claim on the GPU; Kokoro takes what is left
         gpu.hold("stt", speech.stt_gpu_need(args.stt))

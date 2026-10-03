@@ -22,7 +22,8 @@ from typing import Any, Callable, NamedTuple
 import numpy as np
 
 from . import gpu
-from .audio import JUNK_TRANSCRIPTS, SR, CannotStart, Detector, EnergyVAD, SileroVAD, Tuning, TurnDetector
+from .audio import (JUNK_TRANSCRIPTS, SR, BargeGate, CannotStart, Detector, EnergyVAD, SileroVAD, Tuning, TurnDetector,
+                    is_backchannel)
 from .protocol import file_log, log, warn
 
 # Shared with the prototype, so the models it downloaded are reused.
@@ -51,19 +52,22 @@ def is_apple_silicon() -> bool:
 
 # -- STT: the recognizer and its turn detector, built on the listener thread -------------------------------------
 def recognizer(stt: str, asr: str, end_silence_ms: int, speaking: Callable[[], bool],
-               end_silence_long_ms: int = Tuning.end_silence_long_ms) -> tuple[Detector, Callable[[Any], str]]:
+               end_silence_long_ms: int = Tuning.end_silence_long_ms,
+               guard: Any = None) -> tuple[Detector, Callable[[Any], str]]:
     """(detector, transcribe). Kyutai brings its own end of turn and passes text through; Whisper pairs with
-    Silero (or the energy gate) and transcribes the utterance audio."""
+    Silero (or the energy gate) and transcribes the utterance audio. `guard` (an EchoGuard) lets the barge-in gate
+    cut on one word."""
     tune = Tuning(end_silence_ms=end_silence_ms, end_silence_long_ms=end_silence_long_ms)
+    gate = BargeGate(tune, guard)
     try:
         if stt == "kyutai":
             from .kyutai_cuda import load_kyutai
 
             k = load_kyutai()  # MLX on Apple silicon, CUDA PyTorch on an Nvidia GPU, or None
             if k is not None:
-                return KyutaiTurns(k, tune, speaking), k.transcribe
+                return KyutaiTurns(k, tune, speaking, gate), k.transcribe
         w = WhisperASR(asr)
-        return TurnDetector(load_vad(), tune, speaking), w.transcribe
+        return TurnDetector(load_vad(), tune, speaking, gate, w.transcribe), w.transcribe
     finally:
         gpu.release("stt")  # loaded (or not): free VRAM readings show what it took from here on
 
@@ -129,7 +133,7 @@ def _cuda_devices() -> int:
 KYUTAI_STT_REPO = "kyutai/stt-1b-en_fr-candle"  # the -mlx repo drops the extra heads that carry end of turn
 KYUTAI_FILES = ("config.json", "model.safetensors", "mimi-pytorch-e351c8d8@125.safetensors", "tokenizer_en_fr_audio_8000.model")
 KYUTAI_SR, KYUTAI_BLOCK = 24_000, 1920  # 80 ms steps at 12.5 Hz
-BARGE_IN_WORDS = 3  # words the user must say over the assistant before it stops: bleed and "mm-hm" stay out
+BARGE_IN_WORDS = 3  # the old barge-in rule, still the fallback when the echo guard cannot judge (BargeGate)
 END_OF_TURN = 0.6  # pause-head threshold, as in Kyutai's Unmute. Extra heads 0..3 forecast "no new word within
 # 0.5 / 1 / 2 / 3 s" (lower index: more aggressive); they are not silence detectors, so the 2 s head alone rises
 # before the user stops and cut turns mid-sentence, the trailing pieces (text trails audio by ~0.5 s) arriving as a
@@ -267,8 +271,9 @@ class KyutaiSTT:
 
 class KyutaiTurns:
     """TurnDetector's interface over KyutaiSTT: feed() takes 16 kHz, 32 ms frames and returns ('speech_start', p) /
-    ('utterance', text) / ('discard', None). A turn starts on the first word, or while the assistant speaks on
-    BARGE_IN_WORDS words. It ends on one of three triggers:
+    ('utterance', text) / ('discard', None). A turn starts on the first word; while the assistant speaks, on the
+    word piece at which the BargeGate says cut (Tuning.barge_in_words words the echo guard does not place in what the
+    speaker just played, or BARGE_IN_WORDS when it cannot judge). It ends on one of three triggers:
     - semantic: the 2 s pause head (s2) and the 0.5 s head (s05) both above END_OF_TURN for delay_steps
       consecutive steps (6 = 480 ms), counted from the last word piece, and no piece for eot_drain_ms. The 2 s head
       forecasts the end; the 0.5 s head confirms a pause is under way now (Kyutai's advice for mid-sentence
@@ -284,14 +289,17 @@ class KyutaiTurns:
       P(end) < unlikely_threshold, OpenAI semantic_vad medium 4 s, AssemblyAI conservative 3.6 s, Pipecat Smart
       Turn 3 s fallback.
     - max: max_utterance_s.
+    - backchannel: a turn that cut the assistant and is only backchannel words so far (audio.is_backchannel) ends
+      after backchannel_quiet_ms without a new piece, so the paused voice can resume.
     Each end writes one 'kyutai turn end' line to the log file (trigger, cap tier, tail token, length, heads; no
     other text)."""
 
     IN_BLOCK = KYUTAI_BLOCK * SR // KYUTAI_SR  # 1280 input samples per 80 ms step
     MS_PER_STEP = 1000 * KYUTAI_BLOCK / KYUTAI_SR  # 80
 
-    def __init__(self, stt, tune: Tuning, speaking: Callable[[], bool]):
+    def __init__(self, stt, tune: Tuning, speaking: Callable[[], bool], gate: BargeGate | None = None):
         self.stt, self.t, self.speaking = stt, tune, speaking
+        self.gate = gate or BargeGate(tune)  # no guard: it cannot judge echo, so BARGE_IN_WORDS
         self.buf = np.zeros(0, np.float32)
         self.prev = 0.0
         self.active = False  # a turn has started (speech_start sent)
@@ -299,6 +307,8 @@ class KyutaiTurns:
 
     def _clear(self) -> None:
         self.text, self.words, self.ends, self.started_at, self.last_word = "", 0, 0, None, 0
+        self.barged = False  # this turn's speech_start cut the assistant
+        self.gate.reset()
         self.peak = Pauses()
         self.s2_ema: float | None = None
 
@@ -340,9 +350,11 @@ class KyutaiTurns:
             self.text += piece.replace("▁", " ")
             self.words += piece.startswith("▁")
             self.last_word = step
-            if not self.active and (self.words >= BARGE_IN_WORDS or not self.speaking()):
-                self.active = True
-                events.append(("speech_start", 1.0 - pauses.s2))
+            if not self.active:
+                speaking = self.speaking()
+                if not speaking or self.gate.decide(self.text, self.words) == "cut":
+                    self.active, self.barged = True, speaking
+                    events.append(("speech_start", 1.0 - pauses.s2))
         if self.started_at is None:
             return events
         self.peak = Pauses(*map(max, self.peak, pauses))
@@ -353,6 +365,8 @@ class KyutaiTurns:
         cap, cap_ms, tail = self._cap()
         if self.ends >= self.stt.delay_steps and quiet_ms >= self.t.eot_drain_ms:
             trigger, cap = "semantic", "semantic"
+        elif self.barged and quiet_ms >= self.t.backchannel_quiet_ms and is_backchannel(self.text):
+            trigger, cap = "backchannel", "backchannel"
         elif quiet_ms >= cap_ms:
             trigger = "silence"
         elif (step - self.started_at) * self.MS_PER_STEP >= self.t.max_utterance_s * 1000:
@@ -363,7 +377,7 @@ class KyutaiTurns:
         sent = "none"
         if self.active:
             ok = text.lower() not in JUNK_TRANSCRIPTS
-            events.append(("utterance", text) if ok else ("discard", None))
+            events.append(("utterance", text) if ok else ("discard", text or None))  # a session may want "okay."
             sent = events[-1][0]
         heads = " ".join(f"{k}={pk:.2f}/{v:.2f}" for k, pk, v in zip(Pauses._fields, self.peak, pauses))
         file_log("INFO", f"kyutai turn end: trigger={trigger} cap={cap} tail={tail} sent={sent} "

@@ -8,7 +8,9 @@ Three layers, each a fallback for the one before:
                                  through the echo and kept the user's words over it.
   EchoGuard.active()             the barge-in gate stays strict while playing and for TAIL_S after, since the
                                  speaker keeps sounding after play() returns (output buffer, RDP and room).
-  EchoGuard.strip()              drops the runs of an utterance that repeat what was just spoken."""
+  EchoGuard.strip()              drops the runs of an utterance that repeat what was just spoken.
+  EchoGuard.echoes()             a barge-in's first words that repeat what the speaker was playing a moment
+                                 ago: they do not cut it (audio.BargeGate)."""
 from __future__ import annotations
 
 import collections
@@ -189,11 +191,17 @@ class EchoGuard:
     MEMORY_S = 45.0  # how long a spoken sentence can come back as echo
     RUN = 3  # repeated words in a row that count as echo
     MOSTLY = 0.6  # an utterance this much echo is all echo
+    ECHO_LAG_S = 2.5  # a word played this long ago can still come back as a recognized word: the output buffer,
+    # the room, AEC3's convergence and Kyutai's ~0.5 s of text delay, plus the error of placing words by time
+    ECHO_LEAD_S = 0.3  # and one placed this far ahead of now (a word's time is estimated, not measured)
 
     def __init__(self, speaking: Callable[[], bool]):
         self.speaking = speaking
         self.sound_until = 0.0  # time.monotonic() when the last audio handed to the device has been heard
         self.said: collections.deque[tuple[float, list[str]]] = collections.deque(maxlen=64)
+        # (when its first sample played, its words, its length in s, where it resumed 0..1): each word's time
+        self.timeline: collections.deque[tuple[float, list[str], float, float]] = collections.deque(maxlen=8)
+        self.judging: Callable[[], bool] = lambda: False  # the canceller runs with a reference (set by Listener)
         self._lock = threading.Lock()
 
     def sounding(self, until: float) -> None:
@@ -203,9 +211,51 @@ class EchoGuard:
         """The barge-in gate applies: speaking, or within the tail of the last sound."""
         return self.speaking() or time.monotonic() < self.sound_until + self.TAIL_S
 
-    def spoke(self, text: str) -> None:
+    def spoke(self, text: str, seconds: float = 0.0, at: float = 0.0) -> None:
+        """A sentence starts playing, `seconds` long; `at` (0..1) is where a resumed one picks up."""
+        now, words = time.monotonic(), words_of(text)
         with self._lock:
-            self.said.append((time.monotonic(), words_of(text)))
+            if at <= 0.0:
+                self.said.append((now, words))
+            self.timeline.append((now - at * seconds, words, seconds, at))
+
+    def playing_words(self, now: float | None = None) -> list[str]:
+        """The words the speaker played from ECHO_LAG_S ago to ECHO_LEAD_S ahead, in order: each word placed at
+        its share of its sentence's length (a resumed sentence from where it picked up). A sentence of unknown length
+        counts whole."""
+        now = time.monotonic() if now is None else now
+        lo, hi = now - self.ECHO_LAG_S, now + self.ECHO_LEAD_S
+        out: list[str] = []
+        with self._lock:
+            spans = list(self.timeline)
+        for k, (start, words, seconds, at) in enumerate(spans):
+            end = spans[k + 1][0] if k + 1 < len(spans) else start + seconds  # a resumed copy takes over from here
+            for i, w in enumerate(words):
+                share = (i + 0.5) / max(1, len(words))
+                t = start + seconds * share if seconds > 0 else start
+                if share >= at and lo <= t <= hi and (seconds <= 0 or t <= max(end, start)):
+                    out.append(w)
+        return out
+
+    def playing_ms(self, now: float | None = None) -> float:
+        """How far into its clip the sentence playing last has got, in ms (an estimate from its start time)."""
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            if not self.timeline:
+                return 0.0
+            start, _, seconds, _ = self.timeline[-1]
+        return 1000 * max(0.0, min(now - start, seconds) if seconds > 0 else now - start)
+
+    def echoes(self, text: str, now: float | None = None) -> bool:
+        """The words heard so far are the speaker's own: they appear, in order and together, among the words it
+        played in the last ECHO_LAG_S. Narrow on purpose: a one-word "stop" is echo only if "stop" was just played,
+        not if it was said anywhere in the last 45 s (strip()'s memory)."""
+        heard = words_of(text)
+        if not heard:
+            return False
+        played = self.playing_words(now)
+        n = len(heard)
+        return any(played[i:i + n] == heard for i in range(len(played) - n + 1))
 
     def strip(self, text: str, overlapped: bool) -> str:
         """`text` without the runs that repeat recent speech; '' when it is mostly echo. Only an utterance that

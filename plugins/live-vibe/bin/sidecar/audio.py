@@ -19,8 +19,8 @@ from typing import Any, AsyncIterator, Callable, Protocol
 
 import numpy as np
 
-from .echo import EchoCanceller, EchoGuard, EchoReference, make_canceller, stream_time
-from .protocol import log, warn
+from .echo import EchoCanceller, EchoGuard, EchoReference, make_canceller, stream_time, words_of
+from .protocol import file_log, log, warn
 
 SR = 16_000  # mic sample rate
 FRAME = 512  # 32 ms at 16 kHz, the chunk Silero v5 expects
@@ -135,6 +135,72 @@ class Tuning:
     max_utterance_s: float = 30.0
     eot_drain_ms: int = 400  # Kyutai: no new word piece for this long before a semantic end of turn, so the
     # pieces that trail the audio (~0.5 s) land in the same utterance
+    barge_in_words: int = 1  # words over the assistant that cut it, when the echo guard can judge them (BargeGate);
+    # 3 restores the old rule everywhere
+    backchannel_quiet_ms: int = 560  # a barge-in that is only backchannel words ends after this long without a
+    # new word, so the paused voice can resume (Kyutai's text trails the audio by ~0.5 s)
+
+
+BARGE_FALLBACK_WORDS = 3  # without a working echo canceller, a cut needs this many words: bleed and "mm-hm" stay out
+BACKCHANNEL_WINDOW_S = 1.2  # a barge-in whose utterance ends this soon after the pause, as backchannel only, resumes
+# Listening sounds that do not take the turn. Whole utterances only: "okay, stop" is not one. Not "yes" or "no":
+# those answer a question.
+BACKCHANNELS = frozenset(("mm", "mmm", "hm", "hmm", "mhm", "mmhm", "mmhmm", "uh", "huh", "uhhuh", "yeah", "yep", "yup",
+                          "okay", "ok", "right", "sure", "alright", "got it", "i see"))
+
+
+def is_backchannel(text: str) -> bool:
+    """`text` is only listening sounds ("Mm-hm.", "Uh-huh, okay.", "Got it."): every word, or pair of words, is one
+    of BACKCHANNELS."""
+    words = words_of(text.replace("-", " "))
+    i = 0
+    while i < len(words):
+        if " ".join(words[i:i + 2]) in BACKCHANNELS and i + 1 < len(words):
+            i += 2
+        elif words[i] in BACKCHANNELS:
+            i += 1
+        else:
+            return False
+    return bool(words)
+
+
+def barge_log(words: int, at_ms: float, resumed: bool, reason: str) -> None:
+    """One sidecar-log line per barge-in: `reason` is backchannel, speech or echo-ignored."""
+    file_log("INFO", f"barge-in: words={words} at_ms={at_ms:.0f} resumed={'yes' if resumed else 'no'} reason={reason}")
+
+
+class BargeGate:
+    """Whether the words heard so far, while the assistant speaks, cut it. Words the echo guard places in what the
+    speaker just played never cut (logged once per count as echo-ignored). Otherwise barge_in_words words cut, as
+    long as the echo canceller runs with a reference; without one (no AEC3, an unknown speaker) the gate cannot tell
+    the room's echo from the user, so it falls back to BARGE_FALLBACK_WORDS."""
+
+    def __init__(self, tune: Tuning, guard: EchoGuard | None = None):
+        self.need, self.guard = tune.barge_in_words, guard
+        self._echo_logged = 0
+
+    def judging(self) -> bool:
+        return self.guard is not None and self.guard.judging()
+
+    def needed(self) -> int:
+        return self.need if self.judging() else max(self.need, BARGE_FALLBACK_WORDS)
+
+    def decide(self, text: str, n: int | None = None) -> str:
+        """'cut', 'wait' (too few words yet) or 'echo'. `n` is the recognizer's own word count, if it keeps one."""
+        n = len(words_of(text)) if n is None else n
+        if n == 0:
+            return "wait"
+        if self.guard is not None and self.guard.echoes(text):
+            if n > self._echo_logged:
+                self._echo_logged = n
+                at = self.guard.playing_ms()
+                barge_log(n, at, False, "echo-ignored")
+            return "echo"
+        return "cut" if n >= self.needed() else "wait"
+
+    def reset(self) -> None:
+        """A new user turn."""
+        self._echo_logged = 0
 
 
 class Detector(Protocol):
@@ -144,26 +210,59 @@ class Detector(Protocol):
 
 
 class TurnDetector:
-    """Feeds VAD frame by frame and returns ('speech_start', p) / ('utterance', audio) / ('discard', None)."""
+    """Feeds VAD frame by frame and returns ('speech_start', p) / ('utterance', audio) / ('discard', None).
 
-    def __init__(self, vad, tune: Tuning, assistant_speaking: Callable[[], bool]):
+    While the assistant speaks, a turn opens on the stricter barge-in gate (bargein_prob for bargein_frames). With a
+    BargeGate that can judge echo and a transcriber, its speech_start then waits for a word: the audio so far is
+    transcribed at once and every CONFIRM_FRAMES after (at most CONFIRM_TRIES times) until the gate says cut. Without
+    them, speech_start goes at onset, as before. A barge-in of at most BACKCHANNEL_MAX_S of voice that pauses for
+    backchannel_quiet_ms and transcribes as only a backchannel ends there, so the paused voice can resume."""
+
+    CONFIRM_FRAMES = 10  # 320 ms of new audio between two partial transcriptions
+    CONFIRM_TRIES = 8
+    BACKCHANNEL_MAX_S = 1.5
+
+    def __init__(self, vad, tune: Tuning, assistant_speaking: Callable[[], bool], gate: BargeGate | None = None,
+                 transcribe: Callable[[Any], str] | None = None):
         self.vad, self.t, self.speaking = vad, tune, assistant_speaking
+        self.gate, self.transcribe = gate, transcribe
         ms_per_frame = 1000 * FRAME / SR
         self.end_frames = int(tune.end_silence_ms / ms_per_frame)
         self.min_frames = int(tune.min_speech_ms / ms_per_frame)
         self.max_frames = int(tune.max_utterance_s * SR / FRAME)
+        self.quiet_frames = max(1, int(tune.backchannel_quiet_ms / ms_per_frame))
+        self.backchannel_frames = int(self.BACKCHANNEL_MAX_S * SR / FRAME)
         self.pre: collections.deque = collections.deque(maxlen=int(tune.pre_roll_ms / ms_per_frame))
         self.active = False
         self.buf: list[np.ndarray] = []
         self.run = 0
         self.silence = 0
+        self.barged = False  # this turn opened while the assistant spoke
+        self.confirming = False  # its speech_start waits for a word
+        self.tries = self.since = 0
+        self.quiet_checked = False  # this pause was already transcribed for a backchannel
+
+    def _text(self) -> str:
+        try:
+            return self.transcribe(np.concatenate(self.buf)) if self.transcribe is not None and self.buf else ""
+        except Exception as e:  # noqa: BLE001 - a failed partial transcription only delays the cut
+            log(f"turn detector: partial transcription failed: {type(e).__name__}: {e}")
+            return ""
+
+    def _confirm(self, p: float) -> list[tuple[str, Any]]:
+        self.tries, self.since = self.tries + 1, 0
+        if self.gate is not None and self.gate.decide(self._text()) == "cut":
+            self.confirming = False
+            return [("speech_start", p)]
+        return []
 
     def feed(self, frame: np.ndarray) -> list[tuple[str, Any]]:
         p = self.vad(frame)
         events: list[tuple[str, Any]] = []
         if not self.active:
             self.pre.append(frame)
-            if self.speaking():
+            speaking = self.speaking()
+            if speaking:
                 need_p, need_n = self.t.bargein_prob, self.t.bargein_frames
             else:
                 need_p, need_n = self.t.start_prob, self.t.start_frames
@@ -171,17 +270,37 @@ class TurnDetector:
             if self.run >= need_n:
                 self.active, self.run, self.silence = True, 0, 0
                 self.buf = list(self.pre)
-                events.append(("speech_start", p))
-        else:
-            self.buf.append(frame)
-            self.silence = self.silence + 1 if p < self.t.end_prob else 0
-            if self.silence >= self.end_frames or len(self.buf) >= self.max_frames:
-                audio = np.concatenate(self.buf)
-                voiced = len(self.buf) - self.silence
-                self.active, self.buf = False, []
-                self.pre.clear()
-                self.vad.reset()
-                events.append(("utterance", audio) if voiced >= self.min_frames else ("discard", None))
+                self.barged, self.quiet_checked = speaking, False
+                self.confirming = (speaking and self.gate is not None and self.transcribe is not None
+                                   and self.gate.judging())
+                if self.confirming:
+                    self.gate.reset()  # type: ignore[union-attr]
+                    self.tries = 0
+                    events += self._confirm(p)
+                else:
+                    events.append(("speech_start", p))
+            return events
+        self.buf.append(frame)
+        self.silence = self.silence + 1 if p < self.t.end_prob else 0
+        if self.silence == 0:
+            self.quiet_checked = False
+        if self.confirming:
+            self.since += 1
+            if self.since >= self.CONFIRM_FRAMES and self.tries < self.CONFIRM_TRIES:
+                events += self._confirm(p)
+        voiced = len(self.buf) - self.silence
+        backchannel = (self.barged and not self.confirming and self.transcribe is not None
+                       and not self.quiet_checked and self.silence >= self.quiet_frames
+                       and voiced <= self.backchannel_frames)
+        if backchannel:
+            self.quiet_checked = True
+            backchannel = is_backchannel(self._text())
+        if backchannel or self.silence >= self.end_frames or len(self.buf) >= self.max_frames:
+            audio = np.concatenate(self.buf)
+            self.active, self.buf, self.confirming = False, [], False
+            self.pre.clear()
+            self.vad.reset()
+            events.append(("utterance", audio) if voiced >= self.min_frames else ("discard", None))
         return events
 
 
@@ -258,6 +377,9 @@ class Listener:
             self.detector, transcribe = self.build()
             if self.aec:
                 self.canceller = make_canceller(True)
+            if self.guard is not None:  # what lets the barge-in gate trust one word (BargeGate)
+                self.guard.judging = lambda: (self.canceller is not None and not self.canceller.failed
+                                              and self.reference is not None)
         except BaseException as e:  # noqa: BLE001 - reported by main
             self.error = e
             return
@@ -485,15 +607,63 @@ async def aiter_list(items: list[str]) -> AsyncIterator[str]:
         yield s
 
 
+def heard_upto(text: str, played: int, total: int) -> str:
+    """What of a sentence was heard when its clip stopped `played` samples in: the words wholly inside the played
+    share of its characters (Kokoro renders one clip per sentence, so the share of samples stands in for the share
+    of text), then '...'. Never a part word."""
+    if played >= total:
+        return text
+    limit = len(text) * played / max(1, total)
+    end = 0
+    for m in re.finditer(r"\S+", text):
+        if m.end() > limit:
+            break
+        end = m.end()
+    return text[:end].rstrip(" ,;:-") + "..."
+
+
 class Voice:
     """Speaks a stream of sentences: synthesis runs one sentence ahead of playback, so the next sentence is ready
     when the current one ends. Cancelling the task that awaits speak() cuts playback at once and still records
-    the part that was heard (play() is waited for before anything is committed)."""
+    the part that was heard (play() is waited for before anything is committed).
+
+    A barge-in pauses instead (pause()): the sound stops at once, the place in the clip is kept, and nothing more
+    plays until resume() replays the rest of the clip from that sample, or the speak() is cancelled, which makes
+    the pause the cut."""
 
     def __init__(self, tts, player: Player, speaking: threading.Event, guard: EchoGuard | None = None):
         self.tts, self.player = tts, player
         self.speaking = speaking  # set from the first sentence until speak() ends: the barge-in gate reads it
         self.guard = guard  # remembers each sentence as it starts, so its echo can be told from the user
+        self._cancel: threading.Event | None = None  # the running speak()'s
+        self._hold: asyncio.Future[bool] | None = None  # a pause: True resumes, False cuts
+        self.paused_ms = 0.0  # where in its clip the last pause stopped the sound
+
+    @property
+    def paused(self) -> bool:
+        return self._hold is not None and not self._hold.done()
+
+    def pause(self) -> bool:
+        """Stops the sound now and holds the place. False when nothing has played in this speak() yet (nothing to
+        pause: a cut is a cut)."""
+        if self._cancel is None or not self.speaking.is_set():
+            return False
+        if not self.paused:
+            self._hold = asyncio.get_running_loop().create_future()
+            self.paused_ms = 0.0  # until play() reports where the clip stopped
+        self._cancel.set()
+        return True
+
+    def resume(self) -> bool:
+        """Plays on from where the pause stopped. False when no pause is held (it became a cut)."""
+        if not self.paused:
+            return False
+        self._hold.set_result(True)  # type: ignore[union-attr]
+        return True
+
+    def _release(self) -> None:
+        if self.paused:
+            self._hold.set_result(False)  # type: ignore[union-attr]
 
     async def _synth(self, text: str) -> np.ndarray | None:
         try:
@@ -504,26 +674,43 @@ class Voice:
 
     async def speak(self, sentences: AsyncIterator[str], heard: list[str],
                     on_play: Callable[[], None] = lambda: None) -> bool:
-        """Plays every sentence; appends each one heard (a cut one in proportion, ending '...') to `heard`, and
-        calls `on_play` as each starts. Returns True when playback stopped early; raises CancelledError when
-        cancelled."""
+        """Plays every sentence; appends each one heard (a cut one up to its last whole word heard, ending '...')
+        to `heard`, and calls `on_play` as each starts. Returns True when playback stopped early; raises
+        CancelledError when cancelled."""
         cancel = threading.Event()
+        self._cancel = cancel
         ready: asyncio.Queue[tuple[str, np.ndarray] | None] = asyncio.Queue(maxsize=1)
         cut = False
+        rate = getattr(self.tts, "sample_rate", 0) or 1
 
         async def play() -> None:
             nonlocal cut
             while (item := await ready.get()) is not None:
                 text, audio = item
-                self.speaking.set()
-                if self.guard is not None:
-                    self.guard.spoke(text)
-                on_play()
-                played = await asyncio.to_thread(self.player.play, audio, cancel)
-                if played < len(audio):
-                    heard.append(text[: int(len(text) * played / max(1, len(audio)))].rstrip() + "...")
-                    cut = True
-                    return
+                pos = 0
+                while pos < len(audio):
+                    if (hold := self._hold) is not None:
+                        self.paused_ms = pos * 1000 / rate
+                        resumed = await hold
+                        if self._hold is hold:
+                            self._hold = None
+                        if not resumed:
+                            heard.append(heard_upto(text, pos, len(audio)))
+                            cut = True
+                            return
+                        if self._hold is not None:  # paused again before it played on
+                            continue
+                        cancel.clear()
+                    self.speaking.set()
+                    if self.guard is not None:
+                        self.guard.spoke(text, len(audio) / rate, pos / len(audio))
+                    if pos == 0:
+                        on_play()
+                    pos += await asyncio.to_thread(self.player.play, audio[pos:], cancel)
+                    if pos < len(audio) and self._hold is None:  # cut outright: cancelled, or the player stopped
+                        heard.append(heard_upto(text, pos, len(audio)))
+                        cut = True
+                        return
                 heard.append(text)
 
         playing = asyncio.create_task(play())
@@ -544,11 +731,18 @@ class Voice:
                     if audio is not None and len(audio) and not await hand((s, audio)):
                         break
             await hand(None)
-            await playing
+            # Not `await playing`: cancelling this task would cancel play() with it, and the last sentence's
+            # heard part would be lost; play() records it and ends once the finally below cuts it.
+            await asyncio.wait({playing})
+            playing.result()
         finally:
             if not playing.done():  # cancelled or failed: cut now, but let play() report what was heard
+                self._release()  # a held pause is the cut
                 cancel.set()
                 await asyncio.wait({playing}, timeout=1.0)
                 playing.cancel()
+            self._release()
+            self._hold = None
+            self._cancel = None
             self.speaking.clear()
         return cut
