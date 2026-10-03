@@ -139,6 +139,8 @@ class Tuning:
     # 3 restores the old rule everywhere
     backchannel_quiet_ms: int = 560  # a barge-in that is only backchannel words ends after this long without a
     # new word, so the paused voice can resume (Kyutai's text trails the audio by ~0.5 s)
+    experimental: bool = False  # the experimental voice path (userConfig `experimental`); off is 0.6.4's behaviour
+    backchannels: bool = False  # the front's short "mm-hm" during long dictation; only with experimental
 
 
 BARGE_FALLBACK_WORDS = 3  # without a working echo canceller, a cut needs this many words: bleed and "mm-hm" stay out
@@ -664,6 +666,19 @@ class Voice:
     def _release(self) -> None:
         if self.paused:
             self._hold.set_result(False)  # type: ignore[union-attr]
+
+    async def blip(self, text: str, audio: np.ndarray, cancel: threading.Event) -> bool:
+        """Plays one short clip outside any speak(), such as a backchannel while the user talks. It goes through the
+        same player, so the echo reference and the guard's sound tail see it like any other playback, and the guard
+        learns its words. `speaking` stays clear: it is not the assistant's turn, so the user's words go on as their
+        own turn and never count as a barge-in. False, and nothing played, while speak() runs."""
+        if self._cancel is not None or not len(audio):
+            return False
+        rate = getattr(self.tts, "sample_rate", 0) or 1
+        if self.guard is not None:
+            self.guard.spoke(text, len(audio) / rate)
+        await asyncio.to_thread(self.player.play, audio, cancel)
+        return True
 
     async def _synth(self, text: str) -> np.ndarray | None:
         try:
