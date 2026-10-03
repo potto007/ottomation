@@ -26,6 +26,10 @@ Global checks on every fixture:
             answers the question)
   DOUBLED   no turn says "asked" twice
 
+Experimental voice path (0.6.5, `run.py --plain` scores without it): Claude ends each answer with a `Status:` line and
+at most three spoken sentences (RELAY_SECTION_EXPERIMENTAL in register.tsx). with_status() gives each report below the
+lines Claude would add; the front retells those, and the rest of the report joins its history as [agent notes].
+
 Work in session (0.5.3): a fixture whose prior turns delegated or heard a report, or whose turn takes a waiting result,
 runs with the Delegator's work-in-session flag set, as the live session would have it.
 """
@@ -61,6 +65,25 @@ R5 = ("The Windows player is now the default speaker backend in 0.5.1, and all 4
       "pushed yet; it waits for your OK.")
 R6 = ("The `fix/live-vibe-native-rate` branch is local only and made no audible difference. Shall I delete the "
       "branch?")
+# What Claude adds under the experimental relay prompt: the status and the sentences the front retells.
+STATUS = {
+    R1: ("working", "The log worker is still reading the live-vibe logs. I'll pass on its findings when it finishes."),
+    R2: ("done", "The logs from this session show no errors or warnings. Whether the static is gone still needs your "
+                 "ears. Nothing is running in the background."),
+    R4: ("done", "One change targets the static: the Windows-side player in 0.5.0. Nobody has confirmed by ear that "
+                 "the static is gone."),
+    R5: ("done", "The Windows player is now the default speaker backend in 0.5.1, and all 41 session checks pass. "
+                 "Nothing is pushed yet; it waits for your OK."),
+    R6: ("done", "The native-rate branch is local only and made no audible difference. Shall I delete the branch?"),
+}
+
+
+def with_status(report: str) -> str:
+    """The report as Claude ends it under the experimental relay prompt."""
+    status, said = STATUS[report]
+    return f"{report}\n\nStatus: {status}\n{said}"
+
+
 START = ("All right, let's try this again.", "Check the live-vibe logs for errors or warnings.", "Alright, let's go.")
 CONFIRMED = ("Yeah, it sounds perfect. There is no static. It is fixed.", "", "Got it, the static is gone.")
 HELLO = ("Hi there.", "", "Hi! What can I do for you?")

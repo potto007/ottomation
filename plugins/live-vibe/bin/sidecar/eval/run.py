@@ -2,8 +2,11 @@
 Delegator, waiting results, notes) with a silent voice, against an OpenAI-compatible server, and records the speech,
 any announcement that follows the turn, and every emitted delegate and note. See README.md for the procedure.
 
-  run.py run <variant> <out.jsonl> [--ref REF] [--runs 3] [--url http://127.0.0.1:8092] [--only id,id]
-  run.py dry [--ref REF]                       print each fixture's messages; calls no server
+  run.py run <variant> <out.jsonl> [--ref REF] [--runs 3] [--url http://127.0.0.1:8092] [--only id,id] [--plain]
+  run.py dry [--ref REF] [--plain]             print each fixture's messages; calls no server
+
+A ref with the experimental voice path (front.relay_of) runs it, reports ending in their Status lines
+(fixtures.with_status), unless --plain asks for the 0.6.4 path.
   run.py score <a.jsonl> [b.jsonl ...]
 
 --ref picks the sidecar code: "worktree" (default: this checkout's files) or any git ref of this repo (extracted with
@@ -44,7 +47,17 @@ def sidecar_root(ref: str) -> str:
     return str(Path(dest) / BIN.relative_to(repo))
 
 
-def build(front, fx: dict) -> tuple[list[dict], str]:
+def experimental(front, a: argparse.Namespace) -> bool:
+    return hasattr(front, "relay_of") and not a.plain
+
+
+def statused(texts: list[str]) -> list[str]:
+    from fixtures import with_status  # noqa: E402
+
+    return [with_status(t) for t in texts]
+
+
+def build(front, fx: dict, exp: bool = False) -> tuple[list[dict], str]:
     """The history before the turn under test (as that version writes its turns and reports), and its message."""
     order = list(front.LlamaCppBrain.FORMAT["json_schema"]["schema"]["properties"])
 
@@ -57,13 +70,23 @@ def build(front, fx: dict) -> tuple[list[dict], str]:
             return f"{front.EVENT} {' '.join(texts).strip()[:front.EVENT_CHARS]}"
         return front.event_message("\n\n".join(front.report_brief(t) for t in texts))
 
+    def relayed(texts: list[str]) -> list[dict]:
+        r = front.relay_of(statused(texts))
+        return r.messages(front.RETELL_STATUS if r.status else front.RETELL)
+
     history: list[dict] = []
     for p in fx["prior"]:
         if p[0] == "report":
-            history += [{"role": "user", "content": event([p[1]])}, turn("", p[2])]
+            history += [*relayed([p[1]]), turn("", p[2])] if exp else [{"role": "user", "content": event([p[1]])},
+                                                                       turn("", p[2])]
         else:
             history += [{"role": "user", "content": p[0]}, turn(p[1], p[2])]
-    return history, (event(fx["reports"]) if fx["user"] is None else fx["user"])
+    if fx["user"] is not None:
+        return history, fx["user"]
+    if exp:  # an announcement: its notes join the history, the report is the turn's message
+        *notes, message = relayed(fx["reports"])
+        return history + notes, message["content"]
+    return history, event(fx["reports"])
 
 
 class SilentVoice:
@@ -79,8 +102,15 @@ class SilentVoice:
         return False
 
 
-async def announce(front, sess, texts: list[str]) -> str:
+async def announce(front, sess, texts: list[str], exp: bool = False) -> str:
     """What the announcer would say next for these results (FrontSession.background, minus the floor wait)."""
+    if exp:  # the results were put back already carrying their Status lines
+        r = await sess.relay(texts, sess.brain)
+        if r.notes:
+            sess.brain.history.append({"role": "user", "content": front.notes_message(r.notes)})
+        message = front.event_message(r.retold, front.RETELL_STATUS if r.status else front.RETELL)
+        await sess.run_turn(message, is_event=True, report=r.spoken or r.retold)
+        return " ".join(sess.turn_spoken).strip()
     report = "\n\n".join(front.report_brief(t) for t in texts)
     await sess.run_turn(front.event_message(report), is_event=True, report=report)
     return " ".join(sess.turn_spoken).strip()
@@ -92,6 +122,7 @@ async def run(a: argparse.Namespace) -> None:
     from fixtures import F  # noqa: E402
 
     takes_waiting = "waiting" in inspect.signature(front.FrontSession.run_turn).parameters
+    exp = experimental(front, a)
     takes_said = "said" in inspect.signature(front.Delegator.call).parameters
     sink: list[dict] = []
     protocol.capture(sink)
@@ -99,16 +130,30 @@ async def run(a: argparse.Namespace) -> None:
     for fx in F:
         if a.only and fx["id"] not in a.only.split(","):
             continue
-        history, message = build(front, fx)
+        history, message = build(front, fx, exp)
         if a.dry:
-            print(f"== {fx['id']} ({a.variant}) waiting={len(fx['waiting'])} into the turn={takes_waiting}")
+            print(f"== {fx['id']} ({a.variant}) waiting={len(fx['waiting'])} into the turn={takes_waiting} "
+                  f"experimental={exp}")
             for m in history + [{"role": "user", "content": message}]:
                 print(f"  {m['role']}: {m['content'][:130]!r}")
             continue
         for n in range(a.runs):
-            brain = front.LlamaCppBrain(front.FRONT_PROMPT.format(workspace=WORKSPACE), a.url, "")
+            prompt = front.FRONT_PROMPT_EXPERIMENTAL if exp else front.FRONT_PROMPT
+            brain = front.LlamaCppBrain(prompt.format(workspace=WORKSPACE), a.url, "")
             brain.history = [dict(m) for m in history]
-            sess = front.FrontSession(SilentVoice(), lambda: False, brain, None, lambda: None)
+            if exp:
+                from sidecar.audio import Tuning  # noqa: E402
+
+                brain.experimental = True
+                sess = front.FrontSession(SilentVoice(), lambda: False, brain, None, lambda: None,
+                                          Tuning(experimental=True))
+                reports = [k for k, q in enumerate(fx["prior"]) if q[0] == "report"]
+                if reports:  # the last report heard, and the delegations before it, as the session keeps them
+                    k = reports[-1]
+                    sess.tools.status = front.split_status(statused([fx["prior"][k][1]])[0])[0]
+                    sess.tools.status_handed = sum(1 for q in fx["prior"][:k] if q[0] != "report" and q[1])
+            else:
+                sess = front.FrontSession(SilentVoice(), lambda: False, brain, None, lambda: None)
             sess.question_open = bool(fx.get("question_open"))
             # work in session, as the live session would have it: delegations, reports heard, results taken
             sess.tools.handed = sum(1 for q in fx["prior"] if q[0] != "report" and q[1])
@@ -116,11 +161,14 @@ async def run(a: argparse.Namespace) -> None:
             for said, request in fx.get("sent", []):
                 sess.tools.sent.append((time.monotonic(), f"{said} {request}" if takes_said else request))
             sink.clear()
-            if fx["user"] is None:
+            if fx["user"] is None and exp:
+                r = await sess.relay(statused(fx["reports"]), brain)
+                await sess.run_turn(message, is_event=True, report=r.spoken or r.retold)
+            elif fx["user"] is None:
                 report = "\n\n".join(front.report_brief(t) for t in fx["reports"])
                 await sess.run_turn(message, is_event=True, report=report)
             elif takes_waiting:
-                await sess.run_turn(message, waiting=list(fx["waiting"]))
+                await sess.run_turn(message, waiting=statused(fx["waiting"]) if exp else list(fx["waiting"]))
             else:
                 await sess.run_turn(message)
             spoken = " ".join(sess.turn_spoken).strip()
@@ -130,7 +178,7 @@ async def run(a: argparse.Namespace) -> None:
             later = sess.take_results() if hasattr(sess, "take_results") else []
             if not takes_waiting and fx["user"] is not None:
                 later = list(fx["waiting"])
-            announced = await announce(front, sess, later) if later else ""
+            announced = await announce(front, sess, later, exp) if later else ""
             await brain.aclose()
             delegates = [o for o in turn_sink if o.get("type") == "delegate"]
             notes = [o for o in turn_sink if o.get("type") == "note"]
@@ -259,6 +307,7 @@ def main() -> None:
     d = sub.add_parser("dry")
     for p in (r, d):
         p.add_argument("--ref", default="worktree")
+        p.add_argument("--plain", action="store_true", help="the 0.6.4 relay, even where the experimental one exists")
         p.add_argument("--runs", type=int, default=3)
         p.add_argument("--url", default="http://127.0.0.1:8092")
         p.add_argument("--only", default="")

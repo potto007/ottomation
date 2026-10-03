@@ -40,6 +40,10 @@ MODEL=~/.cache/duplex_voice/models/unsloth__Qwen3-4B-Instruct-2507-GGUF/Qwen3-4B
 kill "$(cat /tmp/live-vibe-relay-eval/launch_front.pid)"; nvidia-smi --query-gpu=memory.used,memory.free --format=csv
 ```
 
+A ref with the experimental voice path (0.6.5 on) runs it: each report ends in the `Status:` line and spoken sentences
+Claude adds under the experimental relay prompt (`fixtures.with_status`), the front retells those, and the rest joins
+its history as `[agent notes]`. `--plain` on `run` or `dry` scores the 0.6.4 relay instead.
+
 `relay_eval.sh <gguf | url> <label> [runs] [ref ...]`: each ref is `worktree` (this checkout) or a git ref, so one
 server scores several versions side by side (`c70cc29` is 0.5.0, before the relay fixes). A URL in place of the GGUF
 uses a server that is already running, e.g. `http://172.19.144.1:8090`.
