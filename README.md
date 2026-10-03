@@ -8,12 +8,6 @@ to Claude Code:
 - `/livevibe` lets you talk with a small, fast voice model that hands real work to Claude in vibe mode and tells you
   the result.
 
-## Demo
-
-A short clip of `/livevibe` is coming. Until then,
-[What live vibe prints](plugins/live-vibe/README.md#what-live-vibe-prints) shows the lines a session prints around
-Claude's answers. The recording recipe is in [docs/demo](docs/demo/README.md).
-
 ## Install
 
 ```
