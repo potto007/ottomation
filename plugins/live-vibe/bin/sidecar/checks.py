@@ -27,12 +27,14 @@ import numpy as np
 from . import gpu, protocol
 from .checks_front_server import front_server_units
 from .checks_winplayer import winplayer_units
-from .audio import FRAME, SR, CannotStart, Player, check_devices, SentenceSplitter, Tuning, TurnDetector, Voice, speakable
+from .audio import (FRAME, SR, BargeGate, CannotStart, Player, check_devices, SentenceSplitter, Tuning, TurnDetector, Voice,
+                    heard_upto, is_backchannel, speakable)
 from .echo import EchoCanceller, EchoGuard, EchoReference
 from .front import (ACK, EVENT, EVENT_CHARS, FRAGMENT_HOLD_S, HISTORY_MAX, HOLD, INTERRUPTED, RELAY_CHARS, RETELL,
                     WAITING, _FALLBACKS, _NO_EFFORT, Brain, Delegator, FrontSession, LlamaCppBrain, RelayCap,
                     SpeechFilter, TurnStream, acknowledgement, event_message, held_answer, is_turn_start,
-                    looks_unfinished, make_brain, parse_sse, report_brief, retellable, spoken_model, warm_up)
+                    looks_unfinished, make_brain, parse_sse, report_brief, retellable, spoken_model, spoken_upto,
+                    warm_up)
 from .session import LiveSession
 from .speech import BARGE_IN_WORDS, KYUTAI_BLOCK, KYUTAI_SR, KyutaiTurns, Pauses, SilentTTS, check_tts, turn_tail
 
@@ -625,6 +627,183 @@ def report_units(check: Checker) -> None:
           f"event message: the report quoted, then the retell reminder, so its question is not the last word {msg!r}")
 
 
+BARGE_LINE = re.compile(r"^INFO barge-in: words=\d+ at_ms=\d+ resumed=(yes|no) reason=(backchannel|speech|echo-ignored)$")
+
+
+def judging_guard(text: str = "", ago: float = 1.0, seconds: float = 2.0) -> EchoGuard:
+    """An echo guard whose canceller runs (so one word can cut) and that has been playing `text`, `seconds` long,
+    since `ago` seconds back."""
+    g = EchoGuard(lambda: True)
+    g.judging = lambda: True
+    if text:
+        g.spoke(text, seconds)
+        start, words, secs, at = g.timeline[-1]
+        g.timeline[-1] = (start - ago, words, secs, at)
+    return g
+
+
+class RampTTS:
+    """One second per sentence whose samples count up from 0, so a replayed clip's first sample says where it
+    picked up."""
+
+    sample_rate = 16_000
+
+    def synth(self, text: str) -> np.ndarray:
+        return np.arange(self.sample_rate, dtype=np.float32)
+
+
+class RecordingPlayer(Player):
+    """The silent real-time player, recording (first sample, length, samples played) per play()."""
+
+    def __init__(self) -> None:
+        super().__init__(None, RampTTS.sample_rate)
+        self.calls: list[tuple[int, int, int]] = []
+
+    def play(self, audio, cancel) -> int:
+        n = super().play(audio, cancel)
+        self.calls.append((int(audio[0]) if len(audio) else -1, len(audio), n))
+        return n
+
+
+async def barge_sessions(check: Checker, logs: list[str]) -> None:
+    """(c) "mm-hm" pauses, then resumes at the cut sample, and is no prompt; (d) "mm-hm, wait, stop" makes the
+    pause the cut, heard up to a whole word; (g) one log line each."""
+    out: list[dict[str, Any]] = []
+    protocol.capture(out)
+    sentence = "The cache is rebuilt and the tests pass now."
+    try:
+        for said, resumes in (("Mm-hm.", True), ("Mm-hm, wait, stop.", False)):
+            out.clear()
+            logs.clear()
+            player = RecordingPlayer()
+            voice = Voice(RampTTS(), player, threading.Event())
+            live = LiveSession(voice, lambda: False)
+            running = asyncio.create_task(live.run())
+            live.speak_q.put_nowait(sentence)
+            await until(lambda: voice.speaking.is_set())
+            await asyncio.sleep(0.4)
+            t = time.monotonic()
+            live.post("speech_start", 1.0)
+            paused = await until(lambda: voice.paused and player.calls, 2)
+            took = time.monotonic() - t
+            live.post("transcribing", None)
+            live.post("utterance", said)
+            await until(lambda: [o for o in out if o["type"] == "spoken"], 5)
+            kinds = [o["type"] for o in out]
+            spoken = next((o for o in out if o["type"] == "spoken"), {})
+            first = player.calls[0] if player.calls else (0, 0, 0)
+            if resumes:
+                check(paused and took < 0.2 and len(player.calls) == 2 and player.calls[1][0] == first[2] > 0
+                      and player.calls[1][1] == RampTTS.sample_rate - first[2]
+                      and spoken == {"type": "spoken", "text": sentence, "cut": False}
+                      and "utterance" not in kinds and "barge_in" not in kinds
+                      and {"type": "note", "said": said, "backchannel": True} in out,
+                      f"barge-in: 'mm-hm' pauses at once ({took * 1000:.0f} ms), resumes from sample {first[2]} of "
+                      f"the clip, and is a note, not a prompt {player.calls} {kinds}")
+                check(len(logs) == 1 and BARGE_LINE.match(logs[0]) and " resumed=yes reason=backchannel" in logs[0]
+                      and f"at_ms={first[2] * 1000 // RampTTS.sample_rate} " in logs[0] and "words=2 " in logs[0],
+                      f"barge-in log: one line with the played ms of the clip, resumed {logs}")
+            else:
+                text = spoken.get("text", "")
+                check(paused and spoken.get("cut") is True and "barge_in" in kinds
+                      and {"type": "utterance", "text": said} in out and len(player.calls) == 1
+                      and text.endswith("...") and sentence.startswith(text[:-3]) and len(text) > 3
+                      and text == heard_upto(sentence, first[2], RampTTS.sample_rate),
+                      f"barge-in: 'mm-hm, wait, stop' makes the pause the cut, heard up to a whole word {text!r} "
+                      f"{kinds}")
+                check(len(logs) == 1 and BARGE_LINE.match(logs[0]) and " resumed=no reason=speech" in logs[0]
+                      and "words=4 " in logs[0], f"barge-in log: the cut, as speech {logs}")
+            live.stop()
+            await until(running.done, 3)
+    finally:
+        protocol.capture(None)
+
+
+def barge_units(check: Checker) -> None:
+    """Barge-in on the first real word: the gate, the echo guard's say, the backchannel end, the Whisper path, the
+    pause and resume through a session, the heard boundary and the log line."""
+    from . import audio, speech
+
+    logs: list[str] = []
+    sink = (audio, "file_log", lambda level, text: logs.append(f"{level} {text}"))
+    pad = [(None, 0.0)] * 2
+    block = np.zeros(KYUTAI_BLOCK * SR // KYUTAI_SR, np.float32)
+
+    # (a) one word over the voice cuts on the step it arrives, when the canceller runs
+    turns = KyutaiTurns(FakeKyutai(pad + [("▁stop", 0.0)] + [(None, 0.9)] * 12), Tuning(end_silence_ms=3000),
+                        lambda: True, BargeGate(Tuning(), judging_guard()))
+    ev = [(i, k, v) for i in range(16) for k, v in turns.feed(block)]
+    check(ev[:1] and ev[0][:2] == (2, "speech_start"), f"barge-in: one real word cuts on the step it arrives {ev[:1]}")
+
+    # (b) a word the speaker just played does not cut, and the log says so; the user's next word does
+    g = judging_guard("Let me check the parser now.")
+    turns = KyutaiTurns(FakeKyutai(pad + [("▁check", 0.0), (None, 0.0), ("▁stop", 0.0)]), Tuning(end_silence_ms=3000),
+                        lambda: True, BargeGate(Tuning(), g))
+    with patched(sink):
+        ev = [(i, k, v) for i in range(8) for k, v in turns.feed(block)]
+    at = re.search(r"at_ms=(\d+)", logs[0]) if logs else None
+    check([(i, k) for i, k, _ in ev][:1] == [(4, "speech_start")] and len(logs) == 1 and BARGE_LINE.match(logs[0])
+          and "words=1 " in logs[0] and "resumed=no reason=echo-ignored" in logs[0]
+          and at is not None and 900 <= int(at.group(1)) <= 1300,
+          f"barge-in: a word the speaker just played is echo, ignored and logged; the next word cuts {ev} {logs}")
+    check(g.echoes("check") and g.echoes("me check") and not g.echoes("stop") and not g.echoes("parser")
+          and not g.echoes("check me"), f"echo guard: only words just played, in order, are echo {g.playing_words()}")
+
+    # (e) barge_in_words=3 is the old rule; a gate without a running canceller falls back to it
+    script = pad + [("▁wait", 0.0), ("▁a", 0.0), ("▁moment", 0.0)] + [(None, 0.0)] * 4
+    three = KyutaiTurns(FakeKyutai(script), Tuning(end_silence_ms=3000), lambda: True,
+                        BargeGate(Tuning(barge_in_words=3), judging_guard()))
+    blind = KyutaiTurns(FakeKyutai(script), Tuning(end_silence_ms=3000), lambda: True,
+                        BargeGate(Tuning(), EchoGuard(lambda: True)))
+    ev3 = [(i, k) for i in range(9) for k, _ in three.feed(block)]
+    evb = [(i, k) for i in range(9) for k, _ in blind.feed(block)]
+    check(ev3[:1] == [(4, "speech_start")] and evb[:1] == [(4, "speech_start")]
+          and BargeGate(Tuning(), EchoGuard(lambda: True)).needed() == 3,
+          f"barge-in: barge_in_words=3 waits for the third word, as does a gate without a canceller {ev3} {evb}")
+
+    # a backchannel that cut ends after backchannel_quiet_ms, so the voice can resume in time
+    ends: list[str] = []
+    turns = KyutaiTurns(FakeKyutai(pad + [("▁Mm", 0.0), ("-", 0.0), ("hm", 0.0), (".", 0.0)] + [(None, 0.0)] * 12),
+                        Tuning(end_silence_ms=3000), lambda: True, BargeGate(Tuning(), judging_guard()))
+    with patched((speech, "file_log", lambda level, text: ends.append(text))):
+        ev = [(i, k, v) for i in range(20) for k, v in turns.feed(block)]
+    check([k for _, k, _ in ev] == ["speech_start", "utterance"] and ev[1][2] == "Mm-hm." and ev[1][0] == 5 + 7
+          and "trigger=backchannel" in ends[-1],
+          f"kyutai turns: a backchannel over the voice ends after {Tuning().backchannel_quiet_ms} ms quiet {ev} {ends}")
+
+    # the Whisper path: the onset waits for a word, then cuts; a backchannel ends at its first pause
+    said = {"text": ""}
+    det = TurnDetector(ScriptedVAD([0.9] * 30 + [0.0] * 40), Tuning(end_silence_ms=3000), lambda: True,
+                       BargeGate(Tuning(), judging_guard()), lambda audio_: said["text"])
+    ev = []
+    for i in range(70):
+        if i == 15:
+            said["text"] = "Stop."
+        ev += [(i, k) for k, _ in det.feed(np.zeros(FRAME, np.float32))]
+    check(ev[:1] == [(17, "speech_start")], f"turn detector: over the voice, the onset waits for a word {ev}")
+    said["text"] = "Mm-hmm."
+    det = TurnDetector(ScriptedVAD([0.9] * 14 + [0.0] * 40), Tuning(end_silence_ms=3000), lambda: True,
+                       BargeGate(Tuning(), judging_guard()), lambda audio_: said["text"])
+    ev = [(i, k) for i in range(54) for k, _ in det.feed(np.zeros(FRAME, np.float32))]
+    check(ev == [(7, "speech_start"), (30, "utterance")],
+          f"turn detector: a backchannel over the voice ends at its first {Tuning().backchannel_quiet_ms} ms pause {ev}")
+
+    # (f) the heard boundary, at a whole word
+    text = "The cache is rebuilt and the tests pass."
+    got = (heard_upto(text, 50, 100), heard_upto(text, 49, 100), heard_upto(text, 0, 100), heard_upto(text, 100, 100),
+           spoken_upto("one two three four five six seven eight nine ten eleven twelve thirteen..."))
+    check(got == ("The cache is rebuilt...", "The cache is...", "...", text,
+                  "two three four five six seven eight nine ten eleven twelve thirteen"),
+          f"heard: a cut sentence up to its last whole word in the played share; spoken up to: the last words {got}")
+    check(is_backchannel("Mm-hm.") and is_backchannel("Uh-huh, okay.") and is_backchannel("Got it.")
+          and not is_backchannel("Mm-hm, wait, stop.") and not is_backchannel("yes") and not is_backchannel("")
+          and not is_backchannel("it"), "backchannel: listening sounds only, the whole utterance")
+
+    # (c), (d), (g) through a session and the player
+    with patched(sink):
+        asyncio.run(barge_sessions(check, logs))
+
+
 def units() -> int:
     check = Checker()
 
@@ -672,6 +851,7 @@ def units() -> int:
           f"kyutai turns: 3000 ms without a word caps the turn while the model is unsure {ev}")
     kyutai_end_of_turn(check)
     kyutai_silence_tiers(check)
+    barge_units(check)
 
     check(spoken_model(SWITCH, "Okay, switch to Sonnet.") == "sonnet" and spoken_model(SWITCH, "Use opus to review this.") is None,
           "spoken switch: the mod's pattern over the mod's normalization")
@@ -1410,8 +1590,11 @@ async def selftest_sessions(check: Checker) -> None:
     utter("slow work please")
     await until(lambda: sess.state == "speaking", 5)
     await asyncio.sleep(0.2)
-    sess.post("speech_start", 1.0)  # barge in while "on it" is spoken, before the delegate field has streamed
-    await turn_done()
+    from . import session as session_mod
+
+    with patched((session_mod, "BACKCHANNEL_WINDOW_S", 0.0)):  # the pause is the cut at once, as a long barge-in's
+        sess.post("speech_start", 1.0)  # barge in while "on it" is spoken, before the delegate field has streamed
+        await turn_done()
     cut_early = not emitted("delegate")
     await until(lambda: emitted("delegate"), 5)
     asked = next(i for i, m in enumerate(brain.history) if m["content"] == f"{INTERRUPTED} slow work please"
