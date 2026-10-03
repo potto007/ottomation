@@ -45,7 +45,7 @@ Live voice is ON. The user is speaking, and your final answer of each turn is re
 
 // In live vibe the user talks to a small voice model; Claude's answers reach them only through its summary.
 const RELAY_SECTION = `<live-vibe-relay>
-Live vibe is ON. The user is talking to a voice front, a small fast model that hands their spoken requests to you and relays your final answer of each turn back to them, summarized in one or two spoken sentences. End every turn with a concise plain-text report the front can summarize: what you did, what you found or changed, whether it is verified, and whether work is still running in the background (workers spawned, results pending). No spoken style needed, but lead with the outcome and leave out long listings unless asked. A bracketed note such as "[The user, by voice, adds ...]" is a live addition to act on at once.
+Live vibe is ON. The user is talking to a voice front, a small fast model that hands their spoken requests to you and relays your final answer of each turn back to them, summarized in one or two spoken sentences. End every turn with a concise plain-text report the front can summarize: what you did, what you found or changed, whether it is verified, and whether work is still running in the background (workers spawned, results pending). No spoken style needed, but lead with the outcome and leave out long listings unless asked. A bracketed note such as "[The user, by voice, adds ...]" is a live addition to act on at once. A request that starts "User said:" quotes the user's own words, then the front's reading of them; where they differ, go by the user's words. A note "[The user, by voice, to the voice front (no task asked): ...]" is information, such as a confirmation, a correction or a decision: take it as fact from the user in your next answer; it needs no reply of its own.
 </live-vibe-relay>`
 
 // A whole utterance that only asks for another model ("switch to sonnet", "change the model to opus please", "use haiku").
@@ -140,6 +140,22 @@ async function onSidecar($: EngineInterface, msg: Record<string, unknown>) {
       }
       await toClaude($, `User said: "${said}"\nThe voice front read it as: ${text}`,
         `[The user, by voice, adds while you work: "${said}". The voice front read it as: ${text}. Take it into account now.]`)
+      break
+    }
+    // A user turn the front answered itself: a confirmation, a correction or a decision is still Claude's to know.
+    // It joins the conversation without starting a turn; a reply to the question Claude's last answer asked is a prompt.
+    case 'note': {
+      const said = typeof msg.said === 'string' ? msg.said.trim() : ''
+      if (!said) break
+      const reply = typeof msg.reply === 'string' && msg.reply.trim() ? ` (the voice front answered: "${msg.reply.trim()}")` : ''
+      if (msg.answer === true) {
+        await toClaude($, `User said, answering your last question: "${said}"`,
+          `[The user, by voice, answers your last question: "${said}"${reply}. Take it into account now.]`)
+        break
+      }
+      await $.session.append({ message: { type: 'user', content: [{
+        type: 'text', text: `[The user, by voice, to the voice front (no task asked): "${said}"${reply}]`,
+      }] } })
       break
     }
     case 'switch_model':

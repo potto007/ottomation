@@ -717,6 +717,7 @@ class FrontSession(Duplex):
         self.results: asyncio.Queue[str] = asyncio.Queue(maxsize=RESULTS_MAX)
         self.turn: asyncio.Task | None = None
         self.turn_spoken: list[str] = []
+        self.question_open = False  # the last announced report asked the user something
 
     def routes(self) -> dict[str, Route]:
         def event(body: str) -> bool:
@@ -787,6 +788,7 @@ class FrontSession(Duplex):
             return await self.front_down(report or user_text, is_event)
         self.turn_spoken = []
         failed: list[Exception] = []
+        handed = self.tools.handed
         if waiting:
             log(f"front: {len(waiting)} waiting result(s) go into the user's turn, not a separate announcement")
             brain.history.extend({"role": "user", "content": event_message(report_brief(t), WAITING)} for t in waiting)
@@ -819,9 +821,21 @@ class FrontSession(Duplex):
                 with contextlib.suppress(asyncio.QueueFull):
                     self.results.put_nowait(t)
             return await self.front_down(report or user_text, is_event)
+        if not is_event and brain is self.brain:
+            self.pass_on(user_text, said, handed)
         self.settle()
         if not is_event and _GOODBYE.search(user_text.lower()):
             self.goodbye()
+
+    def pass_on(self, user_text: str, said: str, handed: int) -> None:
+        """A user turn that delegated nothing still reaches Claude, as a note: a confirmation ("it sounds perfect, the
+        static is gone"), a correction or a decision is information Claude needs (seen live: said three times, never
+        passed on, while Claude kept saying nobody had confirmed by ear). `answer` marks a reply to a question the last
+        report asked, which the mod hands to Claude as a prompt rather than a note."""
+        answer, self.question_open = self.question_open, False
+        if self.tools.handed != handed:
+            return
+        emit(type="note", said=user_text, reply=said, **({"answer": True} if answer else {}))
 
     async def front_down(self, text: str, is_event: bool) -> None:
         """Without a front model the request still reaches Claude, and Claude's answer is read out (its first two
@@ -845,6 +859,7 @@ class FrontSession(Duplex):
             if len(texts) > 1:
                 log(f"front: {len(texts)} results waited together; announcing them as one")
             report = "\n\n".join(report_brief(t) for t in texts)[:EVENT_CHARS]
+            self.question_open = "?" in report
             self.turn = asyncio.create_task(self.run_turn(event_message(report), is_event=True, report=report))
             await asyncio.wait({self.turn})
 

@@ -707,6 +707,8 @@ def fake_front() -> tuple[str, list[dict[str, Any]]]:
                 deltas = turn("".join(f"Report sentence {i} goes on for a while here. " for i in range(10)))
             elif text.startswith(EVENT):
                 deltas = turn("All the tests pass now.")
+            elif "perfect" in text:
+                deltas = turn("Great, glad it works.")
             elif "what happened" in text:
                 deltas = turn("It finished with no errors.")
             elif "goodbye" in text.lower():
@@ -858,6 +860,7 @@ async def selftest_sessions(check: Checker) -> None:
           and delegated() == "Fix the failing test in parser.py" and "[" not in said(),
           f"front: history keeps the turn as the model answers it, words and delegation apart {brain.history}")
     check([o["role"] for o in emitted("transcript")] == ["user", "front"], "front: transcript, user then front")
+    check(not emitted("note"), "front: a turn that delegates sends no note")
 
     n = len(brain.history)
     utter("Okay, switch to Sonnet.")
@@ -894,6 +897,29 @@ async def selftest_sessions(check: Checker) -> None:
     check(r == 204 and not emitted("delegate") and delegated() == ""
           and any("announces a result" in o["text"] for o in emitted("log")),
           "announcer: a result listing next steps is reported, never re-delegated (no delegation loop)")
+
+    out.clear()
+    utter("It sounds perfect, the static is gone.")
+    await until(lambda: emitted("note"), 5)
+    await turn_done()
+    check(emitted("note") == [{"type": "note", "said": "It sounds perfect, the static is gone.",
+                               "reply": "Great, glad it works."}] and not emitted("delegate"),
+          f"front: a user turn that hands nothing off still reaches Claude as a note {emitted('note')}")
+    n = len(seen)
+    await asyncio.to_thread(post, port, "/event", "The branch is local. Want me to delete it?", token)
+    await until(lambda: len(seen) > n, 5)
+    await turn_done()
+    out.clear()
+    utter("yes, perfect")
+    await until(lambda: emitted("note"), 5)
+    await turn_done()
+    answered = emitted("note")
+    out.clear()
+    utter("still sounds perfect")
+    await until(lambda: emitted("note"), 5)
+    await turn_done()
+    check(answered and answered[0].get("answer") is True and emitted("note") and "answer" not in emitted("note")[0],
+          f"front: the reply to a report's question is marked as its answer, once {answered} {emitted('note')}")
 
     def events_since(n: int) -> list[str]:
         """The [task finished] messages the front was asked to announce since request n."""

@@ -120,6 +120,31 @@ test("live vibe: a delegate carries the user's own words beside the front's read
   sidecar.release()
 })
 
+test('live vibe: a note joins the conversation without a turn; an answer to the last question is a prompt', async ($, on) => {
+  const sidecar = fakeSidecar(4321,
+    '{"type":"note","said":"It sounds perfect. It is fixed.","reply":"Great, the static is gone."}',
+    '{"type":"note","said":"Yes, delete it.","reply":"Okay.","answer":true}')
+  on('process.spawn', sidecar.spawn)
+  on('http.fetch', () => ok)
+  const appended: string[] = []
+  on('session.append', (_$, e) => {
+    const block = e.message.content[0]
+    if (e.door === 'note' && block && 'text' in block) appended.push(String(block.text))
+    return { message: e.message, uuid: e.uuid }
+  })
+  const prompted: string[] = []
+  on('prompt.submit', (_$, e) => { prompted.push(e.text); return { text: e.text } })
+
+  await $.command.run({ command: 'livevibe', ...typed })
+  await sidecar.isUp
+
+  expect(appended).toEqual(['[The user, by voice, to the voice front (no task asked): "It sounds perfect. It is fixed." '
+    + '(the voice front answered: "Great, the static is gone.")]'])
+  expect(prompted).toEqual(['User said, answering your last question: "Yes, delete it."'])
+  await $.command.run({ command: 'livevibe', ...typed })
+  sidecar.release()
+})
+
 test("live vibe: Claude's answer goes to the front's /event, never /speak", async ($, on) => {
   const posts: { url: string; body?: string; token?: string }[] = []
   const sidecar = fakeSidecar(4321)
