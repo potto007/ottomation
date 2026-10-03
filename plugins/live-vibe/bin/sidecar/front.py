@@ -58,7 +58,8 @@ FRONT_PROMPT = (
     "coding agent anyway. If the user asks how things are going, where things stand, or whether something was "
     "received, say only 'Let me check.'; the coding agent answers.\n"
     f"A message starting with {EVENT} quotes a report on earlier work, written in your voice to the user. It is "
-    "not the user talking. Retell it to the user in one to three sentences, starting from its first sentence:\n"
+    "not the user talking. Retell it to the user in one or two short sentences, starting from its first sentence; "
+    "the user can read the full report on screen:\n"
     "- Keep each item's status exactly as the report gives it: started, still running, waiting on the user, "
     "blocked, done or failed. If work is still running, say so. Never call anything done, ready or working unless "
     "the report says so.\n"
@@ -99,8 +100,76 @@ def retellable(report: str) -> bool:
     return bool(re.search(r"\w", _ASIDE.sub("", report)))
 
 
-RETELL = ("(Retell that report to the user in one to three short sentences, with its status as written. If it asks "
-          "a question, end by asking the user that question; do not answer it.)")
+RETELL = ("(Retell that report to the user in one or two short sentences, with its status as written; never read it "
+          "out whole. If it asks a question, end by asking the user that question; do not answer it.)")
+
+RELAY_SENTENCES = 2  # what a retelling speaks at most, whatever the model writes, plus a closing question
+RELAY_CHARS = 280
+
+
+class RelayCap:
+    """Holds a retelling to RELAY_SENTENCES sentences and RELAY_CHARS characters (seen live: Qwen3-4B read Claude's
+    whole answer back, which the screen then showed twice). A question past the cap still ends it: a report's
+    question is the user's to answer. A retelling with nothing speakable falls back to the report's first sentences."""
+
+    def __init__(self, report: str) -> None:
+        self.report = report
+        self.kept: list[str] = []
+        self.chars = 0
+        self.dropped = 0
+        self.question = ""
+
+    def push(self, sentence: str) -> list[str]:
+        """What of this sentence to speak: itself, or nothing once the cap is reached."""
+        if not self.kept or (not self.dropped and len(self.kept) < RELAY_SENTENCES
+                             and self.chars + len(sentence) <= RELAY_CHARS):
+            self.kept.append(sentence)
+            self.chars += len(sentence) + 1
+            return [sentence]
+        self.dropped += 1
+        if sentence.rstrip().endswith("?"):
+            self.question = sentence
+        return []
+
+    def finish(self) -> list[str]:
+        """What to speak after the last sentence: the dropped closing question, or the fallback."""
+        if self.dropped:
+            log(f"front: the retelling ran past {RELAY_SENTENCES} sentences; {self.dropped} not spoken")
+        if not self.kept:
+            return self.fallback()
+        return [self.question] if self.question else []
+
+    def fallback(self) -> list[str]:
+        out: list[str] = []
+        chars = 0
+        for s in split_all(self.report):
+            if out and (len(out) >= RELAY_SENTENCES or chars + len(s) > RELAY_CHARS):
+                break
+            out.append(s)
+            chars += len(s) + 1
+        if out:
+            log("front: the retelling had nothing to say; the report's first sentences are read instead")
+        return out
+
+
+FRAGMENT_HOLD_S = 2.5  # how long an unfinished utterance waits for the rest of the sentence
+FRAGMENT_PIECES = 4  # at most this many pieces are merged into one utterance
+_OPEN_END = re.compile(r"(?:[,;:\-–—]|\.\.\.|…)\s*$")
+_FUNCTION_END = re.compile(
+    r"\b(?:a|an|the|and|or|but|so|to|of|in|on|at|for|with|from|by|about|into|than|then|which|who|whose|when|where|"
+    r"if|because|as|is|are|was|were|be|been|do|does|did|have|has|had|will|would|could|should|can|need|needs|want|"
+    r"wants|i|we|they|he|she|my|our|your|their|its|like|just|also|really|maybe|not|very)$", re.I)
+
+
+def looks_unfinished(text: str) -> bool:
+    """An utterance cut mid-sentence (the recognizer's pause cap ended it): it ends open ("so," "and...") or, with no
+    closing punctuation, on a function word ("Also, we need"). Its rest is usually the next utterance."""
+    t = text.strip()
+    if not t:
+        return False
+    if _OPEN_END.search(t):
+        return True
+    return t[-1] not in ".!?\"')" and bool(_FUNCTION_END.search(t))
 
 
 WAITING = ("(That report came in while the user was talking; their words follow. Use it only if it answers them; if "
@@ -769,6 +838,9 @@ class FrontSession(Duplex):
         self.turn: asyncio.Task | None = None
         self.turn_spoken: list[str] = []
         self.question_open = False  # the last announced report asked the user something
+        self.fragment: list[str] = []  # an unfinished utterance held for its rest (looks_unfinished)
+        self.fragment_due: asyncio.Task | None = None
+        self.fragment_gen = 0
 
     def routes(self) -> dict[str, Route]:
         def event(body: str) -> bool:
@@ -788,29 +860,72 @@ class FrontSession(Duplex):
         return self.turn is not None and not self.turn.done()
 
     def floor_free(self) -> bool:
-        return not (self.user_talking or self.hearing() or self.turn_running())
+        return not (self.user_talking or self.hearing() or self.turn_running() or self.fragment)
 
     async def handle(self, kind: str, payload: Any) -> None:
         if kind == "speech_start":
             self.user_talking = True
+            if self.fragment_due is not None:  # the rest of a held utterance is coming: wait for it
+                self.fragment_due.cancel()
             await self.interrupt()
             self.set_state("user_speaking")
         elif kind == "transcribing":
             self.set_state("transcribing")
         elif kind == "discard":
             self.user_talking = False
+            if self.fragment:
+                self.arm_fragment()
             self.settle()
         elif kind == "utterance":
             self.user_talking = False
             await self.on_utterance(payload)
+        elif kind == "fragment_due" and payload == self.fragment_gen and self.fragment and not self.user_talking:
+            text, self.fragment = " ".join(self.fragment), []
+            log(f"front: nothing followed the unfinished utterance; sending it as it is: {text[:80]!r}")
+            await self.dispatch(text)
+
+    def arm_fragment(self) -> None:
+        """(Re)starts the wait for a held utterance's rest; when it runs out, the held words go on as they are."""
+        if self.fragment_due is not None:
+            self.fragment_due.cancel()
+        self.fragment_gen += 1
+        gen = self.fragment_gen
+
+        async def due() -> None:
+            await asyncio.sleep(FRAGMENT_HOLD_S)
+            self._put(("fragment_due", gen))
+
+        self.fragment_due = asyncio.ensure_future(due())
 
     async def on_utterance(self, text: str) -> None:
-        emit(type="transcript", role="user", text=text)
+        """An utterance that stops mid-sentence (the recognizer's pause cap cut it: "Also, we need") is held up to
+        FRAGMENT_HOLD_S for its rest, and the pieces go on as one: the front never reads half a sentence as a task,
+        and the screen shows the user's words once, whole."""
+        pieces = [*self.fragment, text]
+        self.fragment = []
+        if self.fragment_due is not None:
+            self.fragment_due.cancel()
+            self.fragment_due = None
+        text = " ".join(p.strip() for p in pieces if p.strip())
         model = spoken_model(self.switch, text)
         if model:
+            emit(type="transcript", role="user", text=text)
             emit(type="switch_model", model=model)  # the mod runs /model and posts the result as an event
             self.settle()
             return
+        if len(pieces) < FRAGMENT_PIECES and looks_unfinished(text) and not self.turn_running():
+            self.fragment = [p for p in pieces if p.strip()]
+            self.arm_fragment()
+            log(f"front: holding an unfinished utterance up to {FRAGMENT_HOLD_S:.1f} s for its rest: {text[:80]!r}")
+            self.settle()
+            return
+        if len(pieces) > 1:
+            log(f"front: {len(pieces)} pieces of one sentence go on as one utterance")
+        await self.dispatch(text)
+
+    async def dispatch(self, text: str) -> None:
+        """The user's whole utterance: on screen, then a front turn."""
+        emit(type="transcript", role="user", text=text)
         await self.interrupt()
         waiting = self.take_results() if self.brain is not None else []
         self.turn = asyncio.create_task(self.run_turn(text, waiting=waiting))
@@ -845,20 +960,52 @@ class FrontSession(Duplex):
             log(f"front: {len(waiting)} waiting result(s) go into the user's turn, not a separate announcement")
             brain.history.extend({"role": "user", "content": event_message(report_brief(t), WAITING)} for t in waiting)
 
-        async def sentences() -> AsyncIterator[str]:
+        words: asyncio.Queue[str | None] = asyncio.Queue()
+        written: list[str] = []
+        shown = False
+
+        def show(text: str) -> None:
+            nonlocal shown
+            shown = True
+            if brain is self.brain and text:
+                emit(type="transcript", role="front", text=text, kind=self.front_kind(text, is_event, handed))
+
+        async def produce() -> None:
+            """Reads the model to the end of its reply on a task of its own, so the reply is on screen as soon as it
+            is written while the voice still reads it out (speak() pulls one sentence ahead of playback)."""
             self.tools.announcing = is_event  # a result is reported, never acted on (set when the turn starts)
             splitter = SentenceSplitter()
+            cap = RelayCap(report) if is_event else None
+
+            def put(sentences: list[str]) -> None:
+                for s in sentences:
+                    for t in cap.push(s) if cap else [s]:
+                        written.append(t)
+                        words.put_nowait(t)
+
             try:
-                async with contextlib.aclosing(brain.respond(user_text, self.tools)) as deltas:
-                    async for delta in deltas:
-                        for s in splitter.push(delta):
-                            yield s
-            except Exception as e:  # noqa: BLE001 - connect error, 5xx, a broken stream: the turn ends cleanly
-                failed.append(e)
-            for s in splitter.flush():
+                try:
+                    async with contextlib.aclosing(brain.respond(user_text, self.tools)) as deltas:
+                        async for delta in deltas:
+                            put(splitter.push(delta))
+                except Exception as e:  # noqa: BLE001 - connect error, 5xx, a broken stream: the turn ends cleanly
+                    failed.append(e)
+                put(splitter.flush())
+                if cap is not None and not failed:
+                    for t in cap.finish():
+                        written.append(t)
+                        words.put_nowait(t)
+                if not failed:
+                    show(" ".join(written))
+            finally:
+                words.put_nowait(None)
+
+        async def sentences() -> AsyncIterator[str]:
+            while (s := await words.get()) is not None:
                 yield s
 
         self.set_state("thinking")
+        producer = asyncio.create_task(produce())
         interrupted = True
         cancelled = False
         try:
@@ -867,9 +1014,11 @@ class FrontSession(Duplex):
             cancelled = True
             raise
         finally:
+            if not producer.done():  # cut while the model still writes: closing its reply hands a cut turn on
+                await cancel_and_wait(producer)
             said = brain.commit(" ".join(self.turn_spoken), interrupted)
-            if brain is self.brain and said:
-                emit(type="transcript", role="front", text=said)
+            if not shown and said:  # cut before the reply was whole, or failed: what was heard
+                show(said)
             if not (is_event or failed) and brain is self.brain:  # also when a barge-in cut the reply: the user's
                 self.pass_on(user_text, said, handed)  # words were heard whole, the reply maybe not
             # A barge-in cut the reply: unless two whole sentences of it were heard (most of a retelling), the
@@ -891,6 +1040,15 @@ class FrontSession(Duplex):
         self.settle()
         if not is_event and _GOODBYE.search(user_text.lower()):
             self.goodbye()
+
+    def front_kind(self, text: str, is_event: bool, handed: int) -> str:
+        """What a front line is, for the mod's display: `relay` retells a report of Claude's (shown above it), `filler`
+        is an acknowledgement or a holding line (Claude answers next), `reply` is the front's own answer."""
+        if is_event:
+            return "relay"
+        if self.tools.handed != handed or text.strip() in (HOLD, ACK):
+            return "filler"
+        return "reply"
 
     def requeue(self, texts: list[str]) -> None:
         """Results back to the announcer, ahead of any that arrived since."""
@@ -943,6 +1101,8 @@ class FrontSession(Duplex):
             await asyncio.wait({self.turn})
 
     async def shutdown(self) -> None:
+        if self.fragment_due is not None:
+            self.fragment_due.cancel()
         await cancel_and_wait(self.turn)
         if self.brain is not None:
             with contextlib.suppress(Exception):
