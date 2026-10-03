@@ -106,6 +106,20 @@ test('live vibe: a delegate from the front becomes a prompt when Claude is idle'
   sidecar.release()
 })
 
+test("live vibe: a delegate carries the user's own words beside the front's reading", async ($, on) => {
+  const sidecar = fakeSidecar(4321, '{"type":"delegate","text":"Summarize the log report","said":"So what was the fix?"}')
+  on('process.spawn', sidecar.spawn)
+  on('http.fetch', () => ok)
+  const prompted = new Promise<string>(resolve =>
+    on('prompt.submit', (_$, e) => { resolve(e.text); return { text: e.text } }))
+
+  await $.command.run({ command: 'livevibe', ...typed })
+
+  expect(await prompted).toBe('User said: "So what was the fix?"\nThe voice front read it as: Summarize the log report')
+  await $.command.run({ command: 'livevibe', ...typed })
+  sidecar.release()
+})
+
 test("live vibe: Claude's answer goes to the front's /event, never /speak", async ($, on) => {
   const posts: { url: string; body?: string; token?: string }[] = []
   const sidecar = fakeSidecar(4321)

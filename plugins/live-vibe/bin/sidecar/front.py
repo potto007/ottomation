@@ -104,7 +104,9 @@ class Delegator:
     """The front's one tool: hands work to Claude over stdout. Two guards keep a delegation loop from forming (seen
     live with Qwen3-4B: a result that listed next steps was re-delegated, Claude's short reply to that came back as a
     result, and so on, eight times): nothing is delegated while a result is being announced (`announcing`), and a
-    request close to one handed off in the last REPEAT_S is not sent again."""
+    request close to one handed off in the last REPEAT_S is not sent again. A delegation carries the user's own words
+    (`said`) beside the model's reading of them: a 4B's rewrite once turned "what was the fix?" into "wait for the
+    worker", and Claude saw only that."""
 
     REPEAT_S = 300.0
     SIMILAR = 0.85  # difflib ratio over the normalized words
@@ -112,6 +114,7 @@ class Delegator:
     def __init__(self) -> None:
         self.announcing = False  # a [task finished] turn: results are reported, not acted on
         self.sent: list[tuple[float, str]] = []
+        self.handed = 0  # delegations sent so far: a user turn that adds none is passed on as a note
 
     @staticmethod
     def _norm(text: str) -> str:
@@ -125,7 +128,7 @@ class Delegator:
                 return earlier
         return None
 
-    async def call(self, name: str, args: Any) -> str:
+    async def call(self, name: str, args: Any, said: str = "") -> str:
         if not isinstance(args, dict):
             return 'error: the arguments were not valid JSON. Call delegate again with {"request": "..."}.'
         request = str(args.get("request") or "").strip()
@@ -134,11 +137,14 @@ class Delegator:
         if self.announcing:
             log(f"front: not delegated, the turn announces a result: {request[:120]!r}")
             return f"Not handed off: a {EVENT} message is reported to the user, never acted on. Just tell the user."
-        if (earlier := self.repeat_of(request)) is not None:
-            log(f"front: not delegated again, it repeats {earlier[:80]!r}: {request[:120]!r}")
+        said = said.strip()
+        key = f"{said} {request}" if said else request
+        if (earlier := self.repeat_of(key)) is not None:
+            log(f"front: not delegated again, it repeats {earlier[:80]!r}: {key[:120]!r}")
             return "Not handed off: the same request is already running. Tell the user it is in progress."
-        emit(type="delegate", text=request)
-        self.sent.append((time.monotonic(), request))
+        emit(type="delegate", text=request, **({"said": said} if said else {}))
+        self.sent.append((time.monotonic(), key))
+        self.handed += 1
         return f"{HANDED_OFF}; it runs in the background. Keep talking. The result arrives as a {EVENT} message."
 
 
@@ -235,12 +241,14 @@ class Brain:
         self.history: list[dict[str, Any]] = []
         self.pending: list[dict[str, Any]] = []  # this turn's tool calls and results, committed with the words
         self.interrupted = False  # the last turn was cut: the next user message says so
+        self.user_said = ""  # the user's own words this turn, as heard
 
     @property
     def where(self) -> str:
         return self.name
 
     def begin(self, user_text: str) -> None:
+        self.user_said = user_text
         if self.interrupted:
             user_text = f"{INTERRUPTED} {user_text}"
             self.interrupted = False
@@ -376,6 +384,7 @@ class FrontTurn:
     """One llama.cpp front turn, kept past its end so a delegation that arrives after a cut joins its history."""
 
     asked: dict[str, Any] | None = None  # the user's message in history
+    said: str = ""  # the user's own words, sent with a delegation
     answer: dict[str, Any] | None = None  # the assistant's entry, once committed
     request: str = ""  # what was delegated
     heard: str = ""  # what of "say" was heard
@@ -442,7 +451,7 @@ class LlamaCppBrain(Brain):
 
     def begin(self, user_text: str) -> None:
         super().begin(user_text)
-        self.current = FrontTurn(asked=self.history[-1])
+        self.current = FrontTurn(asked=self.history[-1], said=user_text)
 
     def said(self, text: str) -> str | None:
         """In the shape the model answers in, so its own past turns teach the format; a delegation stays even when
@@ -532,7 +541,7 @@ class LlamaCppBrain(Brain):
                     if announcing:  # snapshot: a cut result turn's reader may finish after the next turn began
                         log(f"front: not delegated, the turn announces a result: {request[:120]!r}")
                         continue
-                    if not (await tools.call("delegate", {"request": request})).startswith(HANDED_OFF):
+                    if not (await tools.call("delegate", {"request": request}, said=turn.said)).startswith(HANDED_OFF):
                         continue
                     turn.request = f"{turn.request} {request}".strip()
                     if turn.committed:  # cut, and its words already in history
@@ -612,7 +621,8 @@ class AnthropicBrain(Brain):
             asked = {"role": "assistant", "content": uses}
             # eager input streaming leaves validation to us: Delegator checks the input's shape
             results = {"role": "user", "content": [
-                {"type": "tool_result", "tool_use_id": u["id"], "content": await tools.call(u["name"], u["input"])}
+                {"type": "tool_result", "tool_use_id": u["id"],
+                 "content": await tools.call(u["name"], u["input"], said=self.user_said)}
                 for u in uses]}
             text = [{"type": "text", "text": b.text} for b in msg.content if b.type == "text" and b.text.strip()]
             msgs += [{"role": "assistant", "content": text + uses}, results]

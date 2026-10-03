@@ -129,9 +129,17 @@ async function onSidecar($: EngineInterface, msg: Record<string, unknown>) {
       await toClaude($, text, `[The user spoke over you: "${text}". Take this into account now: change course if it asks you to, answer it in your next reply, and keep that reply short.]`)
       break
     }
+    // The front's reading of a request, with the user's own words when the sidecar sends them (`said`): a small
+    // model's rewrite can drop the question, so Claude always sees what was actually said.
     case 'delegate': {
       const text = String(msg.text)
-      await toClaude($, text, `[The user, by voice, adds a request while you work: "${text}". Take it into account now.]`)
+      const said = typeof msg.said === 'string' ? msg.said.trim() : ''
+      if (!said) {
+        await toClaude($, text, `[The user, by voice, adds a request while you work: "${text}". Take it into account now.]`)
+        break
+      }
+      await toClaude($, `User said: "${said}"\nThe voice front read it as: ${text}`,
+        `[The user, by voice, adds while you work: "${said}". The voice front read it as: ${text}. Take it into account now.]`)
       break
     }
     case 'switch_model':

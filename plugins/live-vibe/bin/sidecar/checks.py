@@ -488,6 +488,18 @@ def units() -> int:
           and sent == ["Play the test sentences and report back.", "Run the unit tests.",
                        "Play the test sentences and report back."],
           f"delegate: no repeat within {Delegator.REPEAT_S:.0f} s, nothing while a result is announced {sent}")
+    out.clear()
+    protocol.capture(out)
+    try:
+        d = Delegator()
+        asyncio.run(d.call("delegate", {"request": "Summarize the worker's log report."}, said="So what was the fix?"))
+        other = asyncio.run(d.call("delegate", {"request": "Summarize the worker's log report."}, said="Did it work?"))
+        again = asyncio.run(d.call("delegate", {"request": "summarize the worker's log report"}, said="so what was the fix"))
+    finally:
+        protocol.capture(None)
+    check(out[0] == {"type": "delegate", "text": "Summarize the worker's log report.", "said": "So what was the fix?"}
+          and other.startswith("Handed off") and again.startswith("Not handed off") and d.handed == 2,
+          f"delegate: the user's words go with the request, and a repeat is judged on both {out[:1]}")
     b = Brain()
     for i in range(HISTORY_MAX):
         b.begin(f"u{i}")
@@ -822,7 +834,9 @@ async def selftest_sessions(check: Checker) -> None:
     utter("Please fix the failing test.")
     await until(lambda: emitted("delegate"))
     await turn_done()
-    check(emitted("delegate") == [{"type": "delegate", "text": "Fix the failing test in parser.py"}], f"front: utterance -> delegate {emitted('delegate')}")
+    check(emitted("delegate") == [{"type": "delegate", "text": "Fix the failing test in parser.py",
+                                   "said": "Please fix the failing test."}],
+          f"front: utterance -> delegate, with the user's own words beside the model's reading {emitted('delegate')}")
     check([m["role"] for m in brain.history] == ["user", "assistant"] and said() == "On it."
           and delegated() == "Fix the failing test in parser.py" and "[" not in said(),
           f"front: history keeps the turn as the model answers it, words and delegation apart {brain.history}")
@@ -912,7 +926,8 @@ async def selftest_sessions(check: Checker) -> None:
     utter("notecall")
     await until(lambda: emitted("delegate"), 3)
     await turn_done()
-    check(emitted("delegate") == [{"type": "delegate", "text": "Rebuild the index"}] and sess.turn_spoken[0] == "Sure."
+    check(emitted("delegate") == [{"type": "delegate", "text": "Rebuild the index", "said": "notecall"}]
+          and sess.turn_spoken[0] == "Sure."
           and not any("[" in t for t in sess.turn_spoken) and delegated() == "Rebuild the index",
           f"front: a written delegation note is silent and still delegates {sess.turn_spoken}")
 
@@ -941,7 +956,7 @@ async def selftest_sessions(check: Checker) -> None:
     asked = next(i for i, m in enumerate(brain.history) if m["content"] == f"{INTERRUPTED} slow work please"
                  or m["content"] == "slow work please")
     entry = json.loads(brain.history[asked + 1]["content"]) if len(brain.history) > asked + 1 else {}
-    check(cut_early and emitted("delegate") == [{"type": "delegate", "text": "Rebuild the cache"}]
+    check(cut_early and emitted("delegate") == [{"type": "delegate", "text": "Rebuild the cache", "said": "slow work please"}]
           and entry.get("delegate") == "Rebuild the cache" and str(entry.get("say", "")).startswith("Working")
           and "part 7" not in str(entry.get("say", "")),
           f"front: a turn cut while 'on it' is spoken still hands off its delegate field, and history shows it {entry}")
