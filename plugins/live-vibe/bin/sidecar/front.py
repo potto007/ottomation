@@ -241,6 +241,8 @@ class Brain:
 
     name = "base"
     model = ""
+    trimmed = False  # the last reply was cut to an acknowledgement or ASKED: the user did not hear what it said
+    plain = False  # the last reply to a question stood as the model wrote it: a short answer, no claim
 
     def __init__(self, system: str = ""):
         self.system = system
@@ -345,6 +347,13 @@ def acknowledgement(say: str) -> str:
     return short_first(say) or ACK
 
 
+def plain_answer(say: str) -> bool:
+    """A reply that can stand as the answer to a user's question: one sentence, short, no claim about the work
+    ("I'm doing well, thanks!"). A guess was never that: every recorded one sat in a second sentence."""
+    say = say.strip()
+    return bool(say) and len(re.split(r"(?<=[.!?])\s+", say)) == 1 and short_first(say) == say
+
+
 def asked(say: str) -> str:
     """What a user's question the front answered itself speaks: the same short first sentence, then ASKED. Claude
     gets the question (an `ask` note) and gives the real answer; seen with Qwen3-4B on "so what was the fix?" with
@@ -433,6 +442,8 @@ class FrontTurn:
     heard: str = ""  # what of "say" was heard
     cut_at: float | None = None  # when the turn was cut while its reply was still streaming
     committed: bool = False
+    trimmed: bool = False  # the reply was held back and cut to an acknowledgement or ASKED
+    plain: bool = False  # a question's reply was held back and spoken whole: one short sentence, no claim
 
 
 class LlamaCppBrain(Brain):
@@ -483,6 +494,14 @@ class LlamaCppBrain(Brain):
     def request(self) -> str:
         """This turn's delegation so far."""
         return self.current.request
+
+    @property
+    def trimmed(self) -> bool:  # type: ignore[override]
+        return self.current.trimmed
+
+    @property
+    def plain(self) -> bool:  # type: ignore[override]
+        return self.current.plain
 
     def _body(self, messages: list[dict[str, Any]], max_tokens: int, stream: bool) -> dict[str, Any]:
         return {"model": self.model, "messages": messages, "response_format": self.FORMAT, "stream": stream,
@@ -596,7 +615,11 @@ class LlamaCppBrain(Brain):
             for request in speech.delegations() if not field else [] if handed else [field]:  # or the notes instead
                 await self._hand_off(request, turn, tools, announcing)
             if held is not None:  # handed off: an acknowledgement; a question kept: ASKED, Claude gets it as `ask`
-                words.put_nowait((acknowledgement if turn.request else asked)("".join(held) + said))
+                whole = "".join(held) + said
+                turn.plain = not turn.request and plain_answer(whole)
+                spoken = whole.strip() if turn.plain else (acknowledgement if turn.request else asked)(whole)
+                turn.trimmed = spoken != whole.strip()
+                words.put_nowait(spoken)
             elif said:
                 words.put_nowait(said)
         finally:
@@ -840,29 +863,39 @@ class FrontSession(Duplex):
             if brain is self.brain and said:
                 emit(type="transcript", role="front", text=said)
             if not (is_event or failed) and brain is self.brain:  # also when a barge-in cut the reply: the user's
-                self.pass_on(user_text, said, handed)  # words were heard whole, whatever of the reply was not
+                self.pass_on(user_text, said, handed, brain.plain)  # words were heard whole, the reply maybe not
         if failed:
             e = failed[0]
             warn(f"front model failed at {brain.where} ({type(e).__name__}: {str(e)[:160]})")
-            for t in waiting or []:  # never heard: the announcer reads them out
-                with contextlib.suppress(asyncio.QueueFull):
-                    self.results.put_nowait(t)
+            self.requeue(waiting or [])  # never heard: the announcer reads them out
             return await self.front_down(report or user_text, is_event)
+        # A held reply (cut to "I've asked", or one short plain sentence) told the user nothing of the waiting results
+        # (eval: a waiting report, then "what time is it in Tokyo?", then only "I've asked"): the announcer reads them.
+        if waiting and (brain.trimmed or brain.plain):
+            log(f"front: the reply was held short; {len(waiting)} waiting result(s) go back to the announcer")
+            self.requeue(waiting)
         self.settle()
         if not is_event and _GOODBYE.search(user_text.lower()):
             self.goodbye()
 
-    def pass_on(self, user_text: str, said: str, handed: int) -> None:
+    def requeue(self, texts: list[str]) -> None:
+        """Results back to the announcer, ahead of any that arrived since."""
+        for t in texts + self.take_results():
+            with contextlib.suppress(asyncio.QueueFull):
+                self.results.put_nowait(t)
+
+    def pass_on(self, user_text: str, said: str, handed: int, plain: bool = False) -> None:
         """A user turn that delegated nothing still reaches Claude, as a note: a confirmation ("it sounds perfect, the
         static is gone"), a correction or a decision is information Claude needs (seen live: said three times, never
         passed on, while Claude kept saying nobody had confirmed by ear). The mod hands two kinds to Claude as a
         prompt rather than a note: `answer`, a reply to a question the last report asked, and `ask`, a question the
         front answered itself (Qwen3-4B, asked "so what was the fix?" with only a log report to go on, invented a
-        cause and delegated nothing, even when told to delegate what the report does not answer)."""
+        cause and delegated nothing, even when told to delegate what the report does not answer). A question the front
+        answered plainly (`plain`: one short sentence with no claim, "I'm doing well, thanks!") is a note."""
         answer, self.question_open = self.question_open, False
         if self.tools.handed != handed:
             return
-        kind = {"answer": True} if answer else {"ask": True} if "?" in user_text else {}
+        kind = {"answer": True} if answer else {"ask": True} if "?" in user_text and not plain else {}
         emit(type="note", said=user_text, reply=said, **kind)
 
     async def front_down(self, text: str, is_event: bool) -> None:

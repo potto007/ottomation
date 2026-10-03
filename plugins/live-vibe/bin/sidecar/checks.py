@@ -31,8 +31,8 @@ from .audio import FRAME, SR, CannotStart, Player, check_devices, SentenceSplitt
 from .echo import EchoCanceller, EchoGuard, EchoReference
 from .front import (ACK, ASKED, EVENT, EVENT_CHARS, HISTORY_MAX, INTERRUPTED, RETELL, WAITING, _FALLBACKS,
                     _NO_EFFORT, Brain, Delegator, FrontSession, LlamaCppBrain, SpeechFilter, TurnStream,
-                    acknowledgement, asked, event_message, is_turn_start, make_brain, parse_sse, report_brief,
-                    spoken_model, warm_up)
+                    acknowledgement, asked, event_message, is_turn_start, make_brain, parse_sse, plain_answer,
+                    report_brief, spoken_model, warm_up)
 from .session import LiveSession
 from .speech import BARGE_IN_WORDS, KYUTAI_BLOCK, KYUTAI_SR, KyutaiTurns, SilentTTS, check_tts
 
@@ -394,6 +394,24 @@ def front_history(check: Checker) -> None:
     got = [asked(g) for g in guesses] + [acknowledgement(g) for g in guesses]
     check(got == [ASKED] * len(guesses) + [ACK] * len(guesses),
           f"asked, acknowledgement: a short guessed cause is never spoken {got}")
+    plain = [plain_answer(t) for t in ("I'm doing well, thanks!", "It's sunny here.", "Yes. Then the rest.",
+                                        "It finished with no errors.", "")]
+    check(plain == [True, True, False, False, False],
+          f"plain answer: one short sentence with no claim stands as the answer, nothing else does {plain}")
+    recorded = [  # what Qwen3-4B (3) and Qwen3.6-35B (1) said to "so what was the fix?" with only a log report
+        "The logs show no errors or warnings, and the audio processing is running as expected. The fix was likely the "
+        "combination of proper audio routing and stable GPU handling, but since the logs don't specify changes, I "
+        "can't confirm the exact cause.",
+        "The logs show no errors or warnings, and nothing was running in the background. The audio quality improvement "
+        "was likely due to the session's natural settling or a prior fix not explicitly documented.",
+        "The logs show no errors or warnings, and the audio processing appears stable. However, the fix for the static "
+        "issue was not found in the logs; it was likely resolved by the audio filtering in the front-server model.",
+        "The logs showed no errors or warnings that affected anything. "
+        "The fix seems to have resolved the static issue.",
+    ]
+    got = [(plain_answer(g), asked(g)) for g in recorded]
+    check(all(not p and a.endswith(ASKED) and "fix" not in a.lower() for p, a in got),
+          f"plain answer: every recorded guess at 'what was the fix?' is still cut to ASKED {[a for _, a in got]}")
 
 
 def report_units(check: Checker) -> None:
@@ -726,6 +744,8 @@ def fake_front() -> tuple[str, list[dict[str, Any]]]:
                 deltas = turn("Great, glad it works.")
             elif "what happened" in text:
                 deltas = turn("It finished with no errors.")
+            elif "how are you" in text.lower():
+                deltas = turn("I'm doing well, thanks!")
             elif "goodbye" in text.lower():
                 deltas = turn("Goodbye.")
             elif "thinking leak" in text:
@@ -976,6 +996,29 @@ async def selftest_sessions(check: Checker) -> None:
           and asked[-2]["content"].startswith(f'{EVENT} "The worker finished') and WAITING in asked[-2]["content"]
           and not events_since(n) and sess.results.empty(),
           "announcer: a result that came in while the user talked goes into the user's turn, not a later announcement")
+
+    sess.post("speech_start", 1.0)  # again, but the user asks a question and the reply is cut to ASKED
+    await until(lambda: sess.user_talking)
+    n = len(seen)
+    await asyncio.to_thread(post, port, "/event", "The second worker finished: two warnings, both harmless.", token)
+    sess.post("transcribing", None)
+    sess.post("utterance", "so what happened?")
+    await until(lambda: len(events_since(n)) >= 1, 5)
+    await turn_done()
+    await asyncio.sleep(0.4)
+    events = events_since(n)
+    asked_turn = seen[n]["messages"] if len(seen) > n else [{"content": ""}]
+    check(asked_turn[-1]["content"] == "so what happened?" and len(events) == 1 and "The second worker finished" in
+          events[0] and sess.results.empty(),
+          f"announcer: a waiting result whose user turn was cut to {ASKED!r} is announced after it, once {events}")
+
+    out.clear()
+    utter("How are you?")
+    await until(lambda: emitted("note"), 5)
+    await turn_done()
+    check(sess.turn_spoken == ["I'm doing well, thanks!"] and emitted("note") == [
+              {"type": "note", "said": "How are you?", "reply": "I'm doing well, thanks!"}],
+          f"front: a short plain answer to a question is spoken whole, and is a note, not an ask {emitted('note')}")
 
     sess.post("speech_start", 1.0)  # two results wait for the floor together
     await until(lambda: sess.user_talking)
