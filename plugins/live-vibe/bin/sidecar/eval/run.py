@@ -110,6 +110,9 @@ async def run(a: argparse.Namespace) -> None:
             brain.history = [dict(m) for m in history]
             sess = front.FrontSession(SilentVoice(), lambda: False, brain, None, lambda: None)
             sess.question_open = bool(fx.get("question_open"))
+            # work in session, as the live session would have it: delegations, reports heard, results taken
+            sess.tools.handed = sum(1 for q in fx["prior"] if q[0] != "report" and q[1])
+            sess.tools.results_seen = any(q[0] == "report" for q in fx["prior"]) or bool(fx["waiting"])
             for said, request in fx.get("sent", []):
                 sess.tools.sent.append((time.monotonic(), f"{said} {request}" if takes_said else request))
             sink.clear()
@@ -145,6 +148,8 @@ async def run(a: argparse.Namespace) -> None:
 
 
 def check(fx: dict, r: dict) -> list[str]:
+    from fixtures import HOLD  # noqa: E402
+
     """Why the record fails the fixture's own rubric (empty: it passes). The speech is what the user heard: the
     turn's reply and any announcement right after it."""
     k, t, why = fx["rubric"], (r["spoken"] + " " + r.get("announced", "")).strip(), []
@@ -167,6 +172,11 @@ def check(fx: dict, r: dict) -> list[str]:
     if k.get("answer_or_delegation") and not (note.get("answer") is True
                                               or (r["delegate"] and r.get("said") == fx["user"])):
         why.append("neither an answer note nor a delegation with the user's words")
+    if k.get("hold") and not r["delegate"] and (r["spoken"] != HOLD or note.get("ask") is not True):
+        why.append(f"not only {HOLD!r} with an ask (said {r['spoken']!r}, note {note or 'none'})")
+    if k.get("plain_note") and (not note or note.get("ask") or note.get("answer")
+                                or len([s for s in SENT.split(r["spoken"]) if s]) != 1):
+        why.append(f"not a one-sentence plain note (note {note or 'none'})")
     return why
 
 

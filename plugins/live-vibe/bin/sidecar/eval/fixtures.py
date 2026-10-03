@@ -15,15 +15,22 @@ Each fixture is the conversation so far, then the turn under test:
                  said_verbatim: a delegation carries the user's words unchanged
                  note: the emitted note has these fields; answer_or_delegation: a note with answer=true, or a
                  delegation carrying the user's words verbatim; note_record: record the note kind, unscored
+                 hold: a turn that delegates nothing speaks only HOLD and sends Claude an ask note
+                 plain_note: a plain note (no ask, no answer) and a reply of one sentence
   extra          checks added after a fixture's first results, scored apart so its own score stays comparable
 
 Global checks on every fixture:
-  INVENTED  a user turn that hands nothing off announces no action the front cannot take
+  INVENTED  a user turn that hands nothing off announces no action the front cannot take (HOLD is no action: Claude
+            answers the question)
   DOUBLED   no turn says "asked" twice
+
+Work in session (0.5.3): a fixture whose prior turns delegated or heard a report, or whose turn takes a waiting result,
+runs with the Delegator's work-in-session flag set, as the live session would have it.
 """
 
+HOLD = "Let me check."  # front.HOLD: all a question the front does not delegate hears from it
 INVENTED = [r"\bI(?:'ll| will| am going to|'m going to) (?!be\b|report\b|let you\b|tell you\b|pass\b|share\b)\w+",
-            r"\blet me (?!know\b)\w+"]  # "I'll let you know / pass it on / report" are kept promises
+            r"\blet me (?!know\b)(?!check\.(?:\s|$))\w+"]  # "I'll let you know / pass it on / report" are kept promises
 DOUBLED = r"\basked\b.*\basked\b"
 GUESS = [r"\blikely\b", r"\bprobably\b", r"\bdue to\b", r"\bbecause\b", r"\bso the\b", r"\bseems? to\b",
          r"\bmust have\b"]
@@ -52,6 +59,8 @@ R5 = ("The Windows player is now the default speaker backend in 0.5.1, and all 4
 R6 = ("The `fix/live-vibe-native-rate` branch is local only and made no audible difference. Shall I delete the "
       "branch?")
 START = ("All right, let's try this again.", "Check the live-vibe logs for errors or warnings.", "Alright, let's go.")
+CONFIRMED = ("Yeah, it sounds perfect. There is no static. It is fixed.", "", "Got it, the static is gone.")
+HELLO = ("Hi there.", "", "Hi! What can I do for you?")
 
 F = [
     # -- the first five (rubrics as first scored) --------------------------------------------------------------
@@ -76,16 +85,15 @@ F = [
                     forbid=[r"\b(I'll|I will) (look|check|investigate|run)", r"still (running|reading)"],
                     delegate="no"),
     ),
-    dict(
+    dict(  # 0.5.3: was "a direct yes" (keep yes/got it, extra first_keep); with work in session the front never
+        # answers a question itself, so the yes is Claude's to give
         id="B_followup",
-        criteria="'did you get that?': yes, no invented fix",
-        prior=[START, ("report", R2, R2_SAY),
-               ("Yeah, it sounds perfect. There is no static. It is fixed.", "", "Got it, the static is gone.")],
+        criteria="'did you get that?' with work in session: only the holding line and an ask (or a delegation), no "
+                 "invented fix",
+        prior=[START, ("report", R2, R2_SAY), CONFIRMED],
         waiting=[], user="Yeah, so did you get that? Because you haven't really followed up.",
-        rubric=dict(keep=[r"\b(yes|got it|passed|noted|told)\b"],
-                    forbid=[r"still (running|reading)", r"\bfixed it\b", r"\bI fixed\b"], delegate="any"),
-        extra=dict(first_keep=[r"^\W*(yes|yeah|yep|got it|noted|understood|i did|i got)\b"],
-                   criteria="the first sentence is a direct yes (yes / got it / noted / understood)"),
+        rubric=dict(keep=[r"."], forbid=[r"still (running|reading)", r"\bfixed it\b", r"\bI fixed\b"],
+                    delegate="any", hold=True),
     ),
     dict(
         id="C_stale_status",
@@ -96,7 +104,7 @@ F = [
                 "Review the code changes from the session and explain how the static was fixed.", "On it.")],
         waiting=[], user="So, is it done yet?",
         rubric=dict(keep=[r"\basked\b", r"\bwaiting\b", r"\bnot yet\b", r"\bno (word|report|answer)\b",
-                          r"\bhaven't heard\b", r"\bwhen it\b", r"\bchecking\b"],
+                          r"\bhaven't heard\b", r"\bwhen it\b", r"\bchecking\b", r"^let me check\.$"],  # 0.5.3: HOLD
                     forbid=[r"still (running|reading|working)", r"\b(it's|it is) (done|finished|complete)",
                             r"\bhas finished\b", r"\bnot finished\b", r"\bhasn't finished\b"],
                     delegate="any"),
@@ -143,13 +151,13 @@ F = [
         rubric=dict(keep=[r"."], forbid=[r"\b(deleted|removed|done)\b", r"\b(it's|it is|branch is) gone\b"],
                     delegate="any", answer_or_delegation=True),
     ),
-    dict(
+    dict(  # 0.5.3: also takes the holding line (an ask), the gate's answer to a reply longer than one sentence
         id="N7_smalltalk",
-        criteria="'how are you?' with nothing pending: a short direct answer (2 sentences at most), no delegation; "
-                 "the note kind is recorded (ask costs a Claude turn)",
-        prior=[("Hi there.", "", "Hi! What can I do for you?")], waiting=[], user="How are you?",
-        rubric=dict(keep=[r"\b(good|well|great|fine|doing)\b"], forbid=[], delegate="no", max_sentences=2,
-                    note_record=True),
+        criteria="'how are you?' with nothing pending: a short direct answer (2 sentences at most) or the holding "
+                 "line, no delegation; the note kind is recorded (ask costs a Claude turn)",
+        prior=[HELLO], waiting=[], user="How are you?",
+        rubric=dict(keep=[r"\b(good|well|great|fine|doing)\b", r"^let me check\.$"], forbid=[], delegate="no",
+                    max_sentences=2, note_record=True),
     ),
     dict(
         id="N8_correction",
@@ -175,5 +183,38 @@ F = [
         criteria="'ok thanks, bye': a short goodbye, no delegation",
         prior=[START, ("report", R2, R2_SAY)], waiting=[], user="Ok thanks, bye.",
         rubric=dict(keep=[r"\b(bye|goodbye|see you|take care)\b"], forbid=[], delegate="no", max_sentences=2),
+    ),
+    # -- the context gate (0.5.3) -----------------------------------------------------------------------------------
+    dict(
+        id="G1_how_doing",
+        criteria="'how are we doing?' after a delegation: Claude gets it as ask, the front says only the holding line",
+        prior=[START], waiting=[], user="How are we doing?",
+        rubric=dict(keep=[r"."], forbid=[], delegate="no", hold=True),
+    ),
+    dict(
+        id="G2_hows_it_going",
+        criteria="'how's it going?' after a delegation: Claude gets it as ask, the front says only the holding line",
+        prior=[START], waiting=[], user="How's it going?",
+        rubric=dict(keep=[r"."], forbid=[], delegate="no", hold=True),
+    ),
+    dict(
+        id="G3_got_that_work",
+        criteria="'did you get that?' after a confirmation, with work in session: Claude gets it as ask, the front "
+                 "says only the holding line",
+        prior=[START, ("report", R2, R2_SAY), CONFIRMED], waiting=[], user="Did you get that?",
+        rubric=dict(keep=[r"."], forbid=[], delegate="no", hold=True),
+    ),
+    dict(
+        id="G4_how_are_you_idle",
+        criteria="'how are you?' with no work in session: a plain one-sentence answer kept local (a note, no ask)",
+        prior=[HELLO], waiting=[], user="How are you?",
+        rubric=dict(keep=[r"\b(good|well|great|fine|doing)\b"], forbid=[], delegate="no", plain_note=True),
+    ),
+    dict(
+        id="G5_got_that_idle",
+        criteria="'did you get that?' with no work in session: a plain one-sentence answer kept local (a note, no ask)",
+        prior=[HELLO, ("I'm going to test the microphone now.", "", "Okay, go ahead.")], waiting=[],
+        user="Did you get that?",
+        rubric=dict(keep=[r"\b(yes|yeah|got|hear|heard)\b"], forbid=[], delegate="no", plain_note=True),
     ),
 ]
