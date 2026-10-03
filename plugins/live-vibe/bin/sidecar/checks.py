@@ -29,6 +29,7 @@ from .audio import FRAME, SR, CannotStart, Player, check_devices, SentenceSplitt
 from .echo import EchoCanceller, EchoGuard, EchoReference
 from .front import (EVENT, HISTORY_MAX, INTERRUPTED, _FALLBACKS, _NO_EFFORT, Brain, Delegator, FrontSession,
                     LlamaCppBrain, SpeechFilter, is_turn_start, make_brain, parse_sse, spoken_model, warm_up)
+from .checks_front_server import front_server_units
 from .session import LiveSession
 from .speech import BARGE_IN_WORDS, KYUTAI_BLOCK, KYUTAI_SR, KyutaiTurns, SilentTTS, check_tts
 
@@ -428,6 +429,7 @@ def units() -> int:
     kyutai_choice(check)
     gpu_budget(check)
 
+    front_server_units(check)
     echo_units(check)
     print("UNIT: ALL PASS" if check.ok else "UNIT: SOME CHECKS FAILED", flush=True)
     return 0 if check.ok else 1

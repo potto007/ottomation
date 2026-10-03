@@ -93,7 +93,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--mic", default="", help="input device: index or name substring (see --list-devices)")
     ap.add_argument("--speaker", default="", help="output device: index or name substring")
     ap.add_argument("--front-backend", choices=["llamacpp", "anthropic"], default="llamacpp")
-    ap.add_argument("--front-url", default="http://127.0.0.1:8080", help="OpenAI-compatible server (llama-server)")
+    ap.add_argument("--front-url", default="", help="OpenAI-compatible server; empty: run a managed llama-server")
+    ap.add_argument("--front-server-bin", default="", help="managed front: an existing llama-server (no download)")
+    ap.add_argument("--front-server-model", default="", help="managed front: an existing GGUF (no download)")
+    ap.add_argument("--front-server-log", default="", help="managed front: its log; empty: <cache>/front-server.log")
     ap.add_argument("--front-model", default="", help="empty: the server's model, or claude-haiku-4-5 for anthropic")
     ap.add_argument("--switch-pattern", default="", help="regex whose group 1 is a model a spoken switch names")
     ap.add_argument("--list-devices", action="store_true")
@@ -116,6 +119,10 @@ def run(args: argparse.Namespace, life: protocol.Lifecycle) -> int:
     if sd is not None:
         mic, speaker = audio.pick_device(sd, args.mic, "input"), audio.pick_device(sd, args.speaker, "output")
         audio.check_devices(sd, mic, speaker)
+    if not args.fake_audio:  # /livevibe without frontUrl: our own llama-server, admitted to the GPU before the recognizer
+        from sidecar import front_server
+
+        front_server.start_managed(args, life.on_quit)
 
     # The recognizer loads on the listener thread while this one loads the synthesizer.
     speaking = threading.Event()
@@ -179,7 +186,10 @@ async def serve(args, life: protocol.Lifecycle, listener, voice, sd, mic, t0: fl
         if sd is not None:
             listener.open_mic(sd, mic)
         if brain is not None:
-            sess.spawn(warm_up(brain))  # off the startup path: a cold model load must not hold `ready`
+            from sidecar.front_server import authorize, when_ready
+
+            authorize(brain)  # the managed server's key, if it runs one
+            sess.spawn(when_ready(warm_up(brain)))  # off the startup path: a cold model load must not hold `ready`
         emit(type="ready", port=server.server_port, token=token)
         log(f"ready in {time.monotonic() - t0:.1f}s")
         sess.set_state("listening")
@@ -226,6 +236,10 @@ def main() -> int:
 
         traceback.print_exc()
         return 1
+    finally:
+        from sidecar import front_server
+
+        front_server.stop_all()  # the managed front server, if any: os._exit below skips every other cleanup
 
 
 if __name__ == "__main__":

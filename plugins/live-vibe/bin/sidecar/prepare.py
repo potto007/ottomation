@@ -3,7 +3,7 @@
 By the time this runs, `uv run --script` has installed the Python packages. It then checks PortAudio and the
 devices, loads (downloading on first use) the synthesizer and the recognizer the settings name, speaks a sentence
 into the recognizer to prove the pair works, plays one sentence through the speaker, and asks the front server what
-it serves. Nothing here installs a system package: a missing one is a `fail` line naming the command.
+it serves; with frontUrl empty it first fetches the managed llama-server and its model, and starts and stops it once. Nothing here installs a system package: a missing one is a `fail` line naming the command.
 
 stdout lines, on top of log and warn:
   {"type":"progress","text":"..."}                        a slow step starting
@@ -49,6 +49,7 @@ def run(args: argparse.Namespace) -> int:
          text=f"Python {sys.version.split()[0]} with the sidecar's packages (uv installed them)")
 
     sd, mic, speaker = audio_devices(check, args)
+    managed_front(check, args)  # first, as in a live run: the front model has the first claim on the GPU
     from . import gpu, speech
 
     gpu.hold("stt", speech.stt_gpu_need(args.stt))  # as in a live run: the recognizer has the first claim
@@ -185,6 +186,10 @@ def play(check: Report, sd, tts, speaker) -> None:
 
 def front(check: Report, args: argparse.Namespace) -> None:
     """Only /livevibe needs it, so a front that is down warns rather than fails."""
+    from . import front_server
+
+    if front_server.managed(args):
+        return  # managed_front() checked it
     if args.front_backend == "anthropic":
         try:
             from .front import AnthropicBrain
@@ -212,3 +217,31 @@ def front(check: Report, args: argparse.Namespace) -> None:
                                "loads it on demand, a plain llama-server ignores the name")
     else:
         check("front", "ok", f"{url} serves {', '.join(ids) or 'a model'}")
+
+
+def managed_front(check: Report, args: argparse.Namespace) -> None:
+    """frontUrl empty: fetch (or find) llama-server and the model, start it as /livevibe would, stop it."""
+    from . import front_server as fs
+
+    if not fs.managed(args):
+        return
+    s = fs.settings(args)
+    try:
+        binary = fs.ensure_binary(s, progress)
+        model = fs.ensure_model(s, progress)
+    except Exception as e:  # noqa: BLE001 - only /livevibe needs it
+        check("front", "warn", f"managed llama-server: {str(e)[:300]}. Only /livevibe needs it; set frontServerBin "
+                               "and frontServerModel to files you have, or frontUrl to a server")
+        return
+    progress(f"front: starting llama-server with {model.name}")
+    server = fs.FrontServer(s, progress).start()
+    try:
+        ok = server.wait_ready()
+    finally:
+        server.stop()
+    if not ok:
+        check("front", "warn", f"managed llama-server did not start: {server.error[:300]}")
+        return
+    where = "GPU" if server.on_gpu else f"CPU ({server.where}; slow)"
+    check("front", "ok", f"managed llama-server {fs.version(binary)} with {model.name} on {where}, ready in "
+                         f"{server.ready_s:.0f}s; log {server.log_file}")

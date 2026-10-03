@@ -5,7 +5,10 @@ On WSL2 a GPU near full pages its memory out to system RAM (WDDM) and every mode
 often shared with a local LLM server this process cannot see, so CPU is the answer whenever the room is not there.
 
 main holds a placeholder for the recognizer before either thread starts, so the recognizer gets the GPU first and
-Kokoro (fast enough on the CPU) yields; a backend releases its claim once its memory shows in the reading."""
+Kokoro (fast enough on the CPU) yields; a backend releases its claim once its memory shows in the reading. Under
+/livevibe with the managed front server (front_server.py), the front model is admitted before that placeholder:
+front, then recognizer, then Kokoro, ordered by what the CPU fallback costs (seconds per reply for the front model;
+Whisper instead of Kyutai for the recognizer; nothing that matters for Kokoro)."""
 from __future__ import annotations
 
 import os
@@ -14,7 +17,9 @@ import threading
 from collections.abc import Callable
 
 # Measured on an RTX 5090 under WSL2, with the CUDA context each one brings.
-NEED_GIB = {"kyutai": 3.2, "whisper": 1.0, "kokoro": 1.4}
+# front: the managed llama-server with the default Qwen3-4B-Instruct-2507 Q4_K_M at -c 16384 (4.1 at 8k, 7.6 at 32k);
+# front_server.estimate_gib() works it out per GGUF and context, and falls back to this when the GGUF says too little.
+NEED_GIB = {"kyutai": 3.2, "whisper": 1.0, "kokoro": 1.4, "front": 5.3}
 FLOOR_GIB = 3.0  # what Whisper and Kokoro leave free; Kyutai keeps its own (kyutai_cuda.MIN_FREE_GIB)
 
 _lock = threading.Lock()
