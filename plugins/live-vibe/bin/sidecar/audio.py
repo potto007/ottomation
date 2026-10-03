@@ -13,11 +13,13 @@ import contextlib
 import queue
 import re
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Callable, Protocol
 
 import numpy as np
 
+from .echo import EchoCanceller, EchoGuard, EchoReference, make_canceller, stream_time
 from .protocol import log, warn
 
 SR = 16_000  # mic sample rate
@@ -186,9 +188,12 @@ class Listener:
 
     MAX_FRAMES = 400  # ~12.8 s of audio waiting: beyond it the recognizer has stalled, and old frames are dropped
 
-    def __init__(self, build: Callable[[], tuple[Detector, Callable[[Any], str]]], quit: threading.Event):
+    def __init__(self, build: Callable[[], tuple[Detector, Callable[[Any], str]]], quit: threading.Event,
+                 guard: EchoGuard | None = None, reference: EchoReference | None = None, aec: bool = False):
         self.build, self.quit = build, quit
-        self.frames: queue.Queue[np.ndarray] = queue.Queue(self.MAX_FRAMES)
+        self.guard, self.reference, self.aec = guard, reference, aec
+        self.canceller: EchoCanceller | None = None
+        self.frames: queue.Queue[tuple[np.ndarray, np.ndarray | None]] = queue.Queue(self.MAX_FRAMES)
         self.post: Callable[[str, Any], None] = lambda kind, payload: None
         self.detector: Detector | None = None
         self.error: BaseException | None = None
@@ -196,6 +201,7 @@ class Listener:
         self.stream = None
         self.problem: str | None = None  # set by the audio callback, reported by the thread
         self.dropped = 0
+        self._clean = np.zeros(0, np.float32)  # cancelled samples short of a frame
         self.thread = threading.Thread(target=self._run, name="listener", daemon=True)
 
     @property
@@ -223,37 +229,58 @@ class Listener:
         try:
             if status:
                 self.problem = f"mic: {status}"
-            self.frames.put_nowait(indata[:, 0].copy())
+            ref = None
+            if self.reference is not None:  # what the speaker played while this block was captured
+                adc = stream_time(time_info.inputBufferAdcTime, time_info.currentTime)
+                ref = self.reference.take(frames, adc, SR)
+            self.frames.put_nowait((indata[:, 0].copy(), ref))
         except queue.Full:
             self.dropped += 1
         except Exception as e:  # noqa: BLE001 - an exception escaping a PortAudio callback stops the stream
             self.problem = f"mic callback: {type(e).__name__}: {e}"
 
+    def _frames(self, mic: np.ndarray, ref: np.ndarray | None) -> list[np.ndarray]:
+        """The detector's frames: the mic as captured, or echo-cancelled and re-cut into FRAME samples."""
+        if self.canceller is None or ref is None:
+            return [mic]
+        self._clean = np.concatenate([self._clean, self.canceller.process(mic, ref)])
+        n = len(self._clean) // FRAME
+        out = [self._clean[i * FRAME:(i + 1) * FRAME] for i in range(n)]
+        self._clean = self._clean[n * FRAME:]
+        return out
+
     def _run(self) -> None:
         try:
             self.detector, transcribe = self.build()
+            if self.aec:
+                self.canceller = make_canceller(True)
         except BaseException as e:  # noqa: BLE001 - reported by main
             self.error = e
             return
         finally:
             self.built.set()
         failures = 0
+        overlapped = False  # the user's turn began while the assistant could be heard
         while not self.quit.is_set():
             try:
-                frame = self.frames.get(timeout=0.2)
+                mic, ref = self.frames.get(timeout=0.2)
             except queue.Empty:
                 continue
             if self.problem or self.dropped:
                 log(self.problem or f"mic: {self.dropped} frames dropped (recognizer behind)")
                 self.problem, self.dropped = None, 0
+            events: list[tuple[str, Any]] = []
             try:
-                events = self.detector.feed(frame)
+                for frame in self._frames(mic, ref):
+                    events += self.detector.feed(frame)
             except Exception as e:  # noqa: BLE001
                 failures += 1
                 if failures in (1, 10, 100):
                     log(f"listener: recognizer step failed ({failures}x): {type(e).__name__}: {e}")
                 continue
             for kind, payload in events:
+                if kind == "speech_start":
+                    overlapped = self.guard is not None and self.guard.active()
                 if kind != "utterance":
                     self.post(kind, payload)
                     continue
@@ -263,6 +290,11 @@ class Listener:
                 except Exception as e:  # noqa: BLE001
                     log(f"listener: transcription failed: {type(e).__name__}: {e}")
                     text = ""
+                if text and self.guard is not None:
+                    kept = self.guard.strip(text, overlapped or self.guard.active())
+                    if kept != text:
+                        log(f"echo: dropped {text!r}" if not kept else f"echo: {text!r} -> {kept!r}")
+                    text = kept
                 if text:
                     self.post("utterance", text)
                 else:
@@ -280,38 +312,103 @@ class Listener:
 
 # -- output ------------------------------------------------------------------------------------------------
 class Player:
-    """Owns the output stream. play() blocks (run it in a thread), stops within 30 ms of `cancel` being set, and
-    returns how many samples were played. sd=None plays silently in real time (the self-test)."""
+    """Owns the output stream. play() blocks (run it in a thread), stops within 10 ms of `cancel` being set, and
+    returns how many samples were played. sd=None plays silently in real time (the self-test).
 
-    def __init__(self, sd, sample_rate: int, device: int | None = None):
+    The stream is callback-driven with LATENCY_S of buffer. Measured on WSL2 (ALSA -> PulseAudio -> WSLg's
+    RDPSink), the old latency="low" (8.7 ms) blocking writes underflowed about once a second while Kokoro
+    synthesized the next sentence on the CPU (11 in 15 s; none idle), each one an audible crackle; 150 ms had
+    none under the same load. A barge-in still cuts at once: abort() drops the buffer. The callback also hands
+    what it played to the echo reference, and tells the echo guard how long the speaker sounds."""
+
+    LATENCY_S = 0.15
+    STALL_S = 1.0  # no callback for this long while playing: the device is gone
+
+    def __init__(self, sd, sample_rate: int, device: int | None = None, reference: EchoReference | None = None,
+                 guard: EchoGuard | None = None):
         self.sample_rate = sample_rate
+        self.reference, self.guard = reference, guard
         self.stream = None
         self._lock = threading.Lock()  # one play() at a time; close() waits for it
+        self._mu = threading.Lock()  # the clip and position, between play() and the callback
+        self._clip: np.ndarray | None = None
+        self._pos = 0
+        self._done = threading.Event()
+        self._last_callback = 0.0
         self._broken = False
+        self.underflows = 0
+        self.problem: str | None = None  # set by the callback, logged by play()
         if sd is not None:
-            self.stream = sd.OutputStream(samplerate=sample_rate, channels=1, dtype="float32", latency="low",
-                                          device=device)
+            self.stream = sd.OutputStream(samplerate=sample_rate, channels=1, dtype="float32",
+                                          latency=self.LATENCY_S, device=device, callback=self._callback)
             self.stream.start()
+
+    def _callback(self, outdata, frames, time_info, status) -> None:
+        try:
+            self._last_callback = time.monotonic()
+            out = outdata[:, 0]
+            n = 0
+            with self._mu:
+                clip = self._clip
+                if clip is not None:
+                    n = min(frames, len(clip) - self._pos)
+                    out[:n] = clip[self._pos:self._pos + n]
+                    self._pos += n
+                    if self._pos >= len(clip):
+                        self._clip = None
+                        self._done.set()
+            out[n:] = 0.0
+            if status.output_underflow and n:
+                self.underflows += 1
+            latency = float(self.stream.latency) if self.stream is not None else self.LATENCY_S
+            if n and self.guard is not None:
+                self.guard.sounding(time.monotonic() + latency + n / self.sample_rate)
+            if self.reference is not None:
+                dac = stream_time(time_info.outputBufferDacTime, time_info.currentTime, latency)
+                self.reference.played(out, dac)
+        except Exception as e:  # noqa: BLE001 - an exception escaping a PortAudio callback stops the stream
+            outdata.fill(0)
+            self.problem = f"speaker callback: {type(e).__name__}: {e}"
 
     def play(self, audio: np.ndarray, cancel: threading.Event) -> int:
         with self._lock:
-            step = int(self.sample_rate * 0.03)
-            for i in range(0, len(audio), step):
-                if cancel.is_set():
-                    if self.stream is not None:
+            if self.stream is None or self._broken:
+                step = int(self.sample_rate * 0.03)
+                for i in range(0, len(audio), step):
+                    if cancel.is_set():
+                        return i
+                    cancel.wait(min(step, len(audio) - i) / self.sample_rate)
+                return len(audio)
+            clip = np.ascontiguousarray(audio, dtype=np.float32)
+            if not len(clip):
+                return 0
+            self._done.clear()
+            self._last_callback = time.monotonic()
+            under = self.underflows
+            with self._mu:
+                self._clip, self._pos = clip, 0
+            try:
+                while not self._done.wait(0.01):
+                    if cancel.is_set():
+                        with self._mu:
+                            played, self._clip = self._pos, None
                         with contextlib.suppress(Exception):
                             self.stream.abort()  # drop what is buffered: the cut is immediate
                             self.stream.start()
-                    return i
-                chunk = np.ascontiguousarray(audio[i:i + step])
-                if self.stream is None or self._broken:
-                    cancel.wait(len(chunk) / self.sample_rate)
-                    continue
-                try:
-                    self.stream.write(chunk)
-                except Exception as e:  # noqa: BLE001 - an unplugged device must not kill the session
-                    self._broken = True
-                    warn(f"speaker failed ({type(e).__name__}: {e}); answers continue silently.")
+                        return played
+                    if time.monotonic() - self._last_callback > self.STALL_S:
+                        raise RuntimeError("the output stream stopped")
+            except Exception as e:  # noqa: BLE001 - an unplugged device must not kill the session
+                with self._mu:
+                    self._clip = None
+                self._broken = True
+                warn(f"speaker failed ({type(e).__name__}: {e}); answers continue silently.")
+            finally:
+                if self.problem:
+                    log(self.problem)
+                    self.problem = None
+                if self.underflows > under:
+                    log(f"speaker: {self.underflows - under} underflow(s) in one sentence")
             return len(audio)
 
     def close(self) -> None:
@@ -389,9 +486,10 @@ class Voice:
     when the current one ends. Cancelling the task that awaits speak() cuts playback at once and still records
     the part that was heard (play() is waited for before anything is committed)."""
 
-    def __init__(self, tts, player: Player, speaking: threading.Event):
+    def __init__(self, tts, player: Player, speaking: threading.Event, guard: EchoGuard | None = None):
         self.tts, self.player = tts, player
         self.speaking = speaking  # set from the first sentence until speak() ends: the barge-in gate reads it
+        self.guard = guard  # remembers each sentence as it starts, so its echo can be told from the user
 
     async def _synth(self, text: str) -> np.ndarray | None:
         try:
@@ -414,6 +512,8 @@ class Voice:
             while (item := await ready.get()) is not None:
                 text, audio = item
                 self.speaking.set()
+                if self.guard is not None:
+                    self.guard.spoke(text)
                 on_play()
                 played = await asyncio.to_thread(self.player.play, audio, cancel)
                 if played < len(audio):

@@ -94,7 +94,7 @@ def synthesizer(check: Report, args: argparse.Namespace):
         if args.tts == "kokoro":
             progress("Kokoro: loading (downloads about 330 MB on first run)")
         t = time.monotonic()
-        tts = speech.make_tts(args.tts, args.voice)
+        tts = speech.make_tts(args.tts, args.voice, args.tts_device)
     except CannotStart as e:
         check("synthesizer", "fail", str(e))
         return None
@@ -103,7 +103,8 @@ def synthesizer(check: Report, args: argparse.Namespace):
         return None
     took = time.monotonic() - t
     if isinstance(tts, speech.KokoroTTS):
-        check("synthesizer", "ok", f"Kokoro, voice {tts.voice}, ready in {took:.0f}s")
+        where = "GPU (CUDA)" if tts.provider == "CUDAExecutionProvider" else "CPU"
+        check("synthesizer", "ok", f"Kokoro on the {where}, voice {tts.voice}, ready in {took:.0f}s")
     elif args.tts == "kokoro":
         check("synthesizer", "warn", "Kokoro failed (see the warning above); macOS say speaks instead")
     else:
@@ -168,7 +169,7 @@ def play(check: Report, sd, tts, speaker) -> None:
         player = Player(sd, tts.sample_rate, speaker)
         try:
             player.play(tts.synth("Live voice is set up."), threading.Event())
-            time.sleep(0.3)  # let the device drain before the stream closes
+            time.sleep(Player.LATENCY_S + 0.3)  # let the device drain before the stream closes
         finally:
             player.close()
     except Exception as e:  # noqa: BLE001

@@ -16,10 +16,10 @@ stdout and a loopback HTTP port guarded by a per-run token.
 
 - Claude Code 2.1.287 or newer (mods are on by default from that build).
 - [uv](https://docs.astral.sh/uv/). The sidecar is a PEP 723 script; uv installs Python 3.12 and its packages on first use.
-- A microphone and speaker on the machine running Claude Code. A headless or SSH-only box cannot use voice; `/vibe` still works there. Headphones are recommended, because the mic stays open while the assistant speaks. Pick devices with the `mic` and `speaker` settings; `--list-devices` (below) shows the choices.
+- A microphone and speaker on the machine running Claude Code. A headless or SSH-only box cannot use voice; `/vibe` still works there. Headphones are best, because the mic stays open while the assistant speaks. On open speakers, the sidecar cancels the assistant's echo from the mic (WebRTC AEC3, through the `livekit` package), keeps barge-in strict until the speaker has gone quiet, and drops utterances that only repeat what it just said. Pick devices with the `mic` and `speaker` settings; `--list-devices` (below) shows the choices.
 - Per OS:
   - **macOS (Apple silicon):** `brew install espeak-ng` for Kokoro. Kyutai STT runs on MLX.
-  - **Linux:** `sudo apt install espeak-ng libportaudio2`. Kyutai STT is Apple-silicon only, so Whisper runs instead. It uses an Nvidia GPU when CTranslate2 finds one and CUDA 12 cuBLAS and cuDNN 9 are installed; otherwise it uses the CPU.
+  - **Linux:** `sudo apt install espeak-ng libportaudio2`. Kyutai STT is Apple-silicon only, so Whisper runs instead. It uses an Nvidia GPU when CTranslate2 finds one and CUDA 12 cuBLAS and cuDNN 9 are installed; otherwise it uses the CPU. On x86_64, Kokoro runs on an Nvidia GPU through onnxruntime-gpu, whose CUDA and cuDNN wheels (about 2 GB) uv installs with the sidecar; without a GPU it runs on the CPU. The log line `tts: Kokoro ... on CUDAExecutionProvider` (or `CPUExecutionProvider`) says which.
   - **Windows / WSL:** not tested. WSL needs working audio (WSLg) plus the Linux packages above.
 
 ## First run

@@ -4,13 +4,18 @@
 # dependencies = [
 #   "numpy>=2",
 #   "sounddevice>=0.5",
-#   "onnxruntime>=1.20",
+#   "onnxruntime>=1.20; sys_platform != 'linux' or platform_machine != 'x86_64'",
+#   "onnxruntime-gpu[cuda,cudnn]>=1.22; sys_platform == 'linux' and platform_machine == 'x86_64'",
 #   "faster-whisper>=1.2",
 #   "kokoro-onnx>=0.6",
 #   "httpx>=0.28",
 #   "anthropic>=1.11",
 #   "moshi-mlx>=0.3.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+#   "livekit>=1.0",
 # ]
+# [tool.uv]
+# # kokoro-onnx requires onnxruntime, which would overwrite onnxruntime-gpu's files (one module, two wheels).
+# override-dependencies = ["onnxruntime>=1.20; sys_platform != 'linux' or platform_machine != 'x86_64'"]
 # ///
 """Audio sidecar for the live-vibe mod. It owns the mic and speaker in two modes:
 
@@ -20,9 +25,13 @@
                              tool, delegate, hands real work to Claude; Claude's answers come back through
                              POST /event and the front relays them once the floor is free.
 
+Echo: --aec on runs WebRTC AEC3 (livekit) on the mic with what the speaker played as its reference; with
+or without it, barge-in stays strict for a tail after playback and utterances that repeat recent speech are dropped.
+
 Backends: --stt kyutai (Kyutai STT 1B on MLX, Apple silicon; streaming words and its own end of turn; about
 2.4 GB of weights on first use; elsewhere it falls back to whisper) or whisper (Silero VAD + faster-whisper,
-CUDA when there is a GPU); --tts kokoro (needs espeak-ng) or say (macOS).
+CUDA when there is a GPU); --tts kokoro (needs espeak-ng; CUDA through onnxruntime-gpu on Linux x86_64 when
+there is a GPU, see --tts-device) or say (macOS).
 
 stdout carries only these JSON lines (library output goes to stderr):
   {"type":"ready","port":N,"token":"..."}                every POST must send X-Live-Token: <token>
@@ -74,6 +83,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--asr", default="base.en", help="faster-whisper size for --stt whisper")
     ap.add_argument("--tts", choices=["kokoro", "say"], default="kokoro")
     ap.add_argument("--voice", default="", help="Kokoro voice (af_heart) or say voice (Samantha)")
+    ap.add_argument("--tts-device", choices=["auto", "cuda", "cpu"], default="auto", help="where Kokoro runs")
+    ap.add_argument("--aec", choices=["on", "off"], default="on", help="echo cancelling on the mic")
     ap.add_argument("--end-silence-ms", type=int, default=1500)
     ap.add_argument("--mic", default="", help="input device: index or name substring (see --list-devices)")
     ap.add_argument("--speaker", default="", help="output device: index or name substring")
@@ -91,6 +102,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def run(args: argparse.Namespace, life: protocol.Lifecycle) -> int:
     from sidecar import audio, speech
+    from sidecar.echo import EchoGuard, EchoReference
 
     emit(type="state", state="loading")
     t0 = time.monotonic()
@@ -103,19 +115,22 @@ def run(args: argparse.Namespace, life: protocol.Lifecycle) -> int:
 
     # The recognizer loads on the listener thread while this one loads the synthesizer.
     speaking = threading.Event()
+    guard = EchoGuard(speaking.is_set)  # the barge-in gate holds through the tail of what was played
     if args.fake_audio:
         build = lambda: (speech.NoSpeech(), str)  # noqa: E731
     else:
-        build = lambda: speech.recognizer(args.stt, args.asr, args.end_silence_ms, speaking.is_set)  # noqa: E731
-    listener = audio.Listener(build, life.quit)
+        build = lambda: speech.recognizer(args.stt, args.asr, args.end_silence_ms, guard.active)  # noqa: E731
+    listener = audio.Listener(build, life.quit, guard, aec=sd is not None and args.aec == "on")
     listener.start()
     try:
-        tts = speech.SilentTTS() if args.fake_audio else speech.make_tts(args.tts, args.voice)
+        tts = speech.SilentTTS() if args.fake_audio else speech.make_tts(args.tts, args.voice, args.tts_device)
     except BaseException:
         listener.close()
         raise
+    reference = EchoReference(tts.sample_rate) if sd is not None else None
+    listener.reference = reference  # read by the mic callback, which opens later
     try:
-        player = audio.Player(sd, tts.sample_rate, speaker)
+        player = audio.Player(sd, tts.sample_rate, speaker, reference, guard)
     except Exception as e:  # noqa: BLE001 - no speaker: keep listening, answer silently
         warn(f"speaker unavailable ({type(e).__name__}: {str(e)[:160]}); answers are not read aloud.")
         player = audio.Player(None, tts.sample_rate)
@@ -126,7 +141,7 @@ def run(args: argparse.Namespace, life: protocol.Lifecycle) -> int:
                 warn(f"speech recognition cannot start ({type(e).__name__}: {str(e)[:200]}).")
                 return 1
             return 0  # quit while loading
-        voice = audio.Voice(tts, player, speaking)
+        voice = audio.Voice(tts, player, speaking, guard)
         return asyncio.run(serve(args, life, listener, voice, sd, mic, t0))
     finally:
         listener.close()

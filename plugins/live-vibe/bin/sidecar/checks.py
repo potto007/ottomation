@@ -23,6 +23,7 @@ import numpy as np
 
 from . import protocol
 from .audio import FRAME, SR, CannotStart, Player, check_devices, SentenceSplitter, Tuning, TurnDetector, Voice, speakable
+from .echo import EchoCanceller, EchoGuard, EchoReference
 from .front import (EVENT, HISTORY_MAX, _FALLBACKS, _NO_EFFORT, Brain, Delegator, FrontSession, LlamaCppBrain,
                     make_brain, parse_sse, spoken_model, warm_up)
 from .session import LiveSession
@@ -178,8 +179,77 @@ def units() -> int:
         sys.platform = real
     check("macOS only" in msg and "apt install espeak-ng" in msg, f"say off macOS: one fatal message naming the fix {msg!r}")
 
+    echo_units(check)
     print("UNIT: ALL PASS" if check.ok else "UNIT: SOME CHECKS FAILED", flush=True)
     return 0 if check.ok else 1
+
+
+class _Status:
+    def __init__(self, underflow: bool = False):
+        self.output_underflow = underflow
+
+
+class _Times:
+    def __init__(self, dac: float = 0.0, adc: float = 0.0, now: float = 0.0):
+        self.outputBufferDacTime, self.inputBufferAdcTime, self.currentTime = dac, adc, now
+
+
+def echo_units(check: Checker) -> None:
+    """The echo guard's transcript filter and tail, the reference's time alignment, the player's callback, and
+    (when livekit loads) the canceller on a synthetic echo."""
+    g = EchoGuard(lambda: False)
+    g.spoke("I handed the parser fix to the coding agent, and it is running the tests now.")
+    got = (g.strip("handed the parser fix to the coding agent", True),
+           g.strip("Wait, stop. What about the database migration?", True),
+           g.strip("I handed the parser fix. Wait, what about the migration?", True),
+           g.strip("handed the parser fix to the coding agent", False),
+           g.strip("running", True), g.strip("tests", True))
+    check(got == ("", "Wait, stop. What about the database migration?", "Wait, what about the migration?",
+                  "handed the parser fix to the coding agent", "", ""),
+          f"echo guard: drops echo, keeps the user's words around it, only while overlapping playback {got}")
+    g.sound_until = time.monotonic() - 10
+    idle = not g.active()
+    g.sounding(time.monotonic() + 0.1)
+    check(idle and g.active() and EchoGuard(lambda: True).active(), "echo guard: active while speaking and in the tail")
+
+    ref = EchoReference(24_000)
+    t0, block = 100.0, 900
+    sig = np.sin(2 * np.pi * 220 * np.arange(24_000) / 24_000).astype(np.float32)
+    for i in range(0, len(sig), block):
+        ref.played(sig[i:i + block], t0 + i / 24_000)
+    got_ref = np.concatenate([ref.take(512, t0 + 0.2 + k * 512 / SR, SR) for k in range(10)])
+    want = np.sin(2 * np.pi * 220 * (0.2 + np.arange(len(got_ref)) / SR)).astype(np.float32)
+    again = ref.take(512, t0 + 0.2, SR)
+    err = float(np.abs(got_ref - want).max())
+    check(err < 0.02 and not again.any(), f"echo reference: the mic reads what played when it captured, once ({err:.4f})")
+
+    g2 = EchoGuard(lambda: False)
+    ref2 = EchoReference(24_000)
+    p = Player(None, 24_000, reference=ref2, guard=g2)
+    p._clip, p._pos = np.full(1000, 0.5, np.float32), 0
+    out = np.ones((600, 1), np.float32)
+    p._callback(out, 600, _Times(dac=50.0), _Status())
+    first = bool((out[:, 0] == 0.5).all())
+    p._callback(out, 600, _Times(dac=50.025), _Status(underflow=True))
+    check(first and (out[:400, 0] == 0.5).all() and not out[400:, 0].any() and p._done.is_set()
+          and p.underflows == 1 and g2.active(), "player callback: plays the clip, pads silence, marks the tail")
+    check(np.abs(ref2.take(320, 50.0 + 0.005, SR) - 0.5).max() < 1e-3, "player callback: feeds the echo reference")
+
+    try:
+        canceller = EchoCanceller()
+    except Exception as e:  # noqa: BLE001
+        print(f"SKIP  echo canceller: livekit unavailable ({type(e).__name__}: {e})", flush=True)
+        return
+    rng = np.random.default_rng(0)
+    far = np.repeat(rng.standard_normal(SR * 6 // 80), 80).astype(np.float32) * 0.2  # blocky, speech-like band
+    far *= (np.sin(np.arange(len(far)) / SR * 2 * np.pi * 1.5) > -0.3)  # gaps, like words
+    d = int(0.2 * SR)
+    echo = np.zeros_like(far)
+    echo[d:] = 0.4 * far[:-d]
+    out = np.concatenate([canceller.process(echo[i:i + 512], far[i:i + 512]) for i in range(0, len(far), 512)])
+    tail = slice(SR * 3, len(out))
+    erle = 10 * np.log10(np.mean(echo[tail] ** 2) / (np.mean(out[tail] ** 2) + 1e-12))
+    check(erle > 10, f"echo canceller: AEC3 removes a 200 ms echo once converged (ERLE {erle:.1f} dB)")
 
 
 # =============================================================================================================
