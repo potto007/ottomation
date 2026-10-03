@@ -12,6 +12,19 @@ stdout and a loopback HTTP port guarded by a per-run token.
 
 `/live` and `/livevibe` turn each other off. `/livevibe` off puts vibe mode back the way it was.
 
+## What live vibe prints
+
+Claude's answers print as usual. Around them, each line starts with `live-vibe:` and is dim:
+
+| Line | What it is |
+|---|---|
+| `you (voice): ...` | What you said, once per sentence: an utterance cut off mid-sentence ("Also, we need") waits up to 2.5 s for its rest, and the pieces go to the front as one. |
+| `spoken: Let me check.` | The front's acknowledgements, spoken and shown once; back-to-back ones share the line (`(x2)`). One still waiting when Claude's answer lands is dropped (the debug log keeps it). |
+| `spoken summary: ...` | The front's retelling of a result, at most two sentences plus a closing question. When it repeats the answer above, the line is cut short and marked `(repeats the answer above)`; the debug log has it whole. It shows as soon as the front has written it, while the voice still reads it. |
+| `voice: ...` | The front's own reply to small talk. |
+| `front prompt (3 lines, ctrl+o to expand): task: ...` | The prompt the front handed Claude (your words, the front's reading, the instructions), drawn as one line; ctrl+o shows it whole. |
+| `no update (nothing to add)` | A Claude turn with nothing new, such as a worker's notification repeating a report: the front says nothing. |
+
 ## Requirements
 
 - Claude Code 2.1.287 or newer (mods are on by default from that build).
