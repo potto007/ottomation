@@ -34,7 +34,7 @@ from .front import (ACK, EVENT, EVENT_CHARS, HISTORY_MAX, HOLD, INTERRUPTED, RET
                     acknowledgement, event_message, held_answer, is_turn_start, make_brain, parse_sse,
                     report_brief, retellable, spoken_model, warm_up)
 from .session import LiveSession
-from .speech import BARGE_IN_WORDS, KYUTAI_BLOCK, KYUTAI_SR, KyutaiTurns, Pauses, SilentTTS, check_tts
+from .speech import BARGE_IN_WORDS, KYUTAI_BLOCK, KYUTAI_SR, KyutaiTurns, Pauses, SilentTTS, check_tts, turn_tail
 
 MAIN = Path(__file__).with_name("main.py")
 # The mod's SPOKEN_SWITCH source, as register.tsx passes it in --switch-pattern.
@@ -93,14 +93,15 @@ class FakeKyutai:
 
 
 def run_kyutai(script: list[tuple[str | None, float | Pauses]], speaking: bool = False, steps: int = 0,
-               logs: list[str] | None = None) -> list[tuple[int, str, Any]]:
+               logs: list[str] | None = None, tune: Tuning | None = None) -> list[tuple[int, str, Any]]:
     """(script index, event kind, value) for the script fed through KyutaiTurns; `steps` presets the fake model's
-    step count (above 3000, the first step resets it), and `logs` collects the file_log lines."""
+    step count (above 3000, the first step resets it), and `logs` collects the file_log lines. `tune` defaults to
+    the shipped caps: end_silence_ms 3000 (main.py), long 4000, short 1000."""
     from . import speech
 
     stt = FakeKyutai(script)
     stt.steps = steps
-    turns = KyutaiTurns(stt, Tuning(end_silence_ms=1500), lambda: speaking)
+    turns = KyutaiTurns(stt, tune or Tuning(end_silence_ms=3000), lambda: speaking)
     block = KYUTAI_BLOCK * SR // KYUTAI_SR
     sink = logs if logs is not None else []
     with patched((speech, "file_log", lambda level, text: sink.append(f"{level} {text}"))):
@@ -166,10 +167,10 @@ def kyutai_end_of_turn(check: Checker) -> None:
           and ev[1][0] == 12 + 3 + 15 + 6,
           f"kyutai turns: the 2 s head high with the 0.5 s head low is a mid-sentence pause, not an end {ev}")
     logs: list[str] = []
-    ev = run_kyutai(pad + [("▁so", 0.0)] + [(None, pause)] * 30, logs=logs)
-    check([k for _, k, _ in ev] == ["speech_start", "utterance"] and ev[1][0] == 12 + 19
-          and len(logs) == 1 and "trigger=silence " in logs[0] and "quiet_ms=1520 " in logs[0],
-          f"kyutai turns: with the 0.5 s head low, the 1500 ms cap still ends the turn {ev} {logs}")
+    ev = run_kyutai(pad + [("▁think", 0.0)] + [(None, pause)] * 45, logs=logs)
+    check([k for _, k, _ in ev] == ["speech_start", "utterance"] and ev[1][0] == 12 + 38
+          and len(logs) == 1 and "trigger=silence cap=normal " in logs[0] and "quiet_ms=3040 " in logs[0],
+          f"kyutai turns: with the 0.5 s head low, the 3000 ms cap still ends the turn {ev} {logs}")
 
     for steps, when in ((0, "a fresh model"), (3001, "a reset")):
         ev = run_kyutai([("▁hi", 0.9)] + [(None, 0.9)] * 30, steps=steps)
@@ -179,7 +180,8 @@ def kyutai_end_of_turn(check: Checker) -> None:
     logs = []
     ev = run_kyutai(pad + [("▁open", 0.0), ("▁the", 0.0), ("▁file", 0.95)] + [(None, Pauses(0.9, 0.9, 0.8, 0.7))] * 8,
                     logs=logs)
-    pattern = (r"INFO kyutai turn end: trigger=semantic sent=utterance len_ms=720 quiet_ms=480 words=3 "
+    pattern = (r"INFO kyutai turn end: trigger=semantic cap=semantic tail=word sent=utterance len_ms=720 "
+               r"quiet_ms=480 words=3 "
                r"peak/final s05=0\.95/0\.90 s1=0\.95/0\.90 s2=0\.95/0\.80 s3=0\.95/0\.70")
     check(len(ev) == 2 and len(logs) == 1 and re.fullmatch(pattern, logs[0]),
           f"kyutai turns: one log line per turn end with trigger, length, quiet, words and peak/final heads {logs}")
@@ -574,9 +576,9 @@ def units() -> int:
     ev = run_kyutai([("▁mm", 0.0), ("▁hm", 0.0), (None, 0.0), ("▁wait", 0.0)] + [(None, 0.9)] * 8, speaking=True)
     check([k for _, k, _ in ev][:1] == ["speech_start"] and ev[0][0] == 3,
           f"kyutai turns: {BARGE_IN_WORDS} words to barge in while speaking {ev[:1]}")
-    ev = run_kyutai([("▁so", 0.0)] + [(None, 0.1)] * 30)
-    check([k for _, k, _ in ev] == ["speech_start", "utterance"] and ev[1][0] == 1 + 18,
-          "kyutai turns: 1500 ms without a word caps the turn")
+    ev = run_kyutai([("▁wait", 0.0)] + [(None, 0.5)] * 45)
+    check([k for _, k, _ in ev] == ["speech_start", "utterance"] and ev[1][0] == 38,
+          f"kyutai turns: 3000 ms without a word caps the turn while the model is unsure {ev}")
     kyutai_end_of_turn(check)
 
     check(spoken_model(SWITCH, "Okay, switch to Sonnet.") == "sonnet" and spoken_model(SWITCH, "Use opus to review this.") is None,

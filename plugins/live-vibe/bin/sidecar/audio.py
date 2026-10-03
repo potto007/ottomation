@@ -127,7 +127,9 @@ class Tuning:
     bargein_prob: float = 0.8  # stricter while the assistant is speaking
     bargein_frames: int = 8  # 256 ms sustained: speaker bleed rarely does this
     end_prob: float = 0.35  # below this counts as silence
-    end_silence_ms: int = 700  # trailing silence that ends a turn
+    end_silence_ms: int = 700  # trailing silence that ends a turn (Kyutai: the cap while the model is unsure)
+    end_silence_long_ms: int = 4000  # Kyutai: the cap when the model forecasts more speech or the text is unfinished
+    end_silence_short_ms: int = 1000  # Kyutai: the cap after terminal punctuation while the model is unsure
     min_speech_ms: int = 250  # shorter utterances are dropped (clicks, coughs)
     pre_roll_ms: int = 320  # audio kept from before the trigger
     max_utterance_s: float = 30.0

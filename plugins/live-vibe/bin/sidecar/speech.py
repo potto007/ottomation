@@ -50,10 +50,11 @@ def is_apple_silicon() -> bool:
 
 
 # -- STT: the recognizer and its turn detector, built on the listener thread -------------------------------------
-def recognizer(stt: str, asr: str, end_silence_ms: int, speaking: Callable[[], bool]) -> tuple[Detector, Callable[[Any], str]]:
+def recognizer(stt: str, asr: str, end_silence_ms: int, speaking: Callable[[], bool],
+               end_silence_long_ms: int = Tuning.end_silence_long_ms) -> tuple[Detector, Callable[[Any], str]]:
     """(detector, transcribe). Kyutai brings its own end of turn and passes text through; Whisper pairs with
     Silero (or the energy gate) and transcribes the utterance audio."""
-    tune = Tuning(end_silence_ms=end_silence_ms)
+    tune = Tuning(end_silence_ms=end_silence_ms, end_silence_long_ms=end_silence_long_ms)
     try:
         if stt == "kyutai":
             from .kyutai_cuda import load_kyutai
@@ -135,6 +136,28 @@ END_OF_TURN = 0.6  # pause-head threshold, as in Kyutai's Unmute. Extra heads 0.
 # second utterance. A semantic end needs the 2 s and the 0.5 s heads both above this for delay_steps steps in a row
 # with no new piece (each piece restarts the count) and eot_drain_ms since the last piece; see KyutaiTurns.
 HEADS_IGNORE_STEPS = 12  # the heads jitter for the first steps after a model reset (Unmute ignores these too)
+EOT_CONTINUE = 0.4  # below this the 2 s head forecasts more speech: the silence cap stretches to end_silence_long_ms
+S2_EMA_KEEP = 0.5  # the cap tier reads the 2 s head through an EMA (about 3 steps), so one jittery step cannot pick it
+CONTINUE_WORDS = frozenset(("and", "but", "or", "so", "because", "yet", "the", "a", "an", "to", "of", "in", "on",
+                            "with", "like", "um", "uh"))  # a transcript ending on one of these is unfinished
+TERMINAL = {".": "period", "?": "question", "!": "exclaim"}
+
+
+def turn_tail(text: str) -> str:
+    """How a transcript ends, as one token: 'comma', a TERMINAL class, 'ellipsis' (trailing off: neither finished
+    nor unfinished), a CONTINUE_WORDS word, 'word' for any other word, or 'none'. Kyutai's English output carries
+    punctuation ('are you running?'); without it only the word list applies, so the punctuation rules are no-ops."""
+    text = text.rstrip()
+    if not text:
+        return "none"
+    if text.endswith(("...", "\u2026")):
+        return "ellipsis"
+    if text[-1] == ",":
+        return "comma"
+    if text[-1] in TERMINAL:
+        return TERMINAL[text[-1]]
+    last = text.split()[-1].strip("\"'()[]:;-").lower()
+    return last if last in CONTINUE_WORDS else "word"
 
 
 def kyutai_cached() -> bool:
@@ -251,9 +274,18 @@ class KyutaiTurns:
       forecasts the end; the 0.5 s head confirms a pause is under way now (Kyutai's advice for mid-sentence
       cutoffs, delayed-streams-modeling issue 23); the drain keeps trailing pieces in the same utterance. The
       heads count for nothing in the first HEADS_IGNORE_STEPS steps after a model reset.
-    - silence: end_silence_ms without a new piece (a cap only).
+    - silence: no new piece for the cap of the tier in force, re-read every step:
+        long   (end_silence_long_ms): the 2 s head (S2_EMA_KEEP EMA) below EOT_CONTINUE, the model forecasting
+               more speech, or the text unfinished (turn_tail: a comma or a CONTINUE_WORDS word), whatever s2 says;
+        short  (end_silence_short_ms): the text ends on . ? ! and the head is not below EOT_CONTINUE;
+        normal (end_silence_ms): otherwise, the model unsure (0.4 <= s2 < 0.6, or above 0.6 but not held).
+      With no heads at all (every peak 0) only the text picks the tier. Long is never below normal nor above
+      max_utterance_s; short is never above normal. The industry's tiers: LiveKit 0.3 s / 2.5 s on
+      P(end) < unlikely_threshold, OpenAI semantic_vad medium 4 s, AssemblyAI conservative 3.6 s, Pipecat Smart
+      Turn 3 s fallback.
     - max: max_utterance_s.
-    Each end writes one 'kyutai turn end' line to the log file (trigger, length, heads; no text)."""
+    Each end writes one 'kyutai turn end' line to the log file (trigger, cap tier, tail token, length, heads; no
+    other text)."""
 
     IN_BLOCK = KYUTAI_BLOCK * SR // KYUTAI_SR  # 1280 input samples per 80 ms step
     MS_PER_STEP = 1000 * KYUTAI_BLOCK / KYUTAI_SR  # 80
@@ -268,6 +300,17 @@ class KyutaiTurns:
     def _clear(self) -> None:
         self.text, self.words, self.ends, self.started_at, self.last_word = "", 0, 0, None, 0
         self.peak = Pauses()
+        self.s2_ema: float | None = None
+
+    def _cap(self) -> tuple[str, float, str]:
+        """(tier, cap in ms, turn_tail) for the silence cap now; see the class docstring."""
+        t, tail = self.t, turn_tail(self.text)
+        s2 = self.s2_ema if any(self.peak) else None  # no heads: the text alone picks the tier
+        if tail == "comma" or tail in CONTINUE_WORDS or (s2 is not None and s2 < EOT_CONTINUE):
+            return "long", min(max(t.end_silence_long_ms, t.end_silence_ms), t.max_utterance_s * 1000), tail
+        if tail in TERMINAL.values():
+            return "short", min(t.end_silence_short_ms, t.end_silence_ms), tail
+        return "normal", t.end_silence_ms, tail
 
     def _resample(self, block: np.ndarray) -> np.ndarray:
         x = np.concatenate([[self.prev], block])  # 16 kHz -> 24 kHz, linear, continuous across blocks
@@ -303,12 +346,14 @@ class KyutaiTurns:
         if self.started_at is None:
             return events
         self.peak = Pauses(*map(max, self.peak, pauses))
+        self.s2_ema = pauses.s2 if self.s2_ema is None else S2_EMA_KEEP * self.s2_ema + (1 - S2_EMA_KEEP) * pauses.s2
         high = pauses.s2 > END_OF_TURN and pauses.s05 > END_OF_TURN
         self.ends = self.ends + 1 if high and piece is None else 0  # a new piece restarts the count
         quiet_ms = (step - self.last_word) * self.MS_PER_STEP
+        cap, cap_ms, tail = self._cap()
         if self.ends >= self.stt.delay_steps and quiet_ms >= self.t.eot_drain_ms:
-            trigger = "semantic"
-        elif quiet_ms >= self.t.end_silence_ms:
+            trigger, cap = "semantic", "semantic"
+        elif quiet_ms >= cap_ms:
             trigger = "silence"
         elif (step - self.started_at) * self.MS_PER_STEP >= self.t.max_utterance_s * 1000:
             trigger = "max"
@@ -321,7 +366,7 @@ class KyutaiTurns:
             events.append(("utterance", text) if ok else ("discard", None))
             sent = events[-1][0]
         heads = " ".join(f"{k}={pk:.2f}/{v:.2f}" for k, pk, v in zip(Pauses._fields, self.peak, pauses))
-        file_log("INFO", f"kyutai turn end: trigger={trigger} sent={sent} "
+        file_log("INFO", f"kyutai turn end: trigger={trigger} cap={cap} tail={tail} sent={sent} "
                          f"len_ms={(step - self.started_at + 1) * self.MS_PER_STEP:.0f} quiet_ms={quiet_ms:.0f} "
                          f"words={self.words} peak/final {heads}")
         self.active = False
