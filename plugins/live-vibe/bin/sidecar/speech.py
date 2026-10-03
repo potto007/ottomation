@@ -149,6 +149,7 @@ TERMINAL = {".": "period", "?": "question", "!": "exclaim"}
 P_UNFINISHED = 0.3  # an unfinished tail (comma, CONTINUE_WORDS) caps p here
 P_TERMINAL = 0.7  # terminal punctuation floors p here
 P_NO_HEADS = 0.5  # a model without pause heads: neither "more coming" nor "done"; the text alone moves p
+MAX_EXTEND_STEP_S = 10  # past max_utterance_s, a turn still forecast to go on is re-judged this often
 
 
 def turn_tail(text: str) -> str:
@@ -292,7 +293,9 @@ class KyutaiTurns:
       max_utterance_s; short is never above normal. The industry's tiers: LiveKit 0.3 s / 2.5 s on
       P(end) < unlikely_threshold, OpenAI semantic_vad medium 4 s, AssemblyAI conservative 3.6 s, Pipecat Smart
       Turn 3 s fallback.
-    - max: max_utterance_s.
+    - max: max_utterance_s, if the end-of-turn probability (_p) is at least END_OF_TURN or the model has no
+      heads; otherwise the limit moves MAX_EXTEND_STEP_S at a time, up to max_utterance_extend_s, where the turn
+      ends regardless. The log line carries extended=<s past max_utterance_s>.
     - backchannel: a turn that cut the assistant and is only backchannel words so far (audio.is_backchannel) ends
       after backchannel_quiet_ms without a new piece, so the paused voice can resume.
     Each end writes one 'kyutai turn end' line to the log file (trigger, cap tier, tail token, length, heads; no
@@ -320,6 +323,7 @@ class KyutaiTurns:
         self.gate.reset()
         self.peak = Pauses()
         self.s2_ema: float | None = None
+        self.extended = 0.0  # seconds this turn runs past max_utterance_s
 
     def _cap(self) -> tuple[str, float, str]:
         """(tier, cap in ms, turn_tail) for the silence cap now; see the class docstring."""
@@ -400,7 +404,11 @@ class KyutaiTurns:
             trigger, cap = "backchannel", "backchannel"
         elif quiet_ms >= cap_ms:
             trigger = "silence"
-        elif (step - self.started_at) * self.MS_PER_STEP >= self.t.max_utterance_s * 1000:
+        elif (step - self.started_at) * self.MS_PER_STEP >= (self.t.max_utterance_s + self.extended) * 1000:
+            room = max(self.t.max_utterance_s, self.t.max_utterance_extend_s) - self.t.max_utterance_s - self.extended
+            if room > 0 and any(self.peak) and (p if p is not None else self._p(pauses.s05)) < END_OF_TURN:
+                self.extended += min(MAX_EXTEND_STEP_S, room)  # still speaking: no mid-sentence cut yet
+                return events
             trigger = "max"
         else:
             return events
@@ -412,7 +420,8 @@ class KyutaiTurns:
             sent = events[-1][0]
         heads = " ".join(f"{k}={pk:.2f}/{v:.2f}" for k, pk, v in zip(Pauses._fields, self.peak, pauses))
         cont = f" wait_ms={wait_ms} p={p:.2f}" if p is not None else ""
-        file_log("INFO", f"kyutai turn end: trigger={trigger} cap={cap}{cont} tail={tail} sent={sent} "
+        ext = f" extended={self.extended:.0f}" if trigger == "max" else ""
+        file_log("INFO", f"kyutai turn end: trigger={trigger}{ext} cap={cap}{cont} tail={tail} sent={sent} "
                          f"len_ms={(step - self.started_at + 1) * self.MS_PER_STEP:.0f} quiet_ms={quiet_ms:.0f} "
                          f"words={self.words} peak/final {heads}")
         self.active = False
