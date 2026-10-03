@@ -1095,9 +1095,12 @@ class _HeadTap:
 class TurnWatch:
     """Experimental: the recognizer's detector, watched on the listener thread for what the front needs and speech.py
     does not send. Kyutai only (a detector with `stt` and `text`); anything else passes through unchanged.
-    - ("eot_likely", text): the first step of a turn on which the 2 s pause head's EMA (p, kept as KyutaiTurns keeps
-      it) is above LIKELY with no new word piece: the end of the turn is likely, so the front may speculate (L6).
-      Once per text; ("eot_retract", None) when a word piece arrives after it.
+    - ("eot_likely", text): the first step of a turn on which the 2 s pause head, or its EMA (p, kept as KyutaiTurns
+      keeps it), is above LIKELY with no new word piece: the end of the turn is likely, so the front may speculate
+      (L6). Once per text; ("eot_retract", None) when a word piece arrives after it. The 2 s head alone, not the
+      0.5 s head that confirms a semantic end: with the STT flush on, that confirmation ends the turn within the
+      same step, so only the 2 s head's earlier rise (and the whole continuous wait of a non-semantic end) leaves
+      time to hide the front's reply in.
     - ("listening_pause", seconds into the turn): a pause with more speech coming during long dictation (over
       BACKCHANNEL_AFTER_S into the turn, the 0.5 s head above 0.8 and p below 0.4), at most once a second; the
       session decides whether to say "mm-hm" (L7).
@@ -1151,7 +1154,7 @@ class TurnWatch:
             if self.likely is not None:
                 self.likely = None
                 events.append(("eot_retract", None))
-        elif self.likely is None and self.p > self.LIKELY and (text := str(self.inner.text).strip()):
+        elif self.likely is None and max(s2, self.p) > self.LIKELY and (text := str(self.inner.text).strip()):
             self.likely = text
             events.append(("eot_likely", text))
         seconds = self.steps * self.MS_PER_STEP / 1000

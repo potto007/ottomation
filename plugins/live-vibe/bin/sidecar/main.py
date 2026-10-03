@@ -157,8 +157,9 @@ def run(args: argparse.Namespace, life: protocol.Lifecycle) -> int:
     if args.fake_audio:
         build = lambda: (speech.NoSpeech(), str)  # noqa: E731
     else:
+        # --experimental: Kyutai's continuous end-of-turn wait and STT flush (Tuning.eot_continuous, stt_flush)
         build = lambda: speech.recognizer(args.stt, args.asr, args.end_silence_ms, guard.active,  # noqa: E731
-                                          args.end_silence_long_ms, guard)
+                                          args.end_silence_long_ms, guard, experimental=args.experimental)
         if args.mode == "front" and args.experimental:  # the front's view of the turn: speculation, backchannels
             from sidecar.front import TurnWatch
 
@@ -221,7 +222,8 @@ def tuning(args: argparse.Namespace):
 
     experimental = bool(getattr(args, "experimental", False))
     return Tuning(end_silence_ms=args.end_silence_ms, end_silence_long_ms=args.end_silence_long_ms,
-                  experimental=experimental, backchannels=experimental and bool(getattr(args, "backchannels", False)))
+                  experimental=experimental, backchannels=experimental and bool(getattr(args, "backchannels", False)),
+                  eot_continuous=experimental, stt_flush=experimental)  # as speech.recognizer sets them
 
 
 async def serve(args, life: protocol.Lifecycle, listener, voice, sd, mic, t0: float) -> int:
