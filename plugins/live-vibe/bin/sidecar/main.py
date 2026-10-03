@@ -5,7 +5,7 @@
 #   "numpy>=2",
 #   "sounddevice>=0.5",
 #   "onnxruntime>=1.20; sys_platform != 'linux' or platform_machine != 'x86_64'",
-#   "onnxruntime-gpu[cuda,cudnn]>=1.22; sys_platform == 'linux' and platform_machine == 'x86_64'",
+#   "onnxruntime-gpu[cuda,cudnn]>=1.22,<1.27; sys_platform == 'linux' and platform_machine == 'x86_64'",
 #   "faster-whisper>=1.2",
 #   "kokoro-onnx>=0.6",
 #   "httpx>=0.28",
@@ -16,6 +16,8 @@
 # ]
 # [tool.uv]
 # # kokoro-onnx requires onnxruntime, which would overwrite onnxruntime-gpu's files (one module, two wheels).
+# # onnxruntime-gpu stays below 1.27, the last CUDA 12 build: torch (moshi) and CTranslate2 use CUDA 12, and
+# # cuDNN's cu12 and cu13 wheels share the soname libcudnn.so.9, so one process should load one family.
 # override-dependencies = ["onnxruntime>=1.20; sys_platform != 'linux' or platform_machine != 'x86_64'"]
 # ///
 """Audio sidecar for the live-vibe mod. It owns the mic and speaker in two modes:
@@ -103,7 +105,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def run(args: argparse.Namespace, life: protocol.Lifecycle) -> int:
-    from sidecar import audio, speech
+    from sidecar import audio, gpu, speech
     from sidecar.echo import EchoGuard, EchoReference
 
     emit(type="state", state="loading")
@@ -123,6 +125,8 @@ def run(args: argparse.Namespace, life: protocol.Lifecycle) -> int:
     else:
         build = lambda: speech.recognizer(args.stt, args.asr, args.end_silence_ms, guard.active)  # noqa: E731
     listener = audio.Listener(build, life.quit, guard, aec=sd is not None and args.aec == "on")
+    if not args.fake_audio:  # the recognizer has the first claim on the GPU; Kokoro takes what is left
+        gpu.hold("stt", speech.stt_gpu_need(args.stt))
     listener.start()
     try:
         tts = speech.SilentTTS() if args.fake_audio else speech.make_tts(args.tts, args.voice, args.tts_device)

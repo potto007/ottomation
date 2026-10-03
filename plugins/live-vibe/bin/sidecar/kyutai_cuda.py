@@ -21,7 +21,7 @@ from typing import Any, Protocol
 
 import numpy as np
 
-from . import speech
+from . import gpu, speech
 from .protocol import log, warn
 
 # The model (bf16), Mimi and the CUDA graphs allocate about 2.4 GiB, and with the CUDA
@@ -59,17 +59,17 @@ def cuda_unavailable() -> str | None:
 
     if not torch.cuda.is_available():
         return "PyTorch sees no CUDA GPU"
-    free, _total = torch.cuda.mem_get_info()
-    if free < MIN_FREE_GIB * 2**30:
-        return (
-            f"only {free / 2**30:.1f} GiB of GPU memory free, it needs "
-            f"{MIN_FREE_GIB:.0f}"
-        )
-    return None
+    # nvidia-smi first: torch's reading opens a CUDA context, which costs VRAM a full GPU does not have
+    free = gpu.read_free_gib()
+    if free is None:
+        free = torch.cuda.mem_get_info()[0] / 2**30
+    need = gpu.NEED_GIB["kyutai"]
+    return gpu.admit("stt", need, MIN_FREE_GIB - need, free)
 
 
 def kyutai_backend() -> tuple[str | None, str]:
-    """('mlx' | 'cuda', '') when Kyutai STT can run here, else (None, why not)."""
+    """('mlx' | 'cuda', '') when Kyutai STT can run here, else (None, why not). On CUDA the recognizer's GPU claim
+    ("stt" in gpu.py) now holds Kyutai's share, until the caller releases it."""
     if speech.is_apple_silicon():
         return "mlx", ""
     why = cuda_unavailable()

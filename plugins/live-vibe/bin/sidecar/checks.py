@@ -24,7 +24,7 @@ from typing import Any, Callable
 
 import numpy as np
 
-from . import protocol
+from . import gpu, protocol
 from .audio import FRAME, SR, CannotStart, Player, check_devices, SentenceSplitter, Tuning, TurnDetector, Voice, speakable
 from .echo import EchoCanceller, EchoGuard, EchoReference
 from .front import (EVENT, HISTORY_MAX, _FALLBACKS, _NO_EFFORT, Brain, Delegator, FrontSession, LlamaCppBrain,
@@ -162,14 +162,103 @@ def kyutai_choice(check: Checker) -> None:
         import torch
 
         free = int((kc.MIN_FREE_GIB - 1) * 2**30)
-        with patched((torch.cuda, "is_available", lambda: True), (torch.cuda, "mem_get_info", lambda *a: (free, 32 * 2**30))):
+        with patched((torch.cuda, "is_available", lambda: True), (gpu, "read_free_gib", lambda: None),
+                     (torch.cuda, "mem_get_info", lambda *a: (free, 32 * 2**30))):
             why = kc.cuda_unavailable()
         check(why is not None and "GiB of GPU memory free" in why, f"kyutai choice: a busy GPU is no GPU {why!r}")
+        asked: list[int] = []
+        with patched((torch.cuda, "is_available", lambda: True), (gpu, "read_free_gib", lambda: 2.5),
+                     (torch.cuda, "mem_get_info", lambda *a: asked.append(1) or (40 * 2**30, 0))):
+            why = kc.cuda_unavailable()
+        check(why is not None and "2.5 GiB" in why and not asked,
+              f"kyutai choice: nvidia-smi's reading decides, without a CUDA context {why!r}")
+        gpu.release("stt")
         with patched((torch.cuda, "is_available", lambda: False)):
             why = kc.cuda_unavailable()
         check(why == "PyTorch sees no CUDA GPU", f"kyutai choice: torch without CUDA {why!r}")
     else:
         print("SKIP  kyutai choice: torch not installed here (not Linux x86_64), CUDA probe not exercised", flush=True)
+
+
+def gpu_budget(check: Checker) -> None:
+    """The shared VRAM budget and each backend's fallback to the CPU on a full GPU (mocked readings; nothing
+    touches a GPU)."""
+    from . import speech
+
+    def admit(free: float | None, name: str, need: float, stt_held: float = 0.0) -> str | None:
+        with patched((gpu, "read_free_gib", lambda: free)):
+            if stt_held:
+                gpu.hold("stt", stt_held)
+            try:
+                return gpu.admit(name, need)
+            finally:
+                gpu.release("stt")
+                gpu.release(name)
+
+    full = admit(2.5, "tts", gpu.NEED_GIB["kokoro"])
+    roomy = admit(20.0, "tts", gpu.NEED_GIB["kokoro"], stt_held=gpu.NEED_GIB["kyutai"])
+    shared = admit(7.0, "tts", gpu.NEED_GIB["kokoro"], stt_held=gpu.NEED_GIB["kyutai"])
+    unknown = admit(None, "tts", gpu.NEED_GIB["kokoro"])
+    check(full is not None and "only 2.5 GiB" in full and roomy is None and shared is not None
+          and "claimed by the other" in shared and unknown is not None and not gpu.claimed(),
+          f"gpu budget: room after the need and the others' claims, else why {[full, shared, unknown]}")
+    gpu.hold("stt", 3.2)
+    with patched((gpu, "read_free_gib", lambda: 20.0)):
+        took = gpu.admit("tts", 1.4) is None and gpu.claimed(exclude="stt") == 1.4
+    gpu.release("stt")
+    gpu.release("tts")
+    check(took and not gpu.claimed(), "gpu budget: an admitted backend holds its share until released")
+
+    import onnxruntime as ort
+
+    class FakeSession:
+        def __init__(self, model: str, so: Any = None, providers: list[Any] | None = None) -> None:
+            self.providers = [p[0] if isinstance(p, tuple) else p for p in providers or []]
+
+        def get_providers(self) -> list[str]:
+            return self.providers
+
+    def kokoro(free: float) -> tuple[list[str], str]:
+        with patched((ort, "InferenceSession", FakeSession), (gpu, "read_free_gib", lambda: free),
+                     (ort, "get_available_providers", lambda: ["CUDAExecutionProvider", "CPUExecutionProvider"]),
+                     *([(ort, "preload_dlls", lambda *a, **k: None)] if hasattr(ort, "preload_dlls") else [])):
+            sess, why = speech.kokoro_session("model.onnx", "auto")
+        gpu.release("tts")
+        return sess.get_providers(), why
+
+    on_full, why_full = kokoro(2.5)
+    on_roomy, why_roomy = kokoro(20.0)
+    check(on_full == ["CPUExecutionProvider"] and "2.5 GiB" in why_full and on_roomy[0] == "CUDAExecutionProvider"
+          and not why_roomy, f"kokoro: CPU on a full GPU, CUDA with room {on_full} {why_full!r}")
+
+    class FakeWhisperModel:
+        def __init__(self, size: str, device: str, compute_type: str) -> None:
+            self.device = device
+
+        def transcribe(self, *a: Any, **k: Any) -> tuple[list[Any], None]:
+            return [], None
+
+    fake_fw = type(sys)("faster_whisper")
+    fake_fw.WhisperModel = FakeWhisperModel  # type: ignore[attr-defined]
+    out: list[dict[str, Any]] = []
+    protocol.capture(out)
+    try:
+        with patched((speech, "_cuda_devices", lambda: 1), (gpu, "read_free_gib", lambda: 2.5)):
+            saved = sys.modules.get("faster_whisper")
+            sys.modules["faster_whisper"] = fake_fw
+            try:
+                w = speech.WhisperASR("base.en")
+            finally:
+                if saved is not None:
+                    sys.modules["faster_whisper"] = saved
+                else:
+                    del sys.modules["faster_whisper"]
+    finally:
+        protocol.capture(None)
+        gpu.release("stt")
+    said = [o["text"] for o in out]
+    check(w.device == "cpu" and len(said) == 1 and "CPU int8" in said[0] and "2.5 GiB" in said[0],
+          f"whisper: CPU on a full GPU, one log line {said}")
 
 
 def units() -> int:
@@ -265,6 +354,7 @@ def units() -> int:
         sys.platform = real
     check("macOS only" in msg and "apt install espeak-ng" in msg, f"say off macOS: one fatal message naming the fix {msg!r}")
     kyutai_choice(check)
+    gpu_budget(check)
 
     echo_units(check)
     print("UNIT: ALL PASS" if check.ok else "UNIT: SOME CHECKS FAILED", flush=True)

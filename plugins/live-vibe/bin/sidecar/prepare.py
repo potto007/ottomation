@@ -49,6 +49,9 @@ def run(args: argparse.Namespace) -> int:
          text=f"Python {sys.version.split()[0]} with the sidecar's packages (uv installed them)")
 
     sd, mic, speaker = audio_devices(check, args)
+    from . import gpu, speech
+
+    gpu.hold("stt", speech.stt_gpu_need(args.stt))  # as in a live run: the recognizer has the first claim
     tts = synthesizer(check, args)
     recognized = recognizer(check, args)
     if tts is not None and recognized is not None:
