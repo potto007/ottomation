@@ -92,10 +92,102 @@ class FakeKyutai:
         return payload if isinstance(payload, str) else ""
 
 
-def run_kyutai(script: list[tuple[str | None, float | Pauses]], speaking: bool = False) -> list[tuple[int, str, Any]]:
-    turns = KyutaiTurns(FakeKyutai(script), Tuning(end_silence_ms=1500), lambda: speaking)
+def run_kyutai(script: list[tuple[str | None, float | Pauses]], speaking: bool = False, steps: int = 0,
+               logs: list[str] | None = None) -> list[tuple[int, str, Any]]:
+    """(script index, event kind, value) for the script fed through KyutaiTurns; `steps` presets the fake model's
+    step count (above 3000, the first step resets it), and `logs` collects the file_log lines."""
+    from . import speech
+
+    stt = FakeKyutai(script)
+    stt.steps = steps
+    turns = KyutaiTurns(stt, Tuning(end_silence_ms=1500), lambda: speaking)
     block = KYUTAI_BLOCK * SR // KYUTAI_SR
-    return [(i, k, v) for i in range(len(script) + 25) for k, v in turns.feed(np.zeros(block, np.float32))]
+    sink = logs if logs is not None else []
+    with patched((speech, "file_log", lambda level, text: sink.append(f"{level} {text}"))):
+        return [(i, k, v) for i in range(len(script) + 25) for k, v in turns.feed(np.zeros(block, np.float32))]
+
+
+def kyutai_end_of_turn(check: Checker) -> None:
+    """KyutaiTurns' semantic end of turn: the 2 s and 0.5 s pause heads both high for 6 steps after the last piece,
+    the trailing pieces drained, the jittery first steps after a reset ignored; the caps unchanged."""
+    fake = FakeKyutai([("▁a", 0.7), (None, Pauses(0.1, 0.2, 0.3, 0.4))])
+    got = [fake.step(None), fake.step(None), fake.step(None)]
+    fake.reset()
+    check(got == [("▁a", Pauses(0.7, 0.7, 0.7, 0.7)), (None, Pauses(0.1, 0.2, 0.3, 0.4)), (None, Pauses())]
+          and fake.steps == 0, f"fake kyutai: a float stands for all four heads, reset() restarts the steps {got}")
+    check(Pauses.of([0.3]) == Pauses(0.3, 0.0, 0.0, 0.0) and Pauses.of([1, 2, 3, 4, 5]) == Pauses(1, 2, 3, 4),
+          "kyutai pauses: missing heads read 0, extra heads are dropped")
+
+    if importlib.util.find_spec("torch") is not None:  # the CUDA backend's step() on CPU tensors, model stubbed
+        import torch
+
+        from .kyutai_cuda import KyutaiCudaSTT
+
+        class Stub:
+            def __init__(self, **kw: Any) -> None:
+                self.__dict__.update(kw)
+
+        def cuda_step(heads: int, token: int) -> tuple[str | None, Pauses]:
+            k = object.__new__(KyutaiCudaSTT)
+            k._torch, k.device, k._steps = torch, "cpu", 0
+            k.mimi = Stub(encode=lambda x: torch.zeros(1, 32, 1))
+            p = [torch.tensor([[[0.1 * (i + 1), 1 - 0.1 * (i + 1)]]]) for i in range(heads)]
+            k.gen = Stub(step_with_extra_heads=lambda codes: (torch.full((1, 1, 1), token), p))
+            k.tok = Stub(id_to_piece=lambda t: f"piece{t}")
+            return k.step(np.zeros(KYUTAI_BLOCK, np.float32))
+
+        four, two, pad_token = cuda_step(4, 7), cuda_step(2, 7), cuda_step(4, 3)
+        check(four[0] == "piece7" and isinstance(four[1], Pauses) and np.allclose(four[1], (0.1, 0.2, 0.3, 0.4))
+              and np.allclose(two[1], (0.1, 0.2, 0, 0)) and pad_token[0] is None,
+              f"kyutai cuda: step() returns the piece and heads 0..3 (class 0), zero for a missing head {four} {two}")
+    else:
+        print("SKIP  kyutai cuda: torch not installed here, step() parsing not exercised", flush=True)
+
+    pad = [(None, 0.0)] * 12
+    said = [("▁are", 0.0), ("▁you", 0.0), ("▁runn", 0.0)]
+    for k in range(1, 6):  # the trailing piece lands on the k-th step with the heads high
+        script = pad + said + [(None, 0.9)] * (k - 1) + [("ing?", 0.9)] + [(None, 0.9)] * 8
+        ev = run_kyutai(script)
+        last = len(pad) + len(said) + k - 1
+        check([k_ for _, k_, _ in ev] == ["speech_start", "utterance"] and ev[1][2] == "are you running?"
+              and ev[1][0] == last + 6,
+              f"kyutai turns: a piece {k} step(s) into the high heads joins the utterance, 6 steps on {ev}")
+    script = pad + said + [(None, 0.9)] * 2 + [("ing", 0.9)] + [(None, 0.9)] * 3 + [("?", 0.9)] + [(None, 0.9)] * 8
+    ev = run_kyutai(script)
+    check([k for _, k, _ in ev] == ["speech_start", "utterance"] and ev[1][2] == "are you running?"
+          and ev[1][0] == 12 + 3 + 6 + 6,
+          f"kyutai turns: each trailing piece restarts the count (the old rule split at the 6th high step) {ev}")
+
+    pause = Pauses(0.1, 0.5, 0.9, 0.7)  # the 2 s head forecasts the end, the 0.5 s head says words are coming
+    script = pad + [("▁so", 0.0), ("▁I", 0.0), ("▁think", 0.0)] + [(None, pause)] * 15 + [("▁that", 0.0)] \
+        + [(None, 0.9)] * 8
+    ev = run_kyutai(script)
+    check([k for _, k, _ in ev] == ["speech_start", "utterance"] and ev[1][2] == "so I think that"
+          and ev[1][0] == 12 + 3 + 15 + 6,
+          f"kyutai turns: the 2 s head high with the 0.5 s head low is a mid-sentence pause, not an end {ev}")
+    logs: list[str] = []
+    ev = run_kyutai(pad + [("▁so", 0.0)] + [(None, pause)] * 30, logs=logs)
+    check([k for _, k, _ in ev] == ["speech_start", "utterance"] and ev[1][0] == 12 + 19
+          and len(logs) == 1 and "trigger=silence " in logs[0] and "quiet_ms=1520 " in logs[0],
+          f"kyutai turns: with the 0.5 s head low, the 1500 ms cap still ends the turn {ev} {logs}")
+
+    for steps, when in ((0, "a fresh model"), (3001, "a reset")):
+        ev = run_kyutai([("▁hi", 0.9)] + [(None, 0.9)] * 30, steps=steps)
+        check([k for _, k, _ in ev] == ["speech_start", "utterance"] and ev[1][0] == 12 + 5,
+              f"kyutai turns: the heads count from the 13th step after {when} {ev}")
+
+    logs = []
+    ev = run_kyutai(pad + [("▁open", 0.0), ("▁the", 0.0), ("▁file", 0.95)] + [(None, Pauses(0.9, 0.9, 0.8, 0.7))] * 8,
+                    logs=logs)
+    pattern = (r"INFO kyutai turn end: trigger=semantic sent=utterance len_ms=720 quiet_ms=480 words=3 "
+               r"peak/final s05=0\.95/0\.90 s1=0\.95/0\.90 s2=0\.95/0\.80 s3=0\.95/0\.70")
+    check(len(ev) == 2 and len(logs) == 1 and re.fullmatch(pattern, logs[0]),
+          f"kyutai turns: one log line per turn end with trigger, length, quiet, words and peak/final heads {logs}")
+    logs = []
+    ev = run_kyutai([(f"▁w{i}", 0.0) for i in range(380)], logs=logs)[:2]  # the 4 words after open a new turn
+    check([k for _, k, _ in ev] == ["speech_start", "utterance"] and ev[1][0] == 375
+          and "trigger=max " in logs[0] and "words=376" in logs[0],
+          f"kyutai turns: 30 s of words ends at max_utterance_s {ev[1][0] if len(ev) > 1 else ev} {logs}")
 
 
 @contextmanager
@@ -485,6 +577,7 @@ def units() -> int:
     ev = run_kyutai([("▁so", 0.0)] + [(None, 0.1)] * 30)
     check([k for _, k, _ in ev] == ["speech_start", "utterance"] and ev[1][0] == 1 + 18,
           "kyutai turns: 1500 ms without a word caps the turn")
+    kyutai_end_of_turn(check)
 
     check(spoken_model(SWITCH, "Okay, switch to Sonnet.") == "sonnet" and spoken_model(SWITCH, "Use opus to review this.") is None,
           "spoken switch: the mod's pattern over the mod's normalization")
