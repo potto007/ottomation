@@ -48,6 +48,12 @@ const RELAY_SECTION = `<live-vibe-relay>
 Live vibe is ON. The user is talking to a voice front, a small fast model that hands their spoken requests to you and relays your final answer of each turn back to them, summarized in one or two spoken sentences. End every turn with a concise plain-text report the front can summarize: what you did, what you found or changed, whether it is verified, and whether work is still running in the background (workers spawned, results pending). No spoken style needed, but lead with the outcome and leave out long listings unless asked. A bracketed note such as "[The user, by voice, adds ...]" is a live addition to act on at once. A request that starts "User said:" quotes the user's own words, then the front's reading of them; where they differ, go by the user's words. A note "[The user, by voice, to the voice front (no task asked): ...]" is information, such as a confirmation, a correction or a decision: take it as fact from the user in your next answer; it needs no reply of its own. When a turn brings the user nothing new (a worker's notification that repeats what you already reported, a result already relayed), reply with exactly: (nothing to add). The front then says nothing, and the transcript shows one dim "no update" line.
 </live-vibe-relay>`
 
+// The experimental voice path (userConfig `experimental`): the front retells only a Status line and the sentences after
+// it, and keeps the rest as silent context, as GPT-Live's commentary and thinking appends. One constant per setting,
+// so the section stays byte-stable in Claude's prompt cache for the whole session.
+const RELAY_SECTION_EXPERIMENTAL = RELAY_SECTION.replace('</live-vibe-relay>', `End every answer, after the report, with one line \`Status: working\`, \`Status: done\`, \`Status: failed\` or \`Status: cancelled\` (working while anything you started still runs), then at most three short plain sentences for the voice to say: the outcome first, a question for the user last. The front retells only those lines; the rest of your answer stays on screen and reaches the front as background it can use for status questions. The "(nothing to add)" reply has no Status line.
+</live-vibe-relay>`)
+
 // A whole utterance that only asks for another model ("switch to sonnet", "change the model to opus please", "use haiku").
 // Anchored at both ends, so a request that merely mentions a model ("use opus to review this") stays a prompt.
 // The live vibe sidecar receives this source as --switch-pattern, so both modes match the same words.
@@ -344,6 +350,8 @@ function startSidecar($: EngineInterface, options: PluginOptions, mode: LiveMode
     if (options.speaker) argv.push('--speaker', String(options.speaker))
     if (options.speakerBackend) argv.push('--speaker-backend', String(options.speakerBackend))
     if (options.logFile) argv.push('--log-file', String(options.logFile))
+    if (options.experimental) argv.push('--experimental')
+    if (options.experimental && options.backchannels && mode === 'livevibe') argv.push('--backchannels')
     if (mode === 'livevibe') {
       argv.push('--front-backend', String(options.frontBackend), '--front-url', String(options.frontUrl),
         '--switch-pattern', SPOKEN_SWITCH.source, ...frontServerArgv(options))
@@ -549,7 +557,9 @@ export const register: Register = (on, options) => {
     // Only the main loop lists Agent; a worker's own prompt must not be told it is the director.
     const isMain = e.tools.includes('Agent')
     if ((await read($, isVibe)) && isMain) out.push({ id: `${PLUGIN}:vibe`, text: VIBE_SECTION, scope: 'session' })
-    if (l.isOn && l.mode === 'livevibe' && isMain) out.push({ id: `${PLUGIN}:relay`, text: RELAY_SECTION, scope: 'session' })
+    if (l.isOn && l.mode === 'livevibe' && isMain) {
+      out.push({ id: `${PLUGIN}:relay`, text: options.experimental ? RELAY_SECTION_EXPERIMENTAL : RELAY_SECTION, scope: 'session' })
+    }
     if (l.isOn && l.mode !== 'livevibe') out.push({ id: `${PLUGIN}:voice`, text: VOICE_SECTION, scope: 'session' })
     return { sections: out }
   })

@@ -490,3 +490,38 @@ test("live vibe: a notification turn's '(nothing to add)' is not relayed, and th
   await $.command.run({ command: 'livevibe', ...typed })
   sidecar.release()
 })
+
+test('experimental (the default) reaches the sidecar, and the relay prompt asks for a Status line', { options: { backchannels: true } }, async ($, on) => {
+  const argvs: string[] = []
+  const sidecar = fakeSidecar(4321)
+  on('process.spawn', async function* (_$, e) { argvs.push(e.argv.join(' ')); return yield* sidecar.spawn() })
+  on('http.fetch', () => ok)
+  on('prompt.compose', () => ({ sections: [] }))
+
+  await $.command.run({ command: 'livevibe', ...typed })
+  await sidecar.isUp
+  const relay = (await $.prompt.compose(compose(['Read', 'Agent']))).sections.find(x => x.id === 'live-vibe:relay')
+  expect(argvs[0]).toContain('--experimental')
+  expect(argvs[0]).toContain('--backchannels')
+  expect(relay?.text).toContain('`Status: working`, `Status: done`, `Status: failed` or `Status: cancelled`')
+  expect(relay?.text).toContain('reply with exactly: (nothing to add)')
+  await $.command.run({ command: 'livevibe', ...typed })
+  sidecar.release()
+})
+
+test('experimental off: no flags, and the 0.6.4 relay prompt', { options: { experimental: false, backchannels: true } }, async ($, on) => {
+  const argvs: string[] = []
+  const sidecar = fakeSidecar(4321)
+  on('process.spawn', async function* (_$, e) { argvs.push(e.argv.join(' ')); return yield* sidecar.spawn() })
+  on('http.fetch', () => ok)
+  on('prompt.compose', () => ({ sections: [] }))
+
+  await $.command.run({ command: 'livevibe', ...typed })
+  await sidecar.isUp
+  const relay = (await $.prompt.compose(compose(['Read', 'Agent']))).sections.find(x => x.id === 'live-vibe:relay')
+  expect(argvs[0]).not.toContain('--experimental')
+  expect(argvs[0]).not.toContain('--backchannels')
+  expect(relay?.text).not.toContain('Status:')
+  await $.command.run({ command: 'livevibe', ...typed })
+  sidecar.release()
+})

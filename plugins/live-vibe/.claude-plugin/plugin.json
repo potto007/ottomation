@@ -106,6 +106,18 @@
       "description": "Empty: whatever the llamacpp server serves, or claude-haiku-4-5 for anthropic. Set it when the server hosts several models.",
       "default": ""
     },
+    "experimental": {
+      "type": "boolean",
+      "title": "Experimental voice path",
+      "description": "Turns on the experimental voice path: stable front cache, STT flush, continuous end-of-turn wait, commentary relay and speculative front replies. Off restores the 0.6.4 behaviour.",
+      "default": true
+    },
+    "backchannels": {
+      "type": "boolean",
+      "title": "Live vibe: backchannels",
+      "description": "The front's short \"mm-hm\" during long dictation (needs the experimental voice path). Leave it off on open speakers.",
+      "default": false
+    },
     "logFile": {
       "type": "string",
       "title": "Sidecar log file",
