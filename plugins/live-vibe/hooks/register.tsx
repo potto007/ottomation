@@ -57,6 +57,11 @@ function spokenModel(text: string): string | undefined {
   return SPOKEN_SWITCH.exec(text.toLowerCase().replace(/[^a-z ]+/g, ' ').replace(/\s+/g, ' ').trim())?.[1]
 }
 
+// After a delegation's two readings: the front's gloss is a hint, never a task of its own (seen with Qwen3-4B: "how
+// are we doing?" handed off as "Review the current status of all running tasks and logs").
+const READING = "Answer the user's words; treat the front's reading as a hint, and if it is a question about status or "
+  + 'progress, answer from what you know rather than starting new work.'
+
 // Claude's whole answer to a voice question when the front's own holding line already says enough: never posted.
 const NOTHING_TO_ADD = '(nothing to add)'
 
@@ -145,8 +150,8 @@ async function onSidecar($: EngineInterface, msg: Record<string, unknown>) {
         await toClaude($, text, `[The user, by voice, adds a request while you work: "${text}". Take it into account now.]`)
         break
       }
-      await toClaude($, `User said: "${said}"\nThe voice front read it as: ${text}`,
-        `[The user, by voice, adds while you work: "${said}". The voice front read it as: ${text}. Take it into account now.]`)
+      await toClaude($, `User said: "${said}". The voice front read it as a task: ${text}. ${READING}`,
+        `[The user, by voice, adds while you work: "${said}". The voice front read it as a task: ${text}. ${READING}]`)
       break
     }
     // A user turn the front answered itself: a confirmation, a correction or a decision is still Claude's to know.

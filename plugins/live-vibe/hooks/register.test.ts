@@ -115,7 +115,9 @@ test("live vibe: a delegate carries the user's own words beside the front's read
 
   await $.command.run({ command: 'livevibe', ...typed })
 
-  expect(await prompted).toBe('User said: "So what was the fix?"\nThe voice front read it as: Summarize the log report')
+  expect(await prompted).toBe('User said: "So what was the fix?". The voice front read it as a task: Summarize the log '
+    + "report. Answer the user's words; treat the front's reading as a hint, and if it is a question about status or "
+    + 'progress, answer from what you know rather than starting new work.')
   await $.command.run({ command: 'livevibe', ...typed })
   sidecar.release()
 })

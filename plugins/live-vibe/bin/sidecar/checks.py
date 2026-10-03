@@ -31,7 +31,7 @@ from .audio import FRAME, SR, CannotStart, Player, check_devices, SentenceSplitt
 from .echo import EchoCanceller, EchoGuard, EchoReference
 from .front import (ACK, EVENT, EVENT_CHARS, HISTORY_MAX, HOLD, INTERRUPTED, RETELL, WAITING, _FALLBACKS,
                     _NO_EFFORT, Brain, Delegator, FrontSession, LlamaCppBrain, SpeechFilter, TurnStream,
-                    acknowledgement, event_message, is_turn_start, make_brain, parse_sse, plain_answer,
+                    acknowledgement, event_message, held_answer, is_turn_start, make_brain, parse_sse,
                     report_brief, retellable, spoken_model, warm_up)
 from .session import LiveSession
 from .speech import BARGE_IN_WORDS, KYUTAI_BLOCK, KYUTAI_SR, KyutaiTurns, SilentTTS, check_tts
@@ -386,16 +386,19 @@ def front_history(check: Checker) -> None:
           f"acknowledgement: a short first sentence with no claim about the work, else {ACK!r} {acks}")
     guesses = ["The fix was in the audio pipeline config.", "It was likely the routing.", "Probably the new player.",
                "It stopped because of the buffer.", "That was due to WSLg."]
-    got = [acknowledgement(g) for g in guesses] + [plain_answer(g) for g in guesses]
-    check(got == [ACK] * len(guesses) + [False] * len(guesses),
-          f"acknowledgement, plain answer: a short guessed cause is never spoken {got}")
+    got = [acknowledgement(g) for g in guesses] + [held_answer(g, False) for g in guesses]
+    check(got == [ACK] * len(guesses) + [HOLD] * len(guesses),
+          f"acknowledgement, held answer: a short guessed cause is never spoken {got}")
     got = [retellable(t) for t in ("", "  ", "(nothing to add)", "[done]\n\n(nothing to add)", "Fixed it (finally).")]
     check(got == [False, False, False, False, True],
           f"retellable: an empty or bracket-only report has nothing to announce {got}")
-    plain = [plain_answer(t) for t in ("I'm doing well, thanks!", "It's sunny here.", "Yes. Then the rest.",
-                                        "It finished with no errors.", "")]
-    check(plain == [True, True, False, False, False],
-          f"plain answer: one short sentence with no claim stands as the answer, nothing else does {plain}")
+    replies = ("I'm doing well, thanks! How can I help you today?", "It's sunny here.", "Yes. Then the rest.",
+               "It finished with no errors.", "", "Okay, I will go and look through every single file in the repo now.")
+    got = [held_answer(t, False) for t in replies]
+    check(got == ["I'm doing well, thanks!", "It's sunny here.", "Yes.", HOLD, HOLD, HOLD],
+          f"held answer, no work in session: a short first sentence with no claim, else {HOLD!r} {got}")
+    got = [held_answer(t, True) for t in replies]
+    check(got == [HOLD] * len(replies), f"held answer, work in session: only {HOLD!r} {got}")
     recorded = [  # what Qwen3-4B (3) and Qwen3.6-35B (1) said to "so what was the fix?" with only a log report
         "The logs show no errors or warnings, and the audio processing is running as expected. The fix was likely the "
         "combination of proper audio routing and stable GPU handling, but since the logs don't specify changes, I "
@@ -407,8 +410,9 @@ def front_history(check: Checker) -> None:
         "The logs showed no errors or warnings that affected anything. "
         "The fix seems to have resolved the static issue.",
     ]
-    got = [plain_answer(g) for g in recorded]
-    check(not any(got), f"plain answer: no recorded guess at 'what was the fix?' stands as an answer {got}")
+    got = [held_answer(g, False) for g in recorded]
+    check(not any(re.search(r"\b(fix|likely|seems?)\b", g, re.I) for g in got),
+          f"held answer: no recorded guess at 'what was the fix?' is spoken, even with no work in session {got}")
 
 
 def report_units(check: Checker) -> None:
@@ -1052,12 +1056,14 @@ async def selftest_sessions(check: Checker) -> None:
     worked, sess.tools = sess.tools, Delegator()  # as in a new session: nothing handed off or reported yet
     got = [await question("How are you?"), await question("Did you get that?"), await question("So what was the fix?")]
     fine = "I'm doing well, thanks!"
-    check(got == [([fine], [{"type": "note", "said": "How are you?", "reply": fine}]),
-                  (["Yes, I got it."], [{"type": "note", "said": "Did you get that?", "reply": "Yes, I got it."}]),
-                  ([HOLD], [{"type": "note", "said": "So what was the fix?", "reply": HOLD, "ask": True}])]
+    check(got == [([fine], [{"type": "note", "said": "How are you?", "reply": fine, "ask": True}]),
+                  (["Yes, I got it."], [{"type": "note", "said": "Did you get that?", "reply": "Yes, I got it.",
+                                         "ask": True}]),
+                  (["The logs look clean."], [{"type": "note", "said": "So what was the fix?",
+                                               "reply": "The logs look clean.", "ask": True}])]
           and not sess.tools.work_in_session,
-          f"front: with no work in session, a short plain answer is spoken whole as a note, anything else is {HOLD!r} "
-          f"and an ask {got}")
+          f"front: with no work in session, a question speaks its reply's short first sentence (never the guess after "
+          f"it) and still goes to Claude as ask {got}")
     sess.tools = worked
 
     sess.post("speech_start", 1.0)  # two results wait for the floor together

@@ -257,8 +257,7 @@ class Brain:
 
     name = "base"
     model = ""
-    trimmed = False  # the last reply was cut to an acknowledgement or HOLD: the user did not hear what it said
-    plain = False  # the last reply to a question stood as the model wrote it: a short answer, no claim
+    trimmed = False  # the last reply was held and cut: the user did not hear what it said
 
     def __init__(self, system: str = ""):
         self.system = system
@@ -363,12 +362,12 @@ def acknowledgement(say: str) -> str:
     return short_first(say) or ACK
 
 
-def plain_answer(say: str) -> bool:
-    """A reply that can stand as the answer to a user's question while no work is in session: one sentence, short,
-    no claim about the work ("I'm doing well, thanks!"). A guess was never that: every recorded one sat in a second
-    sentence."""
-    say = say.strip()
-    return bool(say) and len(re.split(r"(?<=[.!?])\s+", say)) == 1 and short_first(say) == say
+def held_answer(say: str, worked: bool) -> str:
+    """What a user's question the front does not delegate speaks; Claude gets the question as `ask` either way. With
+    work in session, only HOLD: the question may be about the work, and the front's memory of it is stale. Otherwise
+    the reply's first sentence when it is short and makes no claim ("I'm doing well, thanks!"), else HOLD. A guess was
+    never that: every recorded one was long, made a claim, or sat in a later sentence."""
+    return HOLD if worked else short_first(say) or HOLD
 
 
 class TurnStream:
@@ -449,8 +448,7 @@ class FrontTurn:
     heard: str = ""  # what of "say" was heard
     cut_at: float | None = None  # when the turn was cut while its reply was still streaming
     committed: bool = False
-    trimmed: bool = False  # the reply was held back and cut to an acknowledgement or HOLD
-    plain: bool = False  # a question's reply was held back and spoken whole: one short sentence, no claim
+    trimmed: bool = False  # the reply was held back and cut: an acknowledgement, a question's first sentence, HOLD
     worked: bool = False  # work was in session when the turn began: a question hears HOLD, never the model's answer
 
 
@@ -506,10 +504,6 @@ class LlamaCppBrain(Brain):
     @property
     def trimmed(self) -> bool:  # type: ignore[override]
         return self.current.trimmed
-
-    @property
-    def plain(self) -> bool:  # type: ignore[override]
-        return self.current.plain
 
     def _body(self, messages: list[dict[str, Any]], max_tokens: int, stream: bool) -> dict[str, Any]:
         return {"model": self.model, "messages": messages, "response_format": self.FORMAT, "stream": stream,
@@ -623,11 +617,11 @@ class LlamaCppBrain(Brain):
             field = json_turn.fields.get("delegate", "").strip()
             for request in speech.delegations() if not field else [] if handed else [field]:  # or the notes instead
                 await self._hand_off(request, turn, tools, announcing)
-            if held is not None:  # handed off: an acknowledgement; a question kept: HOLD, Claude gets it as `ask`
+            if held is not None:  # handed off: an acknowledgement; a question kept: see held_answer
                 whole = "".join(held) + said
-                turn.plain = not (turn.request or turn.worked) and plain_answer(whole)
-                spoken = whole.strip() if turn.plain else acknowledgement(whole) if turn.request else HOLD
-                turn.trimmed = not turn.plain
+                spoken = acknowledgement(whole) if turn.request else held_answer(whole, turn.worked)
+                # a question's held reply, even a whole "Let me check.", told the user nothing of a waiting result
+                turn.trimmed = not turn.request or spoken != whole.strip()
                 words.put_nowait(spoken)
             elif said:
                 words.put_nowait(said)
@@ -877,11 +871,11 @@ class FrontSession(Duplex):
             if brain is self.brain and said:
                 emit(type="transcript", role="front", text=said)
             if not (is_event or failed) and brain is self.brain:  # also when a barge-in cut the reply: the user's
-                self.pass_on(user_text, said, handed, brain.plain)  # words were heard whole, the reply maybe not
+                self.pass_on(user_text, said, handed)  # words were heard whole, the reply maybe not
             # A barge-in cut the reply: unless two whole sentences of it were heard (most of a retelling), the
             # waiting results it took go back to the announcer, or to the user's next turn.
             whole = [s for s in self.turn_spoken if not s.endswith("...")]
-            if cancelled and waiting and (brain.trimmed or brain.plain or len(whole) < 2):
+            if cancelled and waiting and (brain.trimmed or len(whole) < 2):
                 log(f"front: the reply was cut early; {len(waiting)} waiting result(s) go back to the announcer")
                 self.requeue(waiting)
         if failed:
@@ -889,9 +883,9 @@ class FrontSession(Duplex):
             warn(f"front model failed at {brain.where} ({type(e).__name__}: {str(e)[:160]})")
             self.requeue(waiting or [])  # never heard: the announcer reads them out
             return await self.front_down(report or user_text, is_event)
-        # A held reply (cut to HOLD, or one short plain sentence) told the user nothing of the waiting results
+        # A held reply (cut to HOLD or an acknowledgement) told the user nothing of the waiting results
         # (eval: a waiting report, then "what time is it in Tokyo?", then only "I've asked"): the announcer reads them.
-        if waiting and (brain.trimmed or brain.plain):
+        if waiting and brain.trimmed:
             log(f"front: the reply was held short; {len(waiting)} waiting result(s) go back to the announcer")
             self.requeue(waiting)
         self.settle()
@@ -904,19 +898,19 @@ class FrontSession(Duplex):
             with contextlib.suppress(asyncio.QueueFull):
                 self.results.put_nowait(t)
 
-    def pass_on(self, user_text: str, said: str, handed: int, plain: bool = False) -> None:
+    def pass_on(self, user_text: str, said: str, handed: int) -> None:
         """A user turn that delegated nothing still reaches Claude, as a note: a confirmation ("it sounds perfect, the
         static is gone"), a correction or a decision is information Claude needs (seen live: said three times, never
         passed on, while Claude kept saying nobody had confirmed by ear). The mod hands two kinds to Claude as a
         prompt rather than a note: `answer`, a reply to a question the last report asked, and `ask`, a question the
         front did not delegate (Qwen3-4B, asked "so what was the fix?" with only a log report to go on, invented a
-        cause and delegated nothing, even when told to delegate what the report does not answer); the front says only
-        HOLD. With no work in session, a question the front answered plainly (`plain`: one short sentence with no
-        claim, "I'm doing well, thanks!") is a note."""
+        cause and delegated nothing, even when told to delegate what the report does not answer); the front said
+        only HOLD or, with no work in session, a short first sentence (held_answer). Claude may answer that with
+        "(nothing to add)", which the mod does not pass back."""
         answer, self.question_open = self.question_open, False
         if self.tools.handed != handed:
             return
-        kind = {"answer": True} if answer else {"ask": True} if "?" in user_text and not plain else {}
+        kind = {"answer": True} if answer else {"ask": True} if "?" in user_text else {}
         emit(type="note", said=user_text, reply=said, **kind)
 
     async def front_down(self, text: str, is_event: bool) -> None:
