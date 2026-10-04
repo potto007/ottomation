@@ -27,6 +27,6 @@ Claude Code 2.1.287 or newer, uv, a mic and a speaker; see the
 - [Plugin README](plugins/live-vibe/README.md)
 - [ADR 0001: Dedicated Windows speaker player for live-vibe under WSL](docs/decisions/0001-live-vibe-windows-speaker-player.md)
 
-## Licence
+## License
 
 MIT. See [LICENSE](LICENSE).
