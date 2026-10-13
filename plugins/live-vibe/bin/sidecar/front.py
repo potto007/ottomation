@@ -1235,6 +1235,7 @@ class FrontSession(Duplex):
         self.turn: asyncio.Task | None = None
         self.turn_spoken: list[str] = []
         self.question_open = False  # the last announced report asked the user something
+        self.micro_status_answer = False  # micro path: the front answered this utterance from a fresh Status report
         self.fragment: list[str] = []  # an unfinished utterance held for its rest (looks_unfinished)
         self.fragment_due: asyncio.Task | None = None
         self.fragment_gen = 0
@@ -1256,7 +1257,8 @@ class FrontSession(Duplex):
             deps = LoopDeps(speak=self.micro_speak, end_run=self.micro_end_run, cut=self.micro_cut,
                             delegate=self.micro_delegate, speaking=self.voice.speaking.is_set, busy=self.turn_running,
                             show=lambda text, kind: emit(type="transcript", role="front", text=text, kind=kind),
-                            note=lambda text: self.pass_on(text, "", self.tools.handed),
+                            note=lambda text, said="": self.pass_on(text, said, self.tools.handed,
+                                                                      from_status=self.micro_status_answer),
                             is_backchannel=is_backchannel, log=lambda text: file_log("INFO", text),
                             trim=self.micro_trim)
             self.micro = MicroLoop(stepper, brain.history, deps, tune.microturn_ms)
@@ -1268,12 +1270,15 @@ class FrontSession(Duplex):
         removed" in its hand-off); an answer to a question Claude asked gets no front line at all (Claude answers;
         the third session had "Got it, no further action needed" before Claude's own reply); otherwise a reply rests
         on a fresh Status report when there is one, and is held for Claude while work is in session."""
+        self.micro_status_answer = False
         if handing:
             return acknowledgement(say)
         if self.question_open:  # the user is answering Claude's question: Claude replies, the front adds nothing
             return ""
         if self.tools.status_fresh:
-            return status_reply(say)
+            reply = status_reply(say)
+            self.micro_status_answer = reply != HOLD  # answered from the report: the note needs no Claude turn
+            return reply
         return held_answer(say, self.tools.work_in_session)
 
     def micro_speak(self, text: str) -> None:
@@ -1347,6 +1352,7 @@ class FrontSession(Duplex):
         model = spoken_model(self.switch, text)
         if model:
             emit(type="switch_model", model=model)
+        self.micro_status_answer = False
         self.micro.on_utterance_end("" if model else text)
         self.settle()
         if _GOODBYE.search(text.lower()):
@@ -1747,7 +1753,7 @@ class FrontSession(Duplex):
             with contextlib.suppress(asyncio.QueueFull):
                 self.results.put_nowait(t)
 
-    def pass_on(self, user_text: str, said: str, handed: int) -> None:
+    def pass_on(self, user_text: str, said: str, handed: int, from_status: bool | None = None) -> None:
         """A user turn that delegated nothing still reaches Claude, as a note: a confirmation ("it sounds perfect, the
         static is gone"), a correction or a decision is information Claude needs (seen live: said three times, never
         passed on, while Claude kept saying nobody had confirmed by ear). The mod hands two kinds to Claude as a
@@ -1759,7 +1765,8 @@ class FrontSession(Duplex):
         answer, self.question_open = self.question_open, False
         if self.tools.handed != handed:
             return
-        from_status = bool(getattr(getattr(self.brain, "current", None), "status_answer", False))
+        if from_status is None:
+            from_status = bool(getattr(getattr(self.brain, "current", None), "status_answer", False))
         # experimental: a status question the latest Status report answered needs no Claude turn
         kind = {"answer": True} if answer else {"ask": True} if "?" in user_text and not from_status else {}
         emit(type="note", said=user_text, reply=said, **kind)

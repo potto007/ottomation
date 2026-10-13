@@ -103,6 +103,7 @@ class MicroStep:
     speak_ms: float = 0.0  # the full turn when it spoke (first byte to last)
     say: str = ""
     delegate: str = ""
+    spoken: str = ""  # what the floor rules let through to the voice (say after the session's trim rule)
     timings: dict[str, Any] = field(default_factory=dict)  # llama-server's timings of the decision request
 
     @property
@@ -220,7 +221,8 @@ class LoopDeps:
     speaking: Any  # () -> bool: the voice is playing
     busy: Any  # () -> bool: an utterance-level turn holds the floor (an announcement): no step now
     show: Any  # (text, kind) -> None: a front line on screen
-    note: Any  # (text) -> None: the user's utterance to Claude as a note, when the loop handed nothing off for it
+    note: Any  # (text, said) -> None: the user's utterance to Claude as a note, with what the front said to it, when
+    # the loop handed nothing off for it
     is_backchannel: Any  # (text) -> bool
     log: Any  # (text) -> None
     trim: Any = staticmethod(lambda say, handing: say)  # (say, handing off) -> what is spoken: the session's
@@ -251,6 +253,7 @@ class MicroLoop:
         self.last_utterance = ""  # the recognizer's text of the utterance that just ended (the echo check's reference)
         self.final: tuple[str, float] | None = None  # an ended utterance and its p, asked once as a whole before it joins the history
         self.holding = False  # the session holds an unfinished utterance for its rest: the user is still talking
+        self.replied = False  # a line was spoken for the utterance that ended; no second run without new words
         self.pending_note: str | None = None  # an ended utterance not yet handed off or passed on
         self.new_words = False  # words arrived since the last tick
         self.p: float | None = None
@@ -291,6 +294,7 @@ class MicroLoop:
         self.new_words = False
         self.user_done = True
         self.holding = False
+        self.replied = False
         self.handed_this_utterance = False
         self.silent = 0
 
@@ -309,17 +313,18 @@ class MicroLoop:
             self.history.append({"role": "user", "content": window_message(text, p, False)})
             self.final = None
 
-    def flush_note(self) -> None:
+    def flush_note(self, said: str = "") -> None:
         note, self.pending_note = self.pending_note, None
         if note:
-            self.deps.note(note)
+            self.deps.note(note, said)
 
-    def resolve_note(self, handed: bool) -> None:
-        """The step after an utterance settled it: handed off (the words went with the request) or not (a note)."""
+    def resolve_note(self, handed: bool, said: str = "") -> None:
+        """The step after an utterance settled it: handed off (the words went with the request) or not (a note, with
+        what the front said to it, so Claude knows whether the user already heard an answer)."""
         if handed:
             self.pending_note = None
         else:
-            self.flush_note()
+            self.flush_note(said)
 
     def run_ended(self, heard: list[str], cut: bool) -> None:
         """The voice finished (or was cut): the run is one assistant message of what was heard."""
@@ -368,19 +373,24 @@ class MicroLoop:
         """The action after the floor rules, and why."""
         if step.action != SPEAK:
             return LISTEN, "model"
-        if step.say and self.run and is_echo(step.say, " ".join(self.run)):  # the run said this already: it is over
-            return LISTEN, "repeat"
         if self.handed_this_utterance:  # one line per hand-off; what follows is Claude's to say
             return LISTEN, "handed"
         if self.user_talking():
             if step.say and self.deps.is_backchannel(step.say):
+                step.spoken = step.say.strip()
                 return SPEAK, "backchannel"
             return LISTEN, "floor"
+        if self.replied and not self.run:  # one reply per utterance: a new run needs new words from the user
+            return LISTEN, "said"
+        handing = bool(step.delegate.strip())
+        say = str(self.deps.trim(step.say.strip(), handing)).strip() if step.say.strip() else ""
+        step.spoken = say
         reference = self.utterance_text or self.last_utterance
-        handing_off = bool(step.delegate.strip()) and not self.handed_this_utterance
-        if step.say and reference and not handing_off and is_echo(step.say, reference):  # a hand-off names the task
+        if say and reference and not handing and is_echo(say, reference):  # a hand-off names the task
             return LISTEN, "echo"
-        if not step.say.strip() and not step.delegate.strip():
+        if say and self.run and is_echo(say, " ".join(self.run)):  # the run said this already: it is over
+            return LISTEN, "repeat"
+        if not say and not handing:
             return LISTEN, "empty"
         return SPEAK, "model"
 
@@ -431,17 +441,18 @@ class MicroLoop:
                 if await self.deps.delegate(step.delegate.strip(), said):
                     self.handed_this_utterance = handed = True
                     self.run_delegate = self.run_delegate or step.delegate.strip()
-            say = str(self.deps.trim(step.say.strip(), handed)).strip() if step.say.strip() else ""
-            say = say or (HANDOFF_SAY if handed else "")  # a hand-off is never silent
+            say = step.spoken or (HANDOFF_SAY if handed else "")  # a hand-off is never silent
             if say:
                 self.run.append(say)
                 self.deps.speak(say)
+                if self.user_done:
+                    self.replied = True
             if self.user_done:
-                self.resolve_note(handed)
+                self.resolve_note(handed, say)
             return
         self.silent += 1
         if self.user_done and reason != "floor":  # a listen after the user finished: nothing was handed off
-            self.resolve_note(False)
+            self.resolve_note(False, " ".join(self.run))
         if self.deps.speaking() and self.utterance and not self.user_done:  # the user talks over the voice
             await self.deps.cut()
         elif self.run and (not self.deps.speaking() or reason in ("model", "repeat", "handed")):  # over, or ends here

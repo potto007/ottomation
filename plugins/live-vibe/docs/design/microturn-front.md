@@ -131,6 +131,11 @@ it good.
    - An utterance that stops mid-sentence is held for its rest as the utterance-level path holds it
      (`looks_unfinished`, FRAGMENT_HOLD_S), the loop counting the user as still talking meanwhile; the pieces go on
      as one (third session: "okay go ahead with" / "that" and "No, I" / "don't." each reached Claude as two answers).
+   - One reply per utterance: the trim rule runs before the repeat check, so two steps cut to the same canned line
+     speak it once (fourth session: "Let me check. Let me check."); once a reply's run has ended, a new say on
+     silence is dropped until the user speaks again (same session: the issue 8 answer played twice as two runs). The
+     note to Claude carries what the front said, and a question answered from a fresh Status report is a quiet note,
+     not an `ask` (same session: the front answered "number eight" from the report and Claude was asked anyway).
    - While a run plays, the model's context ends with the run so far as a provisional assistant message, so a step
      continues the answer instead of starting it again; a `say` that repeats the run (the echo test against the
      run's text) is not spoken and ends the run. (Second live session, 2026-10-12: with the run invisible until it

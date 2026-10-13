@@ -180,6 +180,7 @@ class World:
         self.turn_busy = False
         self.logs: list[str] = []
         self.notes: list[str] = []
+        self.note_said: list[str] = []
 
     def deps(self) -> LoopDeps:
         async def end_run() -> None:
@@ -198,8 +199,12 @@ class World:
             self.spoken.append(text)
             self.playing = True
 
+        def note(text: str, said: str = "") -> None:
+            self.notes.append(text)
+            self.note_said.append(said)
+
         return LoopDeps(speak=speak, end_run=end_run, cut=cut, delegate=delegate, speaking=lambda: self.playing,
-                        busy=lambda: self.turn_busy, show=lambda t, k: self.shown.append((t, k)), note=self.notes.append,
+                        busy=lambda: self.turn_busy, show=lambda t, k: self.shown.append((t, k)), note=note,
                         is_backchannel=lambda t: t.strip(" .").lower() in ("mm-hm", "uh-huh", "okay", "yeah"),
                         log=self.logs.append)
 
@@ -394,6 +399,34 @@ async def loop_units(check: Any) -> None:
     s = await loop.tick()
     check(s is not None and s.action == SPEAK and w.spoken[-1] == "Sure." and w.delegated[-1][1] == "okay go ahead with that",
           f"microloop: the whole sentence is handed off once its rest arrives ({w.delegated[-1]})")
+
+    # 12. One reply per utterance: two steps trimmed to the same canned line speak it once; after the reply's run has
+    #     ended, a new say on silence is dropped until the user speaks again; the note carries what was said.
+    st = ScriptedStepper([(SPEAK, "Let me look into the current status.", ""),
+                          (SPEAK, "I will check how things stand.", ""),
+                          (SPEAK, "Let me check.", ""),
+                          (SPEAK, "Issue 8 is about the noisy test.", "")])
+    w = World()
+    deps = w.deps()
+    deps.trim = lambda say, handing: "Let me check."
+    loop = MicroLoop(st, [], deps, step_ms=200)
+    loop.on_piece("what's the status", 0.9)
+    loop.on_utterance_end("what's the status?")
+    await loop.tick()
+    s = await loop.tick()
+    check(w.spoken == ["Let me check."] and s is not None and s.action == LISTEN and w.ended == 1,
+          f"microloop: two says trimmed to the same line speak it once ({w.spoken})")
+    check(w.notes == ["what's the status?"] and w.note_said == ["Let me check."],
+          f"microloop: the note carries what the front said ({w.note_said})")
+    w.playing = False
+    loop.run_ended(w.spoken, cut=False)
+    s = await loop.tick()
+    check(s is not None and s.action == LISTEN and w.spoken == ["Let me check."],
+          f"microloop: no second run on silence after the reply ({s and s.action})")
+    loop.on_piece("and number eight", 0.9)
+    loop.on_utterance_end("and number eight?")
+    s = await loop.tick()
+    check(s is not None and s.action == SPEAK and len(w.spoken) == 2, "microloop: the next utterance gets its reply")
 
     # 8. The user moves on before the ended utterance got its window: it still joins the history, in order.
     st = ScriptedStepper([])
