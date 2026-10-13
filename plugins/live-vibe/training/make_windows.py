@@ -194,8 +194,11 @@ class Call:
         return out
 
     def p_mid(self) -> float:
+        """A mid-utterance p: usually low, one in twelve a brief pause at 0.4 or 0.5, never EOT. The first data set
+        rounded uniform(0.4, 0.6) and so put the finished sentence at [p=0.6] with a listen label, the same text the
+        final-raw window then labelled speak."""
         r = self.rng.random()
-        return round(self.rng.uniform(0.4, 0.6), 1) if r < 0.08 else round(self.rng.uniform(0.0, 0.3), 1)
+        return self.rng.choice((0.4, 0.5)) if r < 0.08 else round(self.rng.uniform(0.0, 0.3), 1)
 
     def add(self, window: str, action: str, kind: str, delegate: str = "", say: str = "", speaking: bool = False,
             run: list[str] | None = None, run_delegate: str = "") -> None:
@@ -205,7 +208,7 @@ class Call:
         self.examples.append(Example(history, window, action, delegate, say, kind, speaking))
 
     def utterance(self, text: str, answer: tuple[str, str, str], final_text: str | None = None,
-                  over_voice: bool | None = None, backchannel_ok: bool = False) -> None:
+                  over_voice: bool | None = None) -> None:
         """One user utterance cut into windows: mid-sentence windows (listen), the window where p crosses the
         threshold on raw text (the answer when the sentence is complete), the final clean window, then the run's
         silent windows. `answer` is (action, delegate, say) for the finished utterance."""
@@ -231,9 +234,6 @@ class Call:
             spoken_now = over_voice and steps <= 3
             if spoken_now:  # the user talks over the voice: the model's listen cuts it
                 self.add(window_message(" ".join(heard), p, True), LISTEN, "over-voice", speaking=True)
-                continue
-            if backchannel_ok and len(heard) > 12 and p <= 0.3 and self.rng.random() < 0.25:
-                self.add(window_message(" ".join(heard), p, False), SPEAK, "backchannel", say="Mm-hm.")
                 continue
             self.add(window_message(" ".join(heard), p, False), LISTEN, "mid")
         action, delegate, say = answer
@@ -347,7 +347,7 @@ class Call:
     def dictation(self) -> None:
         self.new_fills()
         text = self.rng.choice(DICTATION)
-        self.utterance(text, (SPEAK, f"Investigate: {text[0].upper() + text[1:]}", "Looking into it."), backchannel_ok=True)
+        self.utterance(text, (SPEAK, f"Investigate: {text[0].upper() + text[1:]}", "Looking into it."))
         self.handed_since, self.question_open = True, False
 
     def stop(self) -> None:

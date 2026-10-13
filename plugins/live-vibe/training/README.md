@@ -32,7 +32,7 @@ What a window is labelled:
 | "yes" to a question the last report asked | speak, delegate the proposed action, name it |
 | "no" to that question | listen (the note reaches Claude as the answer) |
 | small talk | speak a short line |
-| a long dictation pause | "Mm-hm." about one time in four, else listen |
+| a long dictation pause | listen (the sidecar's own clips backchannel; the first set labelled "Mm-hm." one pause in four at random, which no model can learn) |
 | `[no voice]`, with or without `[speaking]` | listen |
 
 ## 2. Train (GPU)

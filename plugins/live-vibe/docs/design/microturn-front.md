@@ -157,7 +157,7 @@ it good.
      ended, the model restarted its one-sentence answer on every `[no voice] [speaking]` window, 192 times, and
      every copy was queued on the voice.)
    - Floor rules, in the sidecar: while the user talks (p below 0.6, utterance open) only the decision request runs
-     and a `speak` is held (backchannels from the model come with the LoRA); a `say` that echoes the user's words is
+     and a `speak` is held (backchannels stay the sidecar's clips; the LoRA listens there); a `say` that echoes the user's words is
      dropped; a delegation is taken once per utterance, after it ends, with the user's words as `said`.
    - A `listen` while the voice plays and the user has spoken cuts the voice; a `listen` once the voice is quiet ends
      the run. The sidecar's own pause/resume barge-in stays as the safety net for now; it and the model's cut can
