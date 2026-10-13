@@ -148,6 +148,7 @@ class Tuning:
     eot_wait_base_ms: int = 400  # continuous wait = base + (1 - p) * span: p 1.0 -> 400 ms, p 0.0 -> 4000 ms
     eot_wait_span_ms: int = 3600
     stt_flush: bool = False  # step the STT through delay_steps + 1 silent blocks when the end of turn looks likely
+    microturn_ms: int = 0  # front: the micro-turn loop's step (docs/design/microturn-front.md); 0 = off
 
 
 BARGE_FALLBACK_WORDS = 3  # without a working echo canceller, a cut needs this many words: bleed and "mm-hm" stay out

@@ -130,6 +130,7 @@ The file rotates at 5 MB and keeps one previous copy (`sidecar.log.1`). If the p
 | `frontModel` | empty | Sent as `model` on every request. Empty means the server's own model (or `claude-haiku-4-5` for anthropic). |
 | `experimental` | `true` | The experimental voice path (below). Off restores the 0.6.4 behaviour. |
 | `backchannels` | `false` | Live vibe, with `experimental` on: the front says a short "mm-hm" during long dictation. Leave it off on open speakers. |
+| `microturnMs` | `0` | Live vibe: the micro-turn loop's step (below). 0 is off; 200 to 600 asks the front every that many milliseconds what it heard so far. |
 
 ### Experimental voice path
 
@@ -160,6 +161,20 @@ The sidecar log gets one line per front turn, `front turn: eot_to_first_token_ms
 prefill_tokens=<n> cached_tokens=<n> kind=user|event`, from llama-server's timings (its `f_keep` is only in
 `front-server.log`), with the setting on or off, and with it on, `front speculate: used|discarded|cancelled
 saved_ms=<n>`, `front warm: ...` and `front backchannel: ...` lines.
+
+### The micro-turn loop (`microturnMs`)
+
+With `microturnMs` above 0 (and the llama.cpp front with the Kyutai recognizer), the front no longer waits for your
+turn to end. Every step it gets one message with what you have said so far in this utterance (`[voice] can you add a
+unit test [p=0.1]`, or `[no voice]`), and answers `listen` or a few words to speak, with the delegation as before. So
+it reads you between words and decides itself when to speak, the way a text LLM can appear full-duplex by
+time-slicing (`docs/design/microturn-front.md`, after DuplexCascade and Codacus's video). The sidecar keeps the floor
+rules: nothing but the decision runs while you are still talking, a reply that only repeats your words is dropped, a
+delegation goes out once per utterance after it ends, and a `listen` while the voice plays and you have spoken cuts
+the voice. Claude's results are still announced as whole turns. Measured on the RTX 5090 with Qwen3-4B: a silent step
+costs about 20 ms, a speaking step under 200 ms, so 200 ms steps are affordable. With the prompt alone the front
+speaks too early and echoes; the timing LoRA (increment 3 in the design note) is what makes it good. Each step writes
+one `micro step:` line to the sidecar log with the action, P(listen), the reason and the time taken.
 
 ## The managed front server
 
@@ -245,3 +260,6 @@ uv run --script bin/sidecar/main.py --setup          # what /live setup runs (wi
 uv run --script bin/sidecar/main.py --unit           # pure unit checks
 uv run --script bin/sidecar/main.py --selftest       # both modes, no mic, speaker or network
 ```
+
+The micro-turn step's latency and behaviour against a running front server: `bin/sidecar/eval/microturn_bench.py`
+(see `eval/README.md` for the server launcher and the GPU rules).

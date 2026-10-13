@@ -119,6 +119,12 @@
       "description": "The front's short \"mm-hm\" during long dictation (needs the experimental voice path). Leave it off on open speakers.",
       "default": false
     },
+    "microturnMs": {
+      "type": "number",
+      "title": "Live vibe: micro-turn step (ms)",
+      "description": "0: off (the front answers after your turn ends). 200 to 600: the front is asked every this many milliseconds what it heard so far and answers listen or a few words, so it reads you between words and decides itself when to speak (docs/design/microturn-front.md). Needs the Kyutai recognizer and the llamacpp backend; experimental, and better with the timing LoRA.",
+      "default": 0
+    },
     "logFile": {
       "type": "string",
       "title": "Sidecar log file",

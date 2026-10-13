@@ -509,6 +509,34 @@ test('experimental (the default) reaches the sidecar, and the relay prompt asks 
   sidecar.release()
 })
 
+test('microturnMs reaches the sidecar as --microturn-ms, only when set', { options: { microturnMs: 300 } }, async ($, on) => {
+  const argvs: string[] = []
+  const sidecar = fakeSidecar(4321)
+  on('process.spawn', async function* (_$, e) { argvs.push(e.argv.join(' ')); return yield* sidecar.spawn() })
+  on('http.fetch', () => ok)
+  on('prompt.compose', () => ({ sections: [] }))
+
+  await $.command.run({ command: 'livevibe', ...typed })
+  await sidecar.isUp
+  expect(argvs[0]).toContain('--microturn-ms 300')
+  await $.command.run({ command: 'livevibe', ...typed })
+  sidecar.release()
+})
+
+test('microturnMs 0 (the default) adds no flag', async ($, on) => {
+  const argvs: string[] = []
+  const sidecar = fakeSidecar(4321)
+  on('process.spawn', async function* (_$, e) { argvs.push(e.argv.join(' ')); return yield* sidecar.spawn() })
+  on('http.fetch', () => ok)
+  on('prompt.compose', () => ({ sections: [] }))
+
+  await $.command.run({ command: 'livevibe', ...typed })
+  await sidecar.isUp
+  expect(argvs[0]).not.toContain('--microturn-ms')
+  await $.command.run({ command: 'livevibe', ...typed })
+  sidecar.release()
+})
+
 test('experimental off: no flags, and the 0.6.4 relay prompt', { options: { experimental: false, backchannels: true } }, async ($, on) => {
   const argvs: string[] = []
   const sidecar = fakeSidecar(4321)

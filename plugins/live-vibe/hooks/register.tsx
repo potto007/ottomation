@@ -352,6 +352,7 @@ function startSidecar($: EngineInterface, options: PluginOptions, mode: LiveMode
     if (options.logFile) argv.push('--log-file', String(options.logFile))
     if (options.experimental) argv.push('--experimental')
     if (options.experimental && options.backchannels && mode === 'livevibe') argv.push('--backchannels')
+    if (mode === 'livevibe' && Number(options.microturnMs) > 0) argv.push('--microturn-ms', String(Math.round(Number(options.microturnMs))))
     if (mode === 'livevibe') {
       argv.push('--front-backend', String(options.frontBackend), '--front-url', String(options.frontUrl),
         '--switch-pattern', SPOKEN_SWITCH.source, ...frontServerArgv(options))

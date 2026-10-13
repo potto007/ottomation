@@ -26,6 +26,7 @@ import numpy as np
 
 from . import gpu, protocol
 from .checks_front_server import front_server_units
+from .checks_microturn import microturn_units
 from .checks_winplayer import winplayer_units
 from .audio import (FRAME, SR, BargeGate, CannotStart, Player, check_devices, SentenceSplitter, Tuning, TurnDetector, Voice,
                     heard_upto, is_backchannel, speakable)
@@ -946,6 +947,7 @@ def units() -> int:
     file_log_units(check)
 
     front_server_units(check)
+    microturn_units(check)
     echo_units(check)
     winplayer_units(check)
     experimental_units(check)

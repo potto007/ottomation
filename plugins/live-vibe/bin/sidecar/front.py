@@ -17,7 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, ClassVar
 
-from .audio import SentenceSplitter, Tuning, Voice, split_all
+from .audio import SentenceSplitter, Tuning, Voice, is_backchannel, split_all
+from .microturn import LoopDeps, MicroLoop, MicroStepper
 from .protocol import Route, emit, file_log, log, warn
 from .session import Duplex, cancel_and_wait
 
@@ -1114,8 +1115,8 @@ class TurnWatch:
     PAUSE_P = 0.4
     BACKCHANNEL_AFTER_S = 6.0
 
-    def __init__(self, inner: Any, backchannels: bool = False):
-        self.inner, self.backchannels = inner, backchannels
+    def __init__(self, inner: Any, backchannels: bool = False, pieces: bool = False):
+        self.inner, self.backchannels, self.pieces = inner, backchannels, pieces
         self.tap: _HeadTap | None = None
         if getattr(inner, "stt", None) is not None and hasattr(inner, "text"):
             self.tap = _HeadTap(inner.stt)
@@ -1147,9 +1148,13 @@ class TurnWatch:
         piece, pauses = last
         self.steps += 1
         if getattr(self.tap, "steps", 0) <= self.IGNORE_STEPS:
+            if self.pieces:  # the micro-turn loop wants the words even while the heads settle
+                events.append(("heads", (piece.replace("▁", " ") if isinstance(piece, str) else None, self.p)))
             return events
         s2, s05 = float(getattr(pauses, "s2", 0.0)), float(getattr(pauses, "s05", 0.0))
         self.p = s2 if self.p is None else self.EMA_KEEP * self.p + (1 - self.EMA_KEEP) * s2
+        if self.pieces:  # ("heads", (this step's word piece or None, p)): the micro-turn loop's input
+            events.append(("heads", (piece.replace("▁", " ") if isinstance(piece, str) else None, self.p)))
         if piece is not None:
             if self.likely is not None:
                 self.likely = None
@@ -1240,6 +1245,87 @@ class FrontSession(Duplex):
         self.backchannel_clip: Any = None  # the rendered BACKCHANNEL_TEXT
         self.backchannel_at = -1e9  # loop time of the last one
         self.backchannel_stop = threading.Event()
+        # The micro-turn loop (microturnMs > 0, llama.cpp front): the front is asked every step what it heard so far
+        # and answers listen or a few words; utterance-level front turns are off, announcements stay (microturn.py).
+        self.micro: MicroLoop | None = None
+        self.run_q: asyncio.Queue[str | None] | None = None  # the speaking run's words, as the loop speaks them
+        self.run_task: asyncio.Task | None = None
+        if tune.microturn_ms > 0 and isinstance(brain, LlamaCppBrain):
+            system = brain.system.removesuffix(LlamaCppBrain.PROTOCOL)
+            stepper = MicroStepper(brain.client, brain.url, brain.model, system, sampling=LlamaCppBrain.SAMPLING)
+            deps = LoopDeps(speak=self.micro_speak, end_run=self.micro_end_run, cut=self.micro_cut,
+                            delegate=self.micro_delegate, speaking=self.voice.speaking.is_set, busy=self.turn_running,
+                            show=lambda text, kind: emit(type="transcript", role="front", text=text, kind=kind),
+                            note=lambda text: self.pass_on(text, "", self.tools.handed),
+                            is_backchannel=is_backchannel, log=lambda text: file_log("INFO", text))
+            self.micro = MicroLoop(stepper, brain.history, deps, tune.microturn_ms)
+
+    # -- the micro-turn loop's hands (microturn.MicroLoop drives these) ------------------------------------------
+    def micro_speak(self, text: str) -> None:
+        """Words to the voice: start a speaking run, or extend the one playing."""
+        if self.run_q is None or self.run_task is None or self.run_task.done():
+            q: asyncio.Queue[str | None] = asyncio.Queue()
+            self.run_q = q
+            self.run_task = asyncio.create_task(self.micro_run(q))
+        self.run_q.put_nowait(text)
+
+    async def micro_run(self, q: asyncio.Queue[str | None]) -> None:
+        heard: list[str] = []
+        cut = True
+
+        async def words() -> AsyncIterator[str]:
+            while (w := await q.get()) is not None:
+                yield w
+
+        self.set_state("speaking")
+        try:
+            cut = await self.voice.speak(words(), heard, lambda: self.set_state("speaking"))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 - the run ends; the loop goes on
+            log(f"micro: the voice failed ({type(e).__name__}: {str(e)[:120]})")
+        finally:
+            if self.run_q is q:
+                self.run_q = None
+            if self.micro is not None:
+                self.micro.run_ended(heard, cut)
+            self.settle()
+
+    async def micro_end_run(self) -> None:
+        if self.run_q is not None:
+            self.run_q.put_nowait(None)
+
+    async def micro_cut(self) -> None:
+        await cancel_and_wait(self.run_task)
+
+    async def micro_delegate(self, request: str, said: str) -> bool:
+        return (await self.tools.call("delegate", {"request": request}, said=said)).startswith(HANDED_OFF)
+
+    async def micro_utterance(self, text: str) -> None:
+        """The recognizer ended the user's utterance: on screen, a model switch or goodbye as before, and the loop
+        takes it (its history, and Claude's note unless the next step hands it off)."""
+        assert self.micro is not None
+        emit(type="transcript", role="user", text=text)
+        model = spoken_model(self.switch, text)
+        if model:
+            emit(type="switch_model", model=model)
+        self.micro.on_utterance_end("" if model else text)
+        self.settle()
+        if _GOODBYE.search(text.lower()):
+            self.goodbye()
+
+    async def micro_loop(self) -> None:
+        """One tick per step; a tick that fails is logged and the next one runs."""
+        assert self.micro is not None
+        step = self.micro.step_ms / 1000
+        while True:
+            await asyncio.sleep(step)
+            try:
+                await self.micro.tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 - a failed request is one missed window
+                file_log("INFO", f"micro step: failed ({type(e).__name__}: {str(e)[:120]})")
 
     def routes(self) -> dict[str, Route]:
         def event(body: str) -> bool:
@@ -1258,8 +1344,12 @@ class FrontSession(Duplex):
     def turn_running(self) -> bool:
         return self.turn is not None and not self.turn.done()
 
+    def run_running(self) -> bool:
+        return self.run_task is not None and not self.run_task.done()
+
     def floor_free(self) -> bool:
-        return not (self.user_talking or self.hearing() or self.turn_running() or self.fragment)
+        return not (self.user_talking or self.hearing() or self.turn_running() or self.fragment or self.run_running()
+                    or (self.micro is not None and self.micro.in_flight))
 
     async def handle(self, kind: str, payload: Any) -> None:
         await self._handle(kind, payload)
@@ -1267,6 +1357,10 @@ class FrontSession(Duplex):
             self.drop_spec("discarded")
 
     async def _handle(self, kind: str, payload: Any) -> None:
+        if self.micro is not None and kind in ("heads", "eot_likely", "eot_retract", "listening_pause"):
+            if kind == "heads":  # the loop reads the words and p; speculation and backchannel cues are its job now
+                self.micro.on_piece(*payload)
+            return
         if kind == "speech_start":
             self.user_talking = True
             if self.warm is not None and not self.warm.done():  # the floor is the user's: the server too
@@ -1300,7 +1394,12 @@ class FrontSession(Duplex):
             if await self.barge_verdict(payload):
                 emit(type="transcript", role="user", text=payload)
                 self.backchannel(payload)
+                if self.micro is not None:
+                    self.micro.on_utterance_end("")  # heard, played on: not a message for the front
                 self.settle()
+                return
+            if self.micro is not None:
+                await self.micro_utterance(payload)
                 return
             await self.on_utterance(payload)
         elif kind == "fragment_due" and payload == self.fragment_gen and self.fragment and not self.user_talking:
@@ -1431,6 +1530,9 @@ class FrontSession(Duplex):
 
     async def interrupt(self) -> None:
         """Barge-in and POST /stop: cancel the running turn; it commits what was heard before it ends."""
+        if self.run_running():
+            await cancel_and_wait(self.run_task)
+            self.settle()
         if self.turn_running():
             await cancel_and_wait(self.turn)
             self.settle()
@@ -1638,6 +1740,9 @@ class FrontSession(Duplex):
         taken once: an announcement cut by a barge-in is not announced again."""
         if self.backchannels:
             self.spawn(self.render_backchannel())
+        if self.micro is not None:
+            self.spawn(self.micro_loop())
+            file_log("INFO", f"micro loop: on, step {self.micro.step_ms} ms")
         while True:
             while self.results.empty() or not self.floor_free():
                 await asyncio.sleep(0.1)
@@ -1671,6 +1776,7 @@ class FrontSession(Duplex):
         self.drop_spec("cancelled")
         if self.warm is not None:
             self.warm.cancel()
+        await cancel_and_wait(self.run_task)
         await cancel_and_wait(self.turn)
         if self.brain is not None:
             with contextlib.suppress(Exception):
