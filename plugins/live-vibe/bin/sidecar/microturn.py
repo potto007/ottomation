@@ -127,9 +127,26 @@ class MicroStepper:
         self.sampling = sampling or {}
         self.listen_ids: set[int] = set()
         self.speak_ids: set[int] = set()
+        self.lora: list[dict[str, Any]] = []  # the server's adapters, applied to this loop's requests alone
+
+    async def resolve_adapters(self) -> None:
+        """The timing LoRA is for the loop's two requests only: on the full front turns (relay, retell) it regressed
+        the relay eval from 45/51 to 39/51. The managed server sets every adapter's server-wide scale to 0 once
+        healthy (FrontServer._scope_lora), and the loop names them at scale 1 per request. A server without the
+        endpoint has none."""
+        get = getattr(self.client, "get", None)
+        if get is None:
+            return
+        try:
+            r = await get(f"{self.url}/lora-adapters", timeout=10.0)
+            adapters = r.json() if r.status_code == 200 else []
+        except Exception:  # noqa: BLE001 - no endpoint, no adapters
+            adapters = []
+        self.lora = [{"id": int(a["id"]), "scale": 1.0} for a in adapters if isinstance(a, dict) and "id" in a]
 
     async def resolve_tokens(self) -> None:
         """The first token of each action word, as the model tokenizes it right after the opening quote."""
+        await self.resolve_adapters()
         for word, ids in ((LISTEN, self.listen_ids), (SPEAK, self.speak_ids)):
             r = await self.client.post(f"{self.url}/tokenize", json={"content": word, "add_special": False},
                                        timeout=10.0)
@@ -157,6 +174,8 @@ class MicroStepper:
         prompt = await self.prompt(self.messages(history, window))
         body = {"prompt": prompt + PREFIX, "n_predict": 1, "n_probs": TOP_N, "cache_prompt": True, "stream": False,
                 "temperature": 0.0, "samplers": []}  # raw logits: no top_k/top_p before the probabilities
+        if self.lora:
+            body["lora"] = self.lora
         r = await self.client.post(f"{self.url}/completion", json=body, timeout=30.0)
         r.raise_for_status()
         data = r.json()
@@ -181,6 +200,8 @@ class MicroStepper:
                 "stream": False, "max_tokens": 80, **self.sampling,
                 "chat_template_kwargs": {"enable_thinking": False},
                 "logit_bias": {str(i): -100 for i in self.listen_ids}}
+        if self.lora:
+            body["lora"] = self.lora
         r = await self.client.post(f"{self.url}/v1/chat/completions", json=body, timeout=30.0)
         r.raise_for_status()
         step.speak_ms = 1000 * (time.monotonic() - t)

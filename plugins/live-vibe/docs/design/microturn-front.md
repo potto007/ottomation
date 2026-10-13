@@ -1,7 +1,10 @@
 # The micro-turn front
 
 Status: in progress, started 2026-10-12. Increments 1 (the decision step and its bench) and 2 (the loop, behind
-the `microturnMs` setting) are in this branch; 2 has unit checks and no live session yet.
+the `microturnMs` setting, with the floor rules six live sessions taught it) are merged (0.7.1). Increment 3 (the
+timing LoRA: `training/`, 0.7.2) took held-out decision accuracy from 64% to 96% and claims from 4% to 0%, with the
+relay eval unchanged (45/51 base, 46/51 with the adapter scoped to the loop's requests); results in
+`training/README.md`. Not yet tried live.
 
 ## Why
 
@@ -170,6 +173,13 @@ it good.
    each of which produced a specific failure in the video (20 repeated warnings; 950 fillers against 164 expected;
    3-word stalls). Train a LoRA on the 4B front; `--lora` on the managed llama-server. Accept: a held-out set for the
    delegate decision, not only turn-taking.
+   What was built (`training/README.md`): `make_windows.py` writes the calls from templates (tasks, status and
+   content questions, confirmations to Claude's questions, small talk, dictation, stops), realized as Kyutai pieces
+   and cut into the loop's windows with the label each should get; it imports the sidecar's own prompt and message
+   builders, so a row is what the loop sends. `train_lora.py` is TRL SFT with PEFT (r=16 on every projection, loss on
+   the JSON only). `score_heldout.py` drives the loop's stepper against a server with and without the adapter and
+   reports decision accuracy by window kind, delegation presence, and the say's claim, echo and length rates. The
+   adapter reaches the managed server through `frontServerLora`.
 
 Settled elsewhere: the per-token rule and the JSON turn replace nothing in the Claude relay; `RELAY_SECTION`, the
 `Status:` line and the announcer are unchanged.

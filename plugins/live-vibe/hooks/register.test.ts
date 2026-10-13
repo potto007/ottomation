@@ -523,6 +523,20 @@ test('microturnMs reaches the sidecar as --microturn-ms, only when set', { optio
   sidecar.release()
 })
 
+test('frontServerLora reaches the sidecar as --front-server-lora', { options: { frontServerLora: '/tmp/timing-lora.gguf' } }, async ($, on) => {
+  const argvs: string[] = []
+  const sidecar = fakeSidecar(4321)
+  on('process.spawn', async function* (_$, e) { argvs.push(e.argv.join(' ')); return yield* sidecar.spawn() })
+  on('http.fetch', () => ok)
+  on('prompt.compose', () => ({ sections: [] }))
+
+  await $.command.run({ command: 'livevibe', ...typed })
+  await sidecar.isUp
+  expect(argvs[0]).toContain('--front-server-lora /tmp/timing-lora.gguf')
+  await $.command.run({ command: 'livevibe', ...typed })
+  sidecar.release()
+})
+
 test('microturnMs 0 (the default) adds no flag', async ($, on) => {
   const argvs: string[] = []
   const sidecar = fakeSidecar(4321)

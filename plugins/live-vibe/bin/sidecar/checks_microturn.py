@@ -48,10 +48,17 @@ class ScriptedServer:
 
     LISTEN_ID, SPEAK_ID = 701, 702
 
-    def __init__(self, p_listen: list[float], say: str = "Sure, on it.", delegate: str = ""):
+    def __init__(self, p_listen: list[float], say: str = "Sure, on it.", delegate: str = "",
+                 adapters: list[dict[str, Any]] | None = None):
         self.p = list(p_listen)
         self.say, self.delegate = say, delegate
+        self.adapters = adapters
         self.posts: list[tuple[str, dict[str, Any]]] = []
+
+    async def get(self, url: str, timeout: float = 0.0) -> _Reply:
+        if url.endswith("/lora-adapters") and self.adapters is not None:
+            return _Reply(self.adapters)
+        return _Reply({}, 404)
 
     async def post(self, url: str, json: dict[str, Any], timeout: float = 0.0) -> _Reply:
         path = url.split("/", 3)[-1]
@@ -133,6 +140,14 @@ def microturn_units(check: Any) -> None:
         s4 = await lazy.decide(hist, NO_VOICE)
         check(lazy.listen_ids and lazy.speak_ids and s4.p_listen is not None,
               f"microturn: the first decision resolves the action tokens itself (p={s4.p_listen})")
+        check(not st.lora and all("lora" not in b for _, b in srv.posts),
+              "microturn: a server with no adapters gets no lora field")
+        adapted = ScriptedServer([0.1], adapters=[{"id": 0, "path": "timing-lora.gguf", "scale": 0.0}])
+        ast = MicroStepper(adapted, "http://s", "m", "SYS")
+        await ast.step(hist, "[voice] can you run the tests [p=0.9]")
+        sent = [b.get("lora") for p, b in adapted.posts if p in ("completion", "v1/chat/completions")]
+        check(sent == [[{"id": 0, "scale": 1.0}]] * 2,
+              f"microturn: the loaded adapter is applied at scale 1 to the decision and the speaking turn {sent}")
 
     asyncio.run(scripted())
 
