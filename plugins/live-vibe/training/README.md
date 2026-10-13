@@ -23,7 +23,7 @@ What a window is labelled:
 
 | Window | Answer |
 |---|---|
-| the user mid-sentence, p low (or a brief 0.4 to 0.6 pause) | listen |
+| the user mid-sentence, p low (or a brief pause at 0.4 or 0.5) | listen |
 | the user's words over the voice (`[speaking]`) | listen (the sidecar cuts the voice) |
 | a finished request, on the raw text as p crosses 0.6 or on the clean final text | speak, the delegation, a few words naming the task |
 | the clean final window after the raw one was answered | listen (one line per utterance) |
@@ -32,7 +32,7 @@ What a window is labelled:
 | "yes" to a question the last report asked | speak, delegate the proposed action, name it |
 | "no" to that question | listen (the note reaches Claude as the answer) |
 | small talk | speak a short line |
-| a long dictation pause | "Mm-hm." about one time in four, else listen |
+| a long dictation pause | listen (the sidecar's own clips backchannel) |
 | `[no voice]`, with or without `[speaking]` | listen |
 
 ## 2. Train (GPU)
@@ -72,41 +72,44 @@ is exempt, as in the loop), or runs long. The relay eval (`bin/sidecar/eval/`) s
 turns, which the same server answers. Accept when every kind's decision accuracy is above the base, the speak
 windows' claim and echo rates are near zero, and the relay score is no worse than the base.
 
-## Results (2026-10-12)
+## Results (2026-10-13)
 
-Data from `make_windows.py --calls 600`: 5397 train rows (2159 speak, 3238 listen), 2529 held-out windows. One epoch,
-338 steps, 33 min on the RTX 5090, 12.3 GiB peak reserved; train loss 0.056, held-out eval loss 0.0116 (token
-accuracy 99.2%). Adapter: 33.0M parameters, 66 MB as f16 GGUF.
+This is the second adapter. The first (2026-10-12) scored 96% on its own held-out set and taught me two things
+about the data: `p_mid()` rounded up to 0.6 about one mid window in fifty, which put the finished sentence at
+`[p=0.6]` with a listen label and then the same text on the final-raw window with a speak label; and the
+dictation windows carried "Mm-hm." one pause in four, drawn at random, so no model could tell them from the
+listen windows, and the loop could not speak them anyway, because it holds every speak while the user talks.
+Both are gone from `make_windows.py`, and the sidecar's own clips do the backchannelling.
 
-Held-out windows, all 2529, decision accuracy by kind (Q4_K_M front, b11146):
+Data from `make_windows.py --calls 600`: 4427 train rows (1771 speak, 2656 listen), 2591 held-out windows. One
+epoch, 277 steps, 29 min on the RTX 5090, 12.5 GiB peak reserved; train loss 0.061, held-out eval loss 0.00013.
+The first run's eval loss of 0.0116 was the random labels. Adapter: 33.0M parameters, 66 MB as f16 GGUF.
+
+Held-out windows, all 2591, decision accuracy by kind (Q4_K_M front, b11146):
 
 | kind | n | base | LoRA |
 | --- | --- | --- | --- |
-| mid (user still talking) | 1244 | 39% | 97% |
-| silent | 481 | 100% | 100% |
-| silent-speaking | 345 | 99% | 100% |
-| final | 120 | 87% | 100% |
-| over-voice | 96 | 55% | 100% |
-| final-raw | 85 | 91% | 99% |
-| after-answer | 79 | 3% | 100% |
-| backchannel | 70 | 91% | 11% |
-| stop | 9 | 56% | 100% |
-| all | 2529 | 64% | 96% |
+| mid (user still talking) | 1315 | 37% | 100% |
+| silent | 452 | 100% | 100% |
+| silent-speaking | 394 | 99% | 100% |
+| final | 110 | 88% | 100% |
+| over-voice | 108 | 64% | 100% |
+| final-raw | 107 | 91% | 100% |
+| after-answer | 99 | 1% | 100% |
+| stop | 6 | 67% | 100% |
+| all | 2591 | 62% | 100% |
 
-On the speak windows: delegation right 70% to 75%, delegation close to the label 22% to 52%, claims 4% to 0%, echoes
-13% to 11%, long says 7% to 0%. These are from the scorer as it then was, over every labelled speak window, so a
-window the LoRA listened on (most of the backchannel ones) counted as a missing delegation, and a hand-off that
-named the task in the user's words counted as an echo; the scorer now divides by the windows where both spoke and
-exempts hand-offs, so the next run's numbers are higher on the same model.
+On the 196 windows where both the label and the model spoke: a delegation present when expected and absent when
+not, 93% to 100%; the delegation close to the label, 32% to 70%; claims about work 6% to 1%; echoes 1% to 0%; long
+says 3% to 0%. The held-out calls come from the same templates as the training calls, so 100% is the ceiling on
+this generator and says nothing yet about a live session.
 
-The backchannel row is not a regression. Its label is "Mm-hm." on about one dictation pause in four, drawn at random,
-so no model can tell those windows from the listen ones. The base "won" them by speaking task lines into the middle of
-the user's sentence ("Fixing the CSV import date format issue."); the LoRA listens, and every time it speaks there it
-says "Mm-hm.".
-
-Relay eval, 17 fixtures by 3 runs: base 45/51; the adapter on every request 39/51 (it delegated "Mark the item as
-verified" for a plain "it works", and said "Deleted the branch." before any delegation ran); the adapter on the loop's
-requests only 46/51. No invented actions and no double asks in any arm. Hence the scoping below.
+Relay eval, 17 fixtures by 3 runs, with the adapter on the loop's requests only: base 46/51, this adapter 45/51.
+Both arms fail `E_combined` on every run and `N2_single_report` on two or three; no invented actions and no
+double asks in either. Those turns never name the adapter and the server holds it at scale 0, so the one-run gap
+is sampling on the same base model. The first adapter measured the scoping: on every request it scored 39/51
+(it delegated "Mark the item as verified" for a plain "it works", and said "Deleted the branch." before any
+delegation ran), on the loop's requests only 46/51.
 
 ## 4. Use it
 

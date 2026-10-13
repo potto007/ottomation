@@ -113,8 +113,8 @@ DEFAULT_MODEL = Gguf("unsloth/Qwen3-4B-Instruct-2507-GGUF", "Qwen3-4B-Instruct-2
 # The published timing LoRA for DEFAULT_MODEL (training/README.md), frontServerLora "timing": 66 MB, f16. It is
 # coupled to the prompt it learned (timing_lora.TRAINED): a retrain gets a new revision and sha256 here and a new
 # TRAINED there, in one commit.
-TIMING_LORA = Gguf("potto007/live-vibe-timing-lora", "timing-lora.gguf", "b623743fdf90101c5ccf53844e298fbd7098cd00",
-                   "c6dd594aa6dcdae4813f865ba9357f08110c425c490eade286e932a073298816")
+TIMING_LORA = Gguf("potto007/live-vibe-timing-lora", "timing-lora.gguf", "99fb41dbd7915f44832e205eb2b0beca879122e4",
+                   "9faba23d9907617de9b67a63f7b53ec50d22bfcebd21f7bcb930693d817c86be")
 LORAS = {"timing": TIMING_LORA}  # frontServerLora names; anything else is a path to a GGUF adapter
 
 
@@ -221,14 +221,27 @@ def _gb(n: float) -> str:
     return f"{n / 1e9:.2f} GB" if n >= 1e8 else f"{n / 1e6:.0f} MB"
 
 
+def _sha256_of(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
 def download(url: str, dest: Path, sha256: str, size: int, progress: Progress, label: str,
              stop: threading.Event | None = None) -> Path:
     """url -> dest through dest.part (resumed with a Range request), sha256-checked before the rename. An empty sha256
-    takes the Hub's X-Linked-Etag (the LFS object's sha256); with neither, the download fails."""
+    takes the Hub's X-Linked-Etag (the LFS object's sha256); with neither, the download fails. A dest that is already
+    there is kept, unless a pinned sha256 says it is another version (a retrained adapter at the same path): then it
+    is replaced."""
     import httpx
 
     if dest.exists():
-        return dest
+        if not sha256 or _sha256_of(dest) == sha256:
+            return dest
+        progress(f"front: {label} on disk is not the pinned version, fetching it")
+        dest.unlink()
     dest.parent.mkdir(parents=True, exist_ok=True)
     part = dest.with_name(dest.name + ".part")
     have = part.stat().st_size if part.exists() else 0
