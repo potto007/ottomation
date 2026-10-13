@@ -131,8 +131,9 @@ class MicroStepper:
 
     async def resolve_adapters(self) -> None:
         """The timing LoRA is for the loop's two requests only: on the full front turns (relay, retell) it regressed
-        the relay eval from 45/51 to 39/51. The managed server loads adapters with --lora-init-without-apply (scale 0
-        for everyone), and the loop names them at scale 1 per request. A server without the endpoint has none."""
+        the relay eval from 45/51 to 39/51. The managed server sets every adapter's server-wide scale to 0 once
+        healthy (FrontServer._scope_lora), and the loop names them at scale 1 per request. A server without the
+        endpoint has none."""
         get = getattr(self.client, "get", None)
         if get is None:
             return

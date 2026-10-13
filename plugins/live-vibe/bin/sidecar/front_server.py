@@ -440,8 +440,9 @@ def command(binary: Path, model: Path, port: int, ctx: int, on_gpu: bool, lora: 
     cmd = [str(binary), "-m", str(model), "--host", "127.0.0.1", "--port", str(port), "--jinja",
            "-c", str(ctx), "-np", str(PARALLEL), "--no-webui"]
     if lora:
-        # a GGUF adapter, loaded at scale 0: the micro-turn loop applies it to its own requests (MicroStepper.lora)
-        cmd += ["--lora", lora, "--lora-init-without-apply"]
+        # a GGUF adapter; FrontServer._scope_lora sets it to scale 0 once healthy, and the micro-turn loop applies it
+        # to its own requests (MicroStepper.lora)
+        cmd += ["--lora", lora]
     return cmd + (["-ngl", "99"] if on_gpu else ["-ngl", "0", "--device", "none"])
 
 
@@ -585,6 +586,8 @@ class FrontServer:
                 warn(f"front: running the front model on the CPU, which is slow (seconds per reply): {self.where}")
             self._spawn()
             self._wait_health(t0)
+            if self.s.lora:
+                self._scope_lora()
             self._ready.set()
             self._done.set()
             assert self.proc is not None
@@ -656,6 +659,24 @@ class FrontServer:
             return ""
         rows = [x.strip() for x in text.splitlines() if x.strip() and not x.startswith("--- ")]
         return " | ".join(rows[-lines:])
+
+    def _scope_lora(self) -> None:
+        """Sets every loaded adapter's server-wide scale to 0, so the front's full turns (relay, retell) run on the
+        base model and only the micro-turn loop, which names the adapter at scale 1 per request, gets the LoRA.
+        b11146 applies an adapter to requests that name none even with --lora-init-without-apply, hence the POST."""
+        auth = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        try:
+            with urllib.request.urlopen(urllib.request.Request(f"{self.url}/lora-adapters", headers=auth),
+                                        timeout=5) as r:
+                ids = [int(a["id"]) for a in json.loads(r.read())]
+            body = json.dumps([{"id": i, "scale": 0.0} for i in ids]).encode()
+            req = urllib.request.Request(f"{self.url}/lora-adapters", data=body, headers=auth, method="POST")
+            with urllib.request.urlopen(req, timeout=5):
+                pass
+            log(f"front: LoRA adapter {self.s.lora} loaded at scale 0; the micro-turn loop applies it per request")
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            warn(f"front: could not scope the LoRA adapter to the micro-turn loop ({e}); it applies to every front "
+                 "request, which made the relay worse in the A/B")
 
     def _wait_health(self, t0: float) -> None:
         deadline = time.monotonic() + self.health_timeout
