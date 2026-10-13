@@ -12,10 +12,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: |
-          plugin=$(jq -r .version plugins/live-vibe/.claude-plugin/plugin.json)
-          market=$(jq -r '.plugins[] | select(.name == "live-vibe") | .version' .claude-plugin/marketplace.json)
-          echo "plugin.json $plugin, marketplace.json $market"
-          test "$plugin" = "$market"
+          status=0
+          for name in $(jq -r '.plugins[].name' .claude-plugin/marketplace.json); do
+            plugin=$(jq -r .version "plugins/$name/.claude-plugin/plugin.json")
+            market=$(jq -r --arg n "$name" '.plugins[] | select(.name == $n) | .version' .claude-plugin/marketplace.json)
+            echo "$name: plugin.json $plugin, marketplace.json $market"
+            test "$plugin" = "$market" || status=1
+          done
+          exit $status
 
   sidecar:
     name: sidecar ruff and unit checks
@@ -46,3 +50,5 @@ jobs:
       - run: claude plugin validate --strict plugins/live-vibe
       - run: claude plugin validate --strict .claude-plugin/marketplace.json
       - run: claude plugin test plugins/live-vibe
+      - run: claude plugin validate --strict plugins/diagram-pane
+      - run: claude plugin test plugins/diagram-pane
