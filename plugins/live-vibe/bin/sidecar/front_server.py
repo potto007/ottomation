@@ -110,6 +110,13 @@ class Gguf:
 # VRAM with the CUDA context (4.1 at 8k, 7.6 at 32k), which estimate_gib() reproduces.
 DEFAULT_MODEL = Gguf("unsloth/Qwen3-4B-Instruct-2507-GGUF", "Qwen3-4B-Instruct-2507-Q4_K_M.gguf")
 
+# The published timing LoRA for DEFAULT_MODEL (training/README.md), frontServerLora "timing": 66 MB, f16. It is
+# coupled to the prompt it learned (timing_lora.TRAINED): a retrain gets a new revision and sha256 here and a new
+# TRAINED there, in one commit.
+TIMING_LORA = Gguf("potto007/live-vibe-timing-lora", "timing-lora.gguf", "b623743fdf90101c5ccf53844e298fbd7098cd00",
+                   "c6dd594aa6dcdae4813f865ba9357f08110c425c490eade286e932a073298816")
+LORAS = {"timing": TIMING_LORA}  # frontServerLora names; anything else is a path to a GGUF adapter
+
 
 class FrontServerError(Exception):
     pass
@@ -121,7 +128,7 @@ class Settings:
     binary: str = ""  # frontServerBin: an existing llama-server; empty: the pinned download
     model: str = ""  # frontServerModel: an existing GGUF; empty: DEFAULT_MODEL, downloaded
     log: str = ""  # frontServerLog: where the server's stdout and stderr go; empty: <cache>/front-server.log
-    lora: str = ""  # frontServerLora: a GGUF LoRA adapter applied to the model (the timing LoRA); empty: none
+    lora: str = ""  # frontServerLora: "timing" (the published adapter, downloaded) or a GGUF adapter's path; empty: none
     ctx: int = CTX
 
 
@@ -191,6 +198,15 @@ def model_path(s: Settings) -> tuple[Path, bool]:
     if s.model:
         return Path(s.model).expanduser(), False
     return model_file(), True
+
+
+def lora_path(s: Settings) -> tuple[Path | None, bool]:
+    """(the LoRA adapter, whether it is a published one fetched by name); (None, False) for none."""
+    if not s.lora:
+        return None, False
+    if s.lora in LORAS:
+        return model_file(LORAS[s.lora]), True
+    return Path(s.lora).expanduser(), False
 
 
 def log_path(s: Settings) -> Path:
@@ -331,6 +347,18 @@ def ensure_model(s: Settings, progress: Progress, stop: threading.Event | None =
     return download(m.url, path, m.sha256, 0, progress, m.file, stop)
 
 
+def ensure_lora(s: Settings, progress: Progress, stop: threading.Event | None = None) -> Path | None:
+    path, named = lora_path(s)
+    if path is None:
+        return None
+    if not named:
+        if not path.is_file():
+            raise FrontServerError(f"frontServerLora {path} is not a file")
+        return path
+    m = LORAS[s.lora]
+    return download(m.url, path, m.sha256, 0, progress, m.file, stop)
+
+
 def missing(s: Settings) -> list[str]:
     """What a start would have to download first (empty: offline is fine)."""
     out = []
@@ -340,6 +368,9 @@ def missing(s: Settings) -> list[str]:
     m, default = model_path(s)
     if default and not m.is_file():
         out.append(m.name)
+    lora, named = lora_path(s)
+    if named and lora is not None and not lora.is_file():
+        out.append(f"{lora.name} (frontServerLora {s.lora})")
     return out
 
 
@@ -541,6 +572,7 @@ class FrontServer:
         self.cmd: list[str] = []
         self.binary: Path | None = None
         self.model: Path | None = None
+        self.lora: Path | None = None
         self.error = ""
         # llama-server answers any origin (CORS *): a per-start key keeps web pages and other local users out. It
         # goes in LLAMA_API_KEY, so it is never on the command line (ps) or in the log; /health needs none.
@@ -580,13 +612,14 @@ class FrontServer:
                      "is ready, speech goes straight to Claude")
             self.binary = ensure_binary(self.s, self.progress, self._stopping)
             self.model = ensure_model(self.s, self.progress, self._stopping)
+            self.lora = self._get_lora()
             if self.on_gpu is None:
                 self.on_gpu, self.where = placement(self.model, self.s.ctx)
             if not self.on_gpu:
                 warn(f"front: running the front model on the CPU, which is slow (seconds per reply): {self.where}")
             self._spawn()
             self._wait_health(t0)
-            if self.s.lora:
+            if self.lora:
                 self._scope_lora()
             self._ready.set()
             self._done.set()
@@ -605,7 +638,8 @@ class FrontServer:
 
     def _spawn(self) -> None:
         assert self.binary is not None and self.model is not None
-        self.cmd = command(self.binary, self.model, self.port, self.s.ctx, bool(self.on_gpu), self.s.lora)
+        self.cmd = command(self.binary, self.model, self.port, self.s.ctx, bool(self.on_gpu),
+                           str(self.lora) if self.lora else "")
         env = {**os.environ, "LLAMA_API_KEY": self.api_key}
         _, pinned = binary_path(self.s)
         if pinned and sys.platform.startswith("linux"):  # the CUDA runtime libraries unpacked beside the binary
@@ -660,6 +694,27 @@ class FrontServer:
         rows = [x.strip() for x in text.splitlines() if x.strip() and not x.startswith("--- ")]
         return " | ".join(rows[-lines:])
 
+    def _get_lora(self) -> Path | None:
+        """The adapter, or None: a LoRA that cannot be had (no file, a failed download) costs the loop its timing,
+        not the front, so the server starts without it. The published one warns when the prompt it learned changed."""
+        try:
+            lora = ensure_lora(self.s, self.progress, self._stopping)
+        except Exception as e:  # noqa: BLE001
+            if self._stopping.is_set():
+                raise
+            warn(f"front: no LoRA adapter, running the base model ({str(e)[:300]})")
+            return None
+        if lora is not None and self.s.lora == "timing":
+            try:
+                from . import timing_lora
+
+                if timing_lora.stale():
+                    warn("front: the timing LoRA was trained on another front prompt than this version sends; its "
+                         "timing is untested here (retrain: training/README.md)")
+            except Exception as e:  # noqa: BLE001 - the check is advice, never a reason to stop
+                log(f"front: timing LoRA fingerprint not checked ({type(e).__name__}: {e})")
+        return lora
+
     def _scope_lora(self) -> None:
         """Sets every loaded adapter's server-wide scale to 0, so the front's full turns (relay, retell) run on the
         base model and only the micro-turn loop, which names the adapter at scale 1 per request, gets the LoRA.
@@ -673,7 +728,7 @@ class FrontServer:
             req = urllib.request.Request(f"{self.url}/lora-adapters", data=body, headers=auth, method="POST")
             with urllib.request.urlopen(req, timeout=5):
                 pass
-            log(f"front: LoRA adapter {self.s.lora} loaded at scale 0; the micro-turn loop applies it per request")
+            log(f"front: LoRA adapter {self.lora} loaded at scale 0; the micro-turn loop applies it per request")
         except (OSError, ValueError, KeyError, TypeError) as e:
             warn(f"front: could not scope the LoRA adapter to the micro-turn loop ({e}); it applies to every front "
                  "request, which made the relay worse in the A/B")

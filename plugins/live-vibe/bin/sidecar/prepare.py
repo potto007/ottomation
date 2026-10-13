@@ -265,6 +265,7 @@ def managed_front(check: Report, args: argparse.Namespace) -> None:
     try:
         binary = fs.ensure_binary(s, progress)
         model = fs.ensure_model(s, progress)
+        lora = fs.ensure_lora(s, progress)  # "timing": the published adapter, fetched now rather than at /livevibe
     except Exception as e:  # noqa: BLE001 - only /livevibe needs it
         check("front", "warn", f"managed llama-server: {str(e)[:300]}. Only /livevibe needs it; set frontServerBin "
                                "and frontServerModel to files you have, or frontUrl to a server")
@@ -279,5 +280,6 @@ def managed_front(check: Report, args: argparse.Namespace) -> None:
         check("front", "warn", f"managed llama-server did not start: {server.error[:300]}")
         return
     where = "GPU" if server.on_gpu else f"CPU ({server.where}; slow)"
-    check("front", "ok", f"managed llama-server {fs.version(binary)} with {model.name} on {where}, ready in "
+    with_lora = f" and LoRA {lora.name}" if lora else ""
+    check("front", "ok", f"managed llama-server {fs.version(binary)} with {model.name}{with_lora} on {where}, ready in "
                          f"{server.ready_s:.0f}s; log {server.log_file}")

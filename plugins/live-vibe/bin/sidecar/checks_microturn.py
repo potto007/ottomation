@@ -156,6 +156,14 @@ def microturn_units(check: Any) -> None:
     check(not is_echo("Sure, on it.", "can you add a unit test for the parser"), "microturn: a reply is not an echo")
     check(not is_echo("", "anything"), "microturn: empty say is not an echo")
 
+    from . import timing_lora
+
+    fp = timing_lora.fingerprint()
+    check(not timing_lora.stale(),
+          f"timing LoRA: the prompt the loop sends is the one the published adapter learned ({fp[:16]} vs "
+          f"{timing_lora.TRAINED[:16]}). A change to the front prompt, MICRO_PROTOCOL or the window format needs a "
+          "retrain (training/README.md), then a new TRAINED, TIMING_LORA revision and sha256 in one commit")
+
     asyncio.run(loop_units(check))
 
 

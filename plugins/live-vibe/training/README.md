@@ -106,8 +106,27 @@ requests only 46/51. No invented actions and no double asks in any arm. Hence th
 
 ## 4. Use it
 
-Set `frontServerLora` to the adapter's path (`/plugin configure live-vibe@ottomation`), with `microturnMs` on. The
-managed llama-server loads it with `--lora`, then sets its server-wide scale to 0 once healthy; the micro-turn
+Set `frontServerLora` to `timing` (`/plugin configure live-vibe@ottomation`), with `microturnMs` on. The sidecar
+downloads the published adapter from
+[potto007/live-vibe-timing-lora](https://huggingface.co/potto007/live-vibe-timing-lora), pinned by revision and
+sha256 (`front_server.TIMING_LORA`), and `/live setup` fetches it ahead of time. A path to a GGUF adapter of your own
+works too. The managed llama-server loads it with `--lora`, then sets its server-wide scale to 0 once healthy; the micro-turn
 loop's two requests name it at scale 1 (`MicroStepper.lora`, found from `GET /lora-adapters`). The front's full turns
 (relay, retell, status) run on the base model. In b11146 `--lora-init-without-apply` does not do this: a request that
 names no adapter still gets it at scale 1, so the POST is what scopes it.
+
+It stays opt-in until live sessions confirm the held-out numbers; then `timing` becomes the default with
+`microturnMs` on.
+
+## 5. When the prompt changes
+
+The adapter learned one front prompt, `MICRO_PROTOCOL`, window format and set of history messages.
+`sidecar/timing_lora.py` hashes them (`fingerprint()`), and `TRAINED` is the hash the published adapter was trained
+on. A change to any of them fails `--unit` (CI) and makes the front warn at start with `timing` set. The adapter
+still loads, but its timing was learned on other text. To ship the change:
+
+1. Steps 1 to 3 on the new code: `make_windows.py` writes the new fingerprint to `meta.json`, and `train_lora.py`
+   copies it beside the adapter as `training.json`. Accept on the same bar as before.
+2. Upload `timing-lora.gguf`, `peft/` and `training.json` to the Hub repo, and update its model card's numbers.
+3. In one commit: `timing_lora.TRAINED` from `training.json`, and `front_server.TIMING_LORA`'s revision (the upload's
+   commit) and sha256.

@@ -10,6 +10,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import signal
 import socket
 import struct
@@ -184,6 +185,32 @@ def settings_units(check: Callable[[Any, str], bool], root: Path) -> None:
                 ok = False
     check(ok and all(1024 < p < 65536 and p not in (8080, 8091) for p in ports),
           f"port: an ephemeral 127.0.0.1 port, free to bind {sorted(ports)}")
+    named = fs.settings(ns(front_server_lora=" timing "))
+    path = fs.settings(ns(front_server_lora="~/a/lora.gguf"))
+    check(fs.lora_path(fs.settings(ns())) == (None, False)
+          and fs.lora_path(named) == (fs.CACHE / "models" / "potto007__live-vibe-timing-lora" / "timing-lora.gguf", True)
+          and fs.lora_path(path) == (Path.home() / "a/lora.gguf", False),
+          "settings: frontServerLora empty is none, 'timing' the published adapter, anything else a path")
+    check(any("frontServerLora timing" in g for g in fs.missing(named))
+          and not any("lora" in g.lower() for g in fs.missing(path)),
+          f"settings: the published adapter is listed as a download until it is there {fs.missing(named)}")
+    check(re.fullmatch(r"[0-9a-f]{64}", fs.TIMING_LORA.sha256) is not None
+          and re.fullmatch(r"[0-9a-f]{40}", fs.TIMING_LORA.revision) is not None,
+          f"settings: the published adapter is pinned by revision and sha256 ({fs.TIMING_LORA.revision})")
+    try:
+        fs.ensure_lora(path, lambda _: None)
+        msg = ""
+    except fs.FrontServerError as e:
+        msg = str(e)
+    check("is not a file" in msg, f"settings: a frontServerLora path that is not there fails clearly ({msg!r})")
+    with captured() as out:
+        got = fs.FrontServer(fs.Settings(lora=str(root / "none.gguf")))._get_lora()
+    said = " ".join(str(m.get("text", "")) for m in out)
+    check(got is None and "no LoRA adapter, running the base model" in said,
+          f"settings: an adapter that cannot be had warns and the front starts without it ({said[:120]!r})")
+    with_lora = fs.command(Path("/b/llama-server"), Path("/m.gguf"), 4000, fs.CTX, True, "/a/l.gguf")
+    check(with_lora[with_lora.index("--lora") + 1] == "/a/l.gguf" and "--lora-init-without-apply" not in with_lora,
+          "command: --lora names the adapter (scoped to the loop after start, not by a flag)")
     on = fs.command(Path("/b/llama-server"), Path("/m.gguf"), 4000, fs.CTX, True)
     off = fs.command(Path("/b/llama-server"), Path("/m.gguf"), 4000, fs.CTX, False)
     joined = " ".join(on)

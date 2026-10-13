@@ -4,7 +4,8 @@ Status: in progress, started 2026-10-12. Increments 1 (the decision step and its
 the `microturnMs` setting, with the floor rules six live sessions taught it) are merged (0.7.1). Increment 3 (the
 timing LoRA: `training/`, 0.7.2) took held-out decision accuracy from 64% to 96% and claims from 4% to 0%, with the
 relay eval unchanged (45/51 base, 46/51 with the adapter scoped to the loop's requests); results in
-`training/README.md`. Not yet tried live.
+`training/README.md`. Published as potto007/live-vibe-timing-lora and fetched by `frontServerLora: timing` (0.7.3),
+with a prompt fingerprint that fails the unit checks when the prompt it learned changes. Not yet tried live.
 
 ## Why
 
