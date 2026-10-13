@@ -221,14 +221,27 @@ def _gb(n: float) -> str:
     return f"{n / 1e9:.2f} GB" if n >= 1e8 else f"{n / 1e6:.0f} MB"
 
 
+def _sha256_of(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
 def download(url: str, dest: Path, sha256: str, size: int, progress: Progress, label: str,
              stop: threading.Event | None = None) -> Path:
     """url -> dest through dest.part (resumed with a Range request), sha256-checked before the rename. An empty sha256
-    takes the Hub's X-Linked-Etag (the LFS object's sha256); with neither, the download fails."""
+    takes the Hub's X-Linked-Etag (the LFS object's sha256); with neither, the download fails. A dest that is already
+    there is kept, unless a pinned sha256 says it is another version (a retrained adapter at the same path): then it
+    is replaced."""
     import httpx
 
     if dest.exists():
-        return dest
+        if not sha256 or _sha256_of(dest) == sha256:
+            return dest
+        progress(f"front: {label} on disk is not the pinned version, fetching it")
+        dest.unlink()
     dest.parent.mkdir(parents=True, exist_ok=True)
     part = dest.with_name(dest.name + ".part")
     have = part.stat().st_size if part.exists() else 0

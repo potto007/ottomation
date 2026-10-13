@@ -333,6 +333,15 @@ def download_units(check: Callable[[Any, str], bool], root: Path) -> None:
             msg = str(e)
         check("mismatch" in msg and not bad.exists() and not bad.with_name("bad.gguf.part").exists(),
               f"download: a sha256 mismatch keeps nothing ({msg!r})")
+        stale = root / "dl" / "stale.gguf"
+        stale.write_bytes(b"the first adapter")  # cached at the same path, pinned sha256 names the retrained one
+        seen.clear()
+        fs.download(f"{base}/m.gguf", stale, hashlib.sha256(payload).hexdigest(), len(payload), seen.append, "stale")
+        check(stale.read_bytes() == payload and any("not the pinned version" in m for m in seen),
+              "download: a cached file with another sha256 than the pin is replaced")
+        seen.clear()
+        fs.download(f"{base}/m.gguf", stale, hashlib.sha256(payload).hexdigest(), len(payload), seen.append, "stale")
+        check(not seen, "download: a cached file that matches the pin is kept without a request")
         into = root / "build"
         for name, data in (("a.tar.gz", main_tgz), ("c.tar.gz", cudart_tgz)):
             got = fs.download(f"{base}/{name}", root / "dl" / name, hashlib.sha256(data).hexdigest(), len(data),
