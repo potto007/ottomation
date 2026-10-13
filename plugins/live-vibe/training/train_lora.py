@@ -2,7 +2,11 @@
 
 Runs in a venv that has trl, peft, transformers and torch (rlm-trainer's: `~/src/rlm-trainer/.venv/bin/python`):
 
-  <venv>/bin/python plugins/live-vibe/training/train_lora.py --data <dir>/train.jsonl --out <dir>/adapter
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True <venv>/bin/python plugins/live-vibe/training/train_lora.py \\
+      --data <dir>/train.jsonl --eval <dir>/heldout.jsonl --out <dir>/adapter --batch 1 --accum 16
+
+Batch 1 with 16 accumulation steps holds about 30 GB reserved on the 32 GB card (batch 4 spills); expandable segments
+keep the pool from fragmenting upward over the epoch.
 
 Prompt-completion rows: the loss is on the assistant JSON only (TRL's completion_only_loss), never on the long
 system prompt or the history. One epoch, LoRA r=16 on every attention and MLP projection: about 30M trainable
@@ -30,7 +34,7 @@ def main() -> int:
     ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--accum", type=int, default=4)
     ap.add_argument("--limit", type=int, default=0, help="rows to use (0 = all); a smoke run uses a few hundred")
-    ap.add_argument("--eval-rows", type=int, default=400, help="held-out rows for the eval loss (every 100 steps)")
+    ap.add_argument("--eval-rows", type=int, default=400, help="held-out rows for the eval loss, once at the end")
     args = ap.parse_args()
 
     import torch
@@ -64,7 +68,9 @@ def main() -> int:
         per_device_eval_batch_size=args.batch, bf16=True, gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False}, max_length=args.max_length, packing=False,
         completion_only_loss=True, logging_steps=10, save_strategy="no",
-        eval_strategy="steps" if "eval" in ds else "no", eval_steps=100, report_to=[], seed=7,
+        # No eval during training: on the 32 GB card an eval pass grew the allocator's reserved pool by 2 GB and the
+        # run spilled to system RAM for the rest of the epoch. The eval loss is measured once, after training.
+        eval_strategy="no", report_to=[], seed=7,
         dataloader_num_workers=2, remove_unused_columns=True,
     )
     trainer = SFTTrainer(model=model, args=cfg, train_dataset=ds["train"], eval_dataset=ds.get("eval"),

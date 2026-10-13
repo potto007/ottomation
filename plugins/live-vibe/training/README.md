@@ -38,13 +38,16 @@ What a window is labelled:
 ## 2. Train (GPU)
 
 ```sh
-~/src/rlm-trainer/.venv/bin/python plugins/live-vibe/training/train_lora.py \
-    --data /tmp/lora-data/train.jsonl --eval /tmp/lora-data/heldout.jsonl --out /tmp/lora-data/adapter
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True ~/src/rlm-trainer/.venv/bin/python \
+    plugins/live-vibe/training/train_lora.py --data /tmp/lora-data/train.jsonl --eval /tmp/lora-data/heldout.jsonl \
+    --out /tmp/lora-data/adapter --batch 1 --accum 16
 ```
 
 TRL `SFTTrainer` with PEFT: bf16 base (`Qwen/Qwen3-4B-Instruct-2507`, 8 GB download), LoRA r=16 on every attention and
-MLP projection, loss on the assistant JSON only, one epoch, lr 2e-4 cosine. Run it through the work band with a
-`DONE` / `FAILED` sentinel; `--limit 160` is a smoke run.
+MLP projection, loss on the assistant JSON only, one epoch, lr 2e-4 cosine, eval loss on 400 held-out rows once at the
+end. Run it through the work band with a `DONE` / `FAILED` sentinel; `--limit 160` is a smoke run. On the 32 GB card
+batch 1 with 16 accumulation steps holds about 30 GB reserved (batch 4 spilled to system RAM, and so did an eval pass
+in the middle of the epoch); watch power and step time, a drop from about 400 W and a rising s/it is the spill.
 
 ## 3. Convert and score
 
