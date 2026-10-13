@@ -149,10 +149,10 @@ test('live vibe: a note joins the conversation without a turn; an answer or a qu
   on('process.spawn', sidecar.spawn)
   on('http.fetch', () => ok)
   const appended: string[] = []
-  on('session.append', (_$, e) => {
+  on('session.append', (_$, e, next) => {
     const block = e.message.content[0]
     if (e.door === 'note' && block && 'text' in block) appended.push(String(block.text))
-    return { message: e.message, uuid: e.uuid }
+    return next(e)
   })
   const prompted: string[] = []
   on('prompt.submit', (_$, e) => { prompted.push(e.text); return { text: e.text } })
