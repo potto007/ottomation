@@ -176,8 +176,9 @@ unit test [p=0.1]`, or `[no voice]`), and answers `listen` or a few words to spe
 it reads you between words and decides itself when to speak, the way a text LLM can appear full-duplex by
 time-slicing (`docs/design/microturn-front.md`, after DuplexCascade and Codacus's video). The sidecar keeps the floor
 rules: nothing but the decision runs while you are still talking, a reply that only repeats your words is dropped, a
-delegation goes out once per utterance after it ends, and a `listen` while the voice plays and you have spoken cuts
-the voice. Claude's results are still announced as whole turns. Measured on the RTX 5090 with Qwen3-4B: a silent step
+delegation goes out once per utterance after it ends and is always spoken (a few words naming the task, or "On it."),
+and a `listen` while the voice plays and you have spoken cuts the voice. Claude's results are still announced as
+whole turns. Measured on the RTX 5090 with Qwen3-4B: a silent step
 costs about 20 ms, a speaking step under 200 ms, so 200 ms steps are affordable. With the prompt alone the front
 speaks too early and echoes; the timing LoRA (increment 3 in the design note) is what makes it good. Each step writes
 one `micro step:` line to the sidecar log with the action, P(listen), the reason and the time taken.
