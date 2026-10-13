@@ -30,6 +30,7 @@ def main() -> int:
     ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--accum", type=int, default=4)
     ap.add_argument("--limit", type=int, default=0, help="rows to use (0 = all); a smoke run uses a few hundred")
+    ap.add_argument("--eval-rows", type=int, default=400, help="held-out rows for the eval loss (every 100 steps)")
     args = ap.parse_args()
 
     import torch
@@ -46,8 +47,9 @@ def main() -> int:
     ds = ds.remove_columns([c for c in ds["train"].column_names if c not in ("prompt", "completion")])
     if args.limit:
         ds["train"] = ds["train"].select(range(min(args.limit, len(ds["train"]))))
-        if "eval" in ds:
-            ds["eval"] = ds["eval"].select(range(min(args.limit // 4 or 1, len(ds["eval"]))))
+    if "eval" in ds:
+        n = min(args.limit // 4 or args.eval_rows, args.eval_rows, len(ds["eval"]))
+        ds["eval"] = ds["eval"].shuffle(seed=7).select(range(max(1, n)))
     print(f"rows: train {len(ds['train'])}" + (f", eval {len(ds['eval'])}" if "eval" in ds else ""), flush=True)
 
     tok = AutoTokenizer.from_pretrained(args.base)
@@ -62,7 +64,7 @@ def main() -> int:
         per_device_eval_batch_size=args.batch, bf16=True, gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False}, max_length=args.max_length, packing=False,
         completion_only_loss=True, logging_steps=10, save_strategy="no",
-        eval_strategy="steps" if "eval" in ds else "no", eval_steps=50, report_to=[], seed=7,
+        eval_strategy="steps" if "eval" in ds else "no", eval_steps=100, report_to=[], seed=7,
         dataloader_num_workers=2, remove_unused_columns=True,
     )
     trainer = SFTTrainer(model=model, args=cfg, train_dataset=ds["train"], eval_dataset=ds.get("eval"),
