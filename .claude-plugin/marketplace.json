@@ -9,7 +9,7 @@
       "name": "live-vibe",
       "source": "./plugins/live-vibe",
       "description": "/live: full-duplex voice (Kyutai streaming STT with semantic end of turn, or Silero and Whisper; Kokoro TTS) through a sidecar; /vibe: director mode that delegates all work to subagents; /livevibe: talk with a fast voice front that hands the work to Claude as director.",
-      "version": "0.7.2",
+      "version": "0.7.3",
       "keywords": [
         "function-hooks",
         "voice",

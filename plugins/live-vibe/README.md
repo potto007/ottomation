@@ -132,7 +132,7 @@ The file rotates at 5 MB and keeps one previous copy (`sidecar.log.1`). If the p
 | `frontUrl` | empty | Empty: a managed llama-server (below). Set: the front's server, which can be another host, such as a GPU box; nothing starts locally. |
 | `frontServerBin` | empty | Managed server: an existing `llama-server` to run instead of the download. |
 | `frontServerModel` | empty | Managed server: an existing GGUF to serve instead of the default model. |
-| `frontServerLora` | empty | Managed server: a GGUF LoRA adapter for the `microturnMs` loop (the timing LoRA, `training/README.md`). Only the loop's requests use it; the front's full turns run on the base model. |
+| `frontServerLora` | empty | Managed server: `timing` for the published timing LoRA of the `microturnMs` loop (downloaded, pinned; `training/README.md`), or a path to a GGUF LoRA adapter. Only the loop's requests use it; the front's full turns run on the base model. |
 | `frontServerLog` | empty | Managed server: where its stdout and stderr go; empty means `~/.cache/duplex_voice/front-server.log`. |
 | `frontModel` | empty | Sent as `model` on every request. Empty means the server's own model (or `claude-haiku-4-5` for anthropic). |
 | `experimental` | `true` | The experimental voice path (below). Off restores the 0.6.4 behaviour. |
