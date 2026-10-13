@@ -1268,14 +1268,17 @@ class FrontSession(Duplex):
         """What a step speaks, by the utterance-level turn's rules: a hand-off is an acknowledgement (a short "on it"
         with no claim about the work; the second live session had the front announce "Done, the branches have been
         removed" in its hand-off); an answer to a question Claude asked gets no front line at all (Claude answers;
-        the third session had "Got it, no further action needed" before Claude's own reply); otherwise a reply rests
-        on a fresh Status report when there is one, and is held for Claude while work is in session."""
+        the third session had "Got it, no further action needed" before Claude's own reply); a status question rests
+        on a fresh Status report when there is one; any other reply is held for Claude while work is in session (the
+        fifth session had the front answer "what would issue five involve?" and "can you give me more detail?" from
+        the report, and Claude never heard them)."""
         self.micro_status_answer = False
         if handing:
             return acknowledgement(say)
         if self.question_open:  # the user is answering Claude's question: Claude replies, the front adds nothing
             return ""
-        if self.tools.status_fresh:
+        asked = self.micro.last_utterance if self.micro is not None else ""
+        if self.tools.status_fresh and is_status_question(asked):  # how the work stands, not what it involves
             reply = status_reply(say)
             self.micro_status_answer = reply != HOLD  # answered from the report: the note needs no Claude turn
             return reply
