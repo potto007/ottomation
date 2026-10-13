@@ -1,0 +1,9 @@
+# The sidecar's lint: ruff's default rules (E4, E7, E9, F), wrapped at 120. Line length is not enforced (E501 is off
+# by default; prose in docstrings and check names runs longer). `select` is explicit so a user-level ruff config
+# cannot widen it.
+line-length = 120
+target-version = "py311"
+extend-exclude = ["win_player"]
+
+[lint]
+select = ["E4", "E7", "E9", "F"]

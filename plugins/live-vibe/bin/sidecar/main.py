@@ -116,6 +116,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                     help="the experimental voice path (stable front cache, commentary relay, speculative replies)")
     ap.add_argument("--backchannels", action="store_true",
                     help="front: a short 'mm-hm' during long dictation (needs --experimental)")
+    ap.add_argument("--microturn-ms", type=int, default=0,
+                    help="front: ask the model every N ms what it heard so far (listen or speak); 0 = off")
     ap.add_argument("--list-devices", action="store_true")
     ap.add_argument("--setup", action="store_true", help="check the system, fetch the models, test the voice")
     ap.add_argument("--unit", action="store_true", help="pure unit checks")
@@ -160,14 +162,14 @@ def run(args: argparse.Namespace, life: protocol.Lifecycle) -> int:
         # --experimental: Kyutai's continuous end-of-turn wait and STT flush (Tuning.eot_continuous, stt_flush)
         build = lambda: speech.recognizer(args.stt, args.asr, args.end_silence_ms, guard.active,  # noqa: E731
                                           args.end_silence_long_ms, guard, experimental=args.experimental)
-        if args.mode == "front" and args.experimental:  # the front's view of the turn: speculation, backchannels
-            from sidecar.front import TurnWatch
+        if args.mode == "front" and (args.experimental or args.microturn_ms > 0):  # the front's view of the turn:
+            from sidecar.front import TurnWatch  # speculation, backchannels, the micro-turn loop's pieces
 
             recognize = build
 
             def build():
                 detector, transcribe = recognize()
-                return TurnWatch(detector, tuning(args).backchannels), transcribe
+                return TurnWatch(detector, tuning(args).backchannels, pieces=args.microturn_ms > 0), transcribe
     listener = audio.Listener(build, life.quit, guard, aec=sd is not None and args.aec == "on")
     if not args.fake_audio:  # the recognizer has the first claim on the GPU; Kokoro takes what is left
         gpu.hold("stt", speech.stt_gpu_need(args.stt))
@@ -223,7 +225,8 @@ def tuning(args: argparse.Namespace):
     experimental = bool(getattr(args, "experimental", False))
     return Tuning(end_silence_ms=args.end_silence_ms, end_silence_long_ms=args.end_silence_long_ms,
                   experimental=experimental, backchannels=experimental and bool(getattr(args, "backchannels", False)),
-                  eot_continuous=experimental, stt_flush=experimental)  # as speech.recognizer sets them
+                  eot_continuous=experimental, stt_flush=experimental,  # as speech.recognizer sets them
+                  microturn_ms=max(0, int(getattr(args, "microturn_ms", 0) or 0)))
 
 
 async def serve(args, life: protocol.Lifecycle, listener, voice, sd, mic, t0: float) -> int:

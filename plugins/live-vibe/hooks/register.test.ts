@@ -149,10 +149,10 @@ test('live vibe: a note joins the conversation without a turn; an answer or a qu
   on('process.spawn', sidecar.spawn)
   on('http.fetch', () => ok)
   const appended: string[] = []
-  on('session.append', (_$, e) => {
+  on('session.append', (_$, e, next) => {
     const block = e.message.content[0]
     if (e.door === 'note' && block && 'text' in block) appended.push(String(block.text))
-    return { message: e.message, uuid: e.uuid }
+    return next(e)
   })
   const prompted: string[] = []
   on('prompt.submit', (_$, e) => { prompted.push(e.text); return { text: e.text } })
@@ -505,6 +505,34 @@ test('experimental (the default) reaches the sidecar, and the relay prompt asks 
   expect(argvs[0]).toContain('--backchannels')
   expect(relay?.text).toContain('`Status: working`, `Status: done`, `Status: failed` or `Status: cancelled`')
   expect(relay?.text).toContain('reply with exactly: (nothing to add)')
+  await $.command.run({ command: 'livevibe', ...typed })
+  sidecar.release()
+})
+
+test('microturnMs reaches the sidecar as --microturn-ms, only when set', { options: { microturnMs: 300 } }, async ($, on) => {
+  const argvs: string[] = []
+  const sidecar = fakeSidecar(4321)
+  on('process.spawn', async function* (_$, e) { argvs.push(e.argv.join(' ')); return yield* sidecar.spawn() })
+  on('http.fetch', () => ok)
+  on('prompt.compose', () => ({ sections: [] }))
+
+  await $.command.run({ command: 'livevibe', ...typed })
+  await sidecar.isUp
+  expect(argvs[0]).toContain('--microturn-ms 300')
+  await $.command.run({ command: 'livevibe', ...typed })
+  sidecar.release()
+})
+
+test('microturnMs 0 (the default) adds no flag', async ($, on) => {
+  const argvs: string[] = []
+  const sidecar = fakeSidecar(4321)
+  on('process.spawn', async function* (_$, e) { argvs.push(e.argv.join(' ')); return yield* sidecar.spawn() })
+  on('http.fetch', () => ok)
+  on('prompt.compose', () => ({ sections: [] }))
+
+  await $.command.run({ command: 'livevibe', ...typed })
+  await sidecar.isUp
+  expect(argvs[0]).not.toContain('--microturn-ms')
   await $.command.run({ command: 'livevibe', ...typed })
   sidecar.release()
 })
