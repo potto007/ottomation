@@ -29,6 +29,7 @@ From `plugins/live-vibe/bin/sidecar/eval/`:
 nvidia-smi --query-gpu=memory.used,memory.free --format=csv          # on its own; 8 GiB or more free
 
 ./launch_front.sh ~/.cache/duplex_voice/models/unsloth__Qwen3-4B-Instruct-2507-GGUF/Qwen3-4B-Instruct-2507-Q4_K_M.gguf
+# a second argument is a GGUF LoRA adapter (`--lora`), for the timing LoRA (training/README.md)
 cat /tmp/live-vibe-relay-eval/launch_front.pid; ps -p "$(cat /tmp/live-vibe-relay-eval/launch_front.pid)"
 curl -s 127.0.0.1:8092/health                                         # until {"status":"ok"}
 
