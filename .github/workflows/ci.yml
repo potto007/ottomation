@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  versions:
+    name: plugin.json and marketplace.json agree
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          plugin=$(jq -r .version plugins/live-vibe/.claude-plugin/plugin.json)
+          market=$(jq -r '.plugins[] | select(.name == "live-vibe") | .version' .claude-plugin/marketplace.json)
+          echo "plugin.json $plugin, marketplace.json $market"
+          test "$plugin" = "$market"
+
+  sidecar:
+    name: sidecar ruff and unit checks
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: plugins/live-vibe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libportaudio2
+      - run: uvx ruff check bin/sidecar
+      # The light set the unit checks import; the full PEP 723 header (onnxruntime-gpu, torch) is for a GPU machine.
+      - run: uv run --python 3.12 --with numpy --with httpx --with sounddevice --with onnxruntime python bin/sidecar/main.py --unit
+
+  mod:
+    name: plugin validate and mod tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm install -g @anthropic-ai/claude-code
+      - run: claude --version
+      - run: claude plugin validate --strict plugins/live-vibe
+      - run: claude plugin validate --strict .claude-plugin/marketplace.json
+      - run: claude plugin test plugins/live-vibe
