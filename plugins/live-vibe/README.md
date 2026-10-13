@@ -86,6 +86,12 @@ name contains the `speaker` setting). No network, port or firewall rule is invol
 
 ## First run
 
+Install the plugin in one step (Claude Code 2.1.275 or later):
+
+```
+/plugin install live-vibe --marketplace potto007/ottomation
+```
+
 Run `/live setup` once on each machine. uv installs the Python packages, then the sidecar downloads the models your
 settings name and tests each piece: PortAudio and the mic and speaker, espeak-ng, the synthesizer, the recognizer
 (it speaks a sentence into it and checks what comes back), one sentence through the speaker, and the front server
