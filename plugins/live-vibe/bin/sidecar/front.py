@@ -1257,10 +1257,22 @@ class FrontSession(Duplex):
                             delegate=self.micro_delegate, speaking=self.voice.speaking.is_set, busy=self.turn_running,
                             show=lambda text, kind: emit(type="transcript", role="front", text=text, kind=kind),
                             note=lambda text: self.pass_on(text, "", self.tools.handed),
-                            is_backchannel=is_backchannel, log=lambda text: file_log("INFO", text))
+                            is_backchannel=is_backchannel, log=lambda text: file_log("INFO", text),
+                            trim=self.micro_trim)
             self.micro = MicroLoop(stepper, brain.history, deps, tune.microturn_ms)
 
     # -- the micro-turn loop's hands (microturn.MicroLoop drives these) ------------------------------------------
+    def micro_trim(self, say: str, handing: bool) -> str:
+        """What a step speaks, by the utterance-level turn's rules: a hand-off is an acknowledgement (a short "on it"
+        with no claim about the work; the second live session had the front announce "Done, the branches have been
+        removed" in its hand-off); a reply rests on a fresh Status report when there is one, and is held for Claude
+        otherwise while work is in session."""
+        if handing:
+            return acknowledgement(say)
+        if self.tools.status_fresh:
+            return status_reply(say)
+        return held_answer(say, self.tools.work_in_session)
+
     def micro_speak(self, text: str) -> None:
         """Words to the voice: start a speaking run, or extend the one playing."""
         if self.run_q is None or self.run_task is None or self.run_task.done():

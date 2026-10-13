@@ -177,7 +177,7 @@ class MicroStepper:
             return step
         t = time.monotonic()
         body = {"model": self.model, "messages": self.messages(history, window), "response_format": FORMAT,
-                "stream": False, "max_tokens": 120, **self.sampling,
+                "stream": False, "max_tokens": 80, **self.sampling,
                 "chat_template_kwargs": {"enable_thinking": False},
                 "logit_bias": {str(i): -100 for i in self.listen_ids}}
         r = await self.client.post(f"{self.url}/v1/chat/completions", json=body, timeout=30.0)
@@ -223,6 +223,8 @@ class LoopDeps:
     note: Any  # (text) -> None: the user's utterance to Claude as a note, when the loop handed nothing off for it
     is_backchannel: Any  # (text) -> bool
     log: Any  # (text) -> None
+    trim: Any = staticmethod(lambda say, handing: say)  # (say, handing off) -> what is spoken: the session's
+    # acknowledgement rule for a hand-off (a short "on it" with no claim about the work) and its reply rule otherwise
 
 
 class MicroLoop:
@@ -416,7 +418,8 @@ class MicroLoop:
                 if await self.deps.delegate(step.delegate.strip(), said):
                     self.handed_this_utterance = handed = True
                     self.run_delegate = self.run_delegate or step.delegate.strip()
-            say = step.say.strip() or (HANDOFF_SAY if handed else "")  # a hand-off is never silent
+            say = str(self.deps.trim(step.say.strip(), handed)).strip() if step.say.strip() else ""
+            say = say or (HANDOFF_SAY if handed else "")  # a hand-off is never silent
             if say:
                 self.run.append(say)
                 self.deps.speak(say)

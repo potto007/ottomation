@@ -119,6 +119,12 @@ it good.
      called it, every reading was `n/a`, and the rule's fallback for no reading is listen.)
    - A hand-off is never silent: the prompt asks for a few words that name the task, the echo rule does not apply to
      a delegating step's `say`, and a delegation with no `say` speaks `HANDOFF_SAY` ("On it.").
+   - What a step speaks goes through the utterance-level turn's rules (`FrontSession.micro_trim`): a hand-off is an
+     `acknowledgement` (first sentence when short and claim-free, else "On it, I've asked."), a reply is `status_reply`
+     on a fresh Status report and `held_answer` otherwise (held for Claude while work is in session). The speaking
+     turn's `max_tokens` is 80. (Second live session: the hand-off for "yeah" was "Deleting the old Tetris
+     branches... Done. The branches ... have been removed", a claim about work not yet begun, which the
+     acknowledgement rule cuts to its first sentence.)
    - While a run plays, the model's context ends with the run so far as a provisional assistant message, so a step
      continues the answer instead of starting it again; a `say` that repeats the run (the echo test against the
      run's text) is not spoken and ends the run. (Second live session, 2026-10-12: with the run invisible until it

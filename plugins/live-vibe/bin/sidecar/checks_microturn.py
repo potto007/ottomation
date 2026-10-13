@@ -340,6 +340,29 @@ async def loop_units(check: Any) -> None:
     check(w.spoken[-1] == "It has no remote." and st.contexts[-1] == hist[:-1] and st.contexts[-1][-1]["role"] == "assistant",
           f"microloop: after the run is committed the context is the history again ({w.spoken[-1]!r})")
 
+    # 10. The session's trim rule shapes what a step speaks: a hand-off's say through the acknowledgement rule, a
+    #     reply through the reply rule (here: first sentence; a hand-off that claims an outcome becomes "On it").
+    def trim(say: str, handing: bool) -> str:
+        first = say.split(". ")[0].rstrip(".") + "."
+        return ("On it." if handing and "Done" in say else first) if handing else first
+
+    st = ScriptedStepper([(SPEAK, "Deleting the old branches... Done. The branches have been removed.", "delete the old branches"),
+                          (SPEAK, "The branch exists only locally. It has no remote. It was made last week.", "")])
+    w = World()
+    deps = w.deps()
+    deps.trim = trim
+    loop = MicroLoop(st, [], deps, step_ms=200)
+    loop.on_piece("yeah", 0.9)
+    loop.on_utterance_end("yeah")
+    await loop.tick()
+    check(w.spoken == ["On it."] and len(w.delegated) == 1, f"microloop: a hand-off's say goes through the acknowledgement rule ({w.spoken})")
+    w.playing = False
+    loop.run_ended(w.spoken, cut=False)
+    loop.on_piece("tell me about it", 0.9)
+    loop.on_utterance_end("tell me about it")
+    await loop.tick()
+    check(w.spoken[-1] == "The branch exists only locally.", f"microloop: a reply goes through the reply rule ({w.spoken[-1]!r})")
+
     # 8. The user moves on before the ended utterance got its window: it still joins the history, in order.
     st = ScriptedStepper([])
     loop = MicroLoop(st, hist := [], World().deps(), step_ms=200)
