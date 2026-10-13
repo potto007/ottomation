@@ -9,6 +9,7 @@ from typing import Any
 
 from .microturn import (
     FORMAT,
+    HANDOFF_SAY,
     IDLE_SKIP,
     LISTEN,
     NO_VOICE,
@@ -128,6 +129,10 @@ def microturn_units(check: Any) -> None:
         s3 = await st.step(hist, NO_VOICE)
         check(s3.action == LISTEN and s3.p_listen is not None and abs(s3.p_listen - 0.30) < 1e-6,
               f"microturn: exactly the threshold listens (p={s3.p_listen})")
+        lazy = MicroStepper(ScriptedServer([0.9]), "http://s", "m", "SYS")
+        s4 = await lazy.decide(hist, NO_VOICE)
+        check(lazy.listen_ids and lazy.speak_ids and s4.p_listen is not None,
+              f"microturn: the first decision resolves the action tokens itself (p={s4.p_listen})")
 
     asyncio.run(scripted())
 
@@ -215,9 +220,13 @@ async def loop_units(check: Any) -> None:
     check(st.windows[-1].startswith("[voice] can you add [p=0.1]"), f"microloop: the window is the utterance so far {st.windows[-1]!r}")
     loop.on_piece("a unit test for the parser", 0.9)
     loop.on_utterance_end("Can you add a unit test for the parser?")
-    check(hist[-1]["role"] == "user" and "Can you add a unit test" in hist[-1]["content"] and not w.notes,
-          "microloop: the utterance is one user message in the history; its note waits for the next step")
+    check(loop.final is not None and not hist and not w.notes,
+          "microloop: the ended utterance waits for its window; its note waits for the next step")
     s = await loop.tick()
+    check(st.windows[-1] == "[voice] Can you add a unit test for the parser? [p=0.9]",
+          f"microloop: the window after the end is the whole utterance with the turn over {st.windows[-1]!r}")
+    check(hist[-1]["role"] == "user" and "Can you add a unit test" in hist[-1]["content"],
+          "microloop: after that window the utterance is one user message in the history")
     check(s is not None and s.action == SPEAK and w.spoken == ["Sure, on it."]
           and w.delegated == [("add a unit test for the parser", "Can you add a unit test for the parser?")] and not w.notes,
           f"microloop: after the utterance the front speaks and delegates with the user's words; no note ({w.delegated})")
@@ -281,3 +290,33 @@ async def loop_units(check: Any) -> None:
     before = len(loop.history)
     loop.on_utterance_end("")
     check(len(loop.history) == before, "microloop: an empty utterance end adds nothing")
+
+    # 7. A hand-off is never silent, and its say may name the task in the user's words.
+    st = ScriptedStepper([(SPEAK, "", "check the status of this repo"),
+                          (SPEAK, "Checking the status of this repo.", "look at the failing test")])
+    w = World()
+    hist = []
+    loop = MicroLoop(st, hist, w.deps(), step_ms=200)
+    loop.on_piece("can you check the status of this repo", 0.7)
+    loop.on_utterance_end("can you check the status of this repo")
+    await loop.tick()
+    check(w.spoken == [HANDOFF_SAY] and len(w.delegated) == 1, f"microloop: a hand-off with no say speaks {HANDOFF_SAY!r} ({w.spoken})")
+    loop.run_ended(w.spoken, cut=False)
+    w.playing = False
+    loop.on_piece("now look at the failing test", 0.8)
+    loop.on_utterance_end("now look at the failing test")
+    await loop.tick()
+    check(w.spoken[-1] == "Checking the status of this repo." and len(w.delegated) == 2,
+          f"microloop: a hand-off's say is not dropped as an echo ({w.spoken[-1]!r})")
+    check(st.windows[-1].endswith("[p=0.8]") and not st.windows[-1].startswith(NO_VOICE),
+          f"microloop: an ended utterance is asked with its own p when above EOT {st.windows[-1]!r}")
+
+    # 8. The user moves on before the ended utterance got its window: it still joins the history, in order.
+    st = ScriptedStepper([])
+    loop = MicroLoop(st, hist := [], World().deps(), step_ms=200)
+    loop.on_piece("first", 0.9)
+    loop.on_utterance_end("first thing")
+    loop.on_piece("second", 0.1)
+    check(len(hist) == 1 and "first thing" in hist[0]["content"], f"microloop: an unasked utterance is committed when the next begins {hist}")
+    check(st.windows == [] and (await loop.tick()) is not None and st.windows[-1].startswith("[voice] second"),
+          f"microloop: the new utterance is the window {st.windows}")

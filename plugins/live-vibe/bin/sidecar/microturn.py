@@ -32,8 +32,10 @@ MICRO_PROTOCOL = (
     f"nothing now: the user is still talking, or you have nothing to add. {SPEAK} means say is spoken at once: a few "
     f"words that continue what you were saying, or start an answer, or a short listening sound (mm-hm) while the user "
     f"talks on. If the user talks over you, answer {LISTEN} and stop. delegate is the complete request for the coding "
-    f'agent whenever the user asks for any work, otherwise "".'
+    f'agent whenever the user asks for any work, otherwise "". When you hand work off, say so in a few words that name '
+    f'the task ("Checking the repo status."); never hand off in silence.'
 )
+HANDOFF_SAY = "On it."  # spoken when a delegation goes out with no say of its own
 
 FORMAT: dict[str, Any] = {"type": "json_schema", "json_schema": {
     "name": "micro_turn", "strict": True, "schema": {
@@ -147,6 +149,8 @@ class MicroStepper:
 
     async def decide(self, history: list[dict[str, Any]], window: str) -> MicroStep:
         """The decision request alone: PREFIX appended to the templated prompt, one token, TOP_N logprobs."""
+        if not self.listen_ids or not self.speak_ids:  # first step: the action tokens, from the server's tokenizer
+            await self.resolve_tokens()
         step = MicroStep(window=window)
         t = time.monotonic()
         prompt = await self.prompt(self.messages(history, window))
@@ -243,6 +247,7 @@ class MicroLoop:
         self.stepper, self.history, self.deps, self.step_ms, self.eot = stepper, history, deps, step_ms, eot
         self.utterance: list[str] = []  # the user's words since the last utterance end
         self.last_utterance = ""  # the recognizer's text of the utterance that just ended (the echo check's reference)
+        self.final: tuple[str, float] | None = None  # an ended utterance and its p, asked once as a whole before it joins the history
         self.pending_note: str | None = None  # an ended utterance not yet handed off or passed on
         self.new_words = False  # words arrived since the last tick
         self.p: float | None = None
@@ -260,6 +265,7 @@ class MicroLoop:
         if piece and piece.strip():
             if self.user_done:  # a new utterance begins: the last one's note, if still pending, goes now
                 self.flush_note()
+                self.commit_final()
             self.utterance.append(piece.strip())
             self.new_words = True
             self.user_done = False
@@ -268,12 +274,14 @@ class MicroLoop:
             self.p = p
 
     def on_utterance_end(self, text: str) -> None:
-        """The recognizer's utterance: it goes into the history as the user's message (its text, not the pieces),
-        becomes the pending note, and the loop starts a fresh utterance."""
+        """The recognizer's utterance: the next window asks the model on its whole text (not the pieces) with the
+        turn taken as ended, then that window joins the history as the user's message; it becomes the pending note,
+        and the loop starts a fresh utterance."""
         text = " ".join(text.split())
         self.flush_note()
+        self.commit_final()
         if text:
-            self.history.append({"role": "user", "content": window_message(text, self.p if self.p is not None else 0.9, False)})
+            self.final = (text, self.p if self.p is not None else 0.9)
             self.last_utterance = text
             self.pending_note = text
         self.utterance = []
@@ -281,6 +289,14 @@ class MicroLoop:
         self.user_done = True
         self.handed_this_utterance = False
         self.silent = 0
+
+    def commit_final(self) -> None:
+        """The ended utterance joins the history once: after the window that asked on it, or when the user moves on
+        before one did."""
+        if self.final is not None:
+            text, p = self.final
+            self.history.append({"role": "user", "content": window_message(text, p, False)})
+            self.final = None
 
     def flush_note(self) -> None:
         note, self.pending_note = self.pending_note, None
@@ -317,13 +333,15 @@ class MicroLoop:
         speaking = bool(self.deps.speaking())
         if self.utterance and not self.user_done:
             return window_message(self.utterance_text, self.p, speaking)
+        if self.final is not None:  # the ended utterance, whole, with the turn taken as over
+            return window_message(self.final[0], max(self.final[1], self.eot), speaking)
         return window_message("", self.p if self.utterance else None, speaking)
 
     def idle(self) -> bool:
         """Nothing to ask: no new words, the user is not mid-utterance, nothing plays, and the model has had
         IDLE_SKIP silent windows since."""
-        return (not self.new_words and (self.user_done or not self.utterance) and not self.deps.speaking()
-                and not self.run and self.silent >= IDLE_SKIP)
+        return (not self.new_words and self.final is None and (self.user_done or not self.utterance)
+                and not self.deps.speaking() and not self.run and self.silent >= IDLE_SKIP)
 
     def floor(self, step: MicroStep) -> tuple[str, str]:
         """The action after the floor rules, and why."""
@@ -334,7 +352,8 @@ class MicroLoop:
                 return SPEAK, "backchannel"
             return LISTEN, "floor"
         reference = self.utterance_text or self.last_utterance
-        if step.say and reference and is_echo(step.say, reference):
+        handing_off = bool(step.delegate.strip()) and not self.handed_this_utterance
+        if step.say and reference and not handing_off and is_echo(step.say, reference):  # a hand-off names the task
             return LISTEN, "echo"
         if not step.say.strip() and not step.delegate.strip():
             return LISTEN, "empty"
@@ -349,6 +368,7 @@ class MicroLoop:
         if self.idle():
             return None
         window = self.window()
+        asked_final = self.final is not None and not (self.utterance and not self.user_done)
         self.new_words = False
         self.in_flight = True
         t = time.monotonic()
@@ -365,6 +385,8 @@ class MicroLoop:
                 step.action, reason = self.floor(step)
         finally:
             self.in_flight = False
+        if asked_final:
+            self.commit_final()
         ms = 1000 * (time.monotonic() - t)
         if ms > self.step_ms:
             self.late += 1
@@ -383,9 +405,10 @@ class MicroLoop:
                 if await self.deps.delegate(step.delegate.strip(), said):
                     self.handed_this_utterance = handed = True
                     self.run_delegate = self.run_delegate or step.delegate.strip()
-            if step.say.strip():
-                self.run.append(step.say.strip())
-                self.deps.speak(step.say.strip())
+            say = step.say.strip() or (HANDOFF_SAY if handed else "")  # a hand-off is never silent
+            if say:
+                self.run.append(say)
+                self.deps.speak(say)
             if self.user_done:
                 self.resolve_note(handed)
             return

@@ -110,8 +110,15 @@ it good.
 2. **The loop in the sidecar** (`microturn.MicroLoop`, driven by `FrontSession`), behind `microturnMs` (0 = off;
    llama.cpp front and the Kyutai recognizer). What changed from the bench after its results:
    - The window carries the whole utterance so far (`[voice] can you add a unit test [p=0.1]`), not the step's
-     fragment, so the model reads a sentence. The history takes the utterance once, when the recognizer ends it,
-     and a speaking run once, when the voice finishes, with what was heard. Silent windows are never committed.
+     fragment, so the model reads a sentence. When the recognizer ends the utterance, the next window asks on its
+     whole text with the turn taken as over (`[p=` at least 0.6), and that window then joins the history as the
+     user's message; a speaking run joins once, when the voice finishes, with what was heard. Silent windows are
+     never committed. (The first live session, 2026-10-12, showed why the final window matters: with `[no voice]`
+     after the end, the model listened through every utterance and Claude got the words only as notes.)
+   - The stepper resolves the `listen` and `speak` token ids on its first decision. (Same session: the loop never
+     called it, every reading was `n/a`, and the rule's fallback for no reading is listen.)
+   - A hand-off is never silent: the prompt asks for a few words that name the task, the echo rule does not apply to
+     a delegating step's `say`, and a delegation with no `say` speaks `HANDOFF_SAY` ("On it.").
    - Floor rules, in the sidecar: while the user talks (p below 0.6, utterance open) only the decision request runs
      and a `speak` is held (backchannels from the model come with the LoRA); a `say` that echoes the user's words is
      dropped; a delegation is taken once per utterance, after it ends, with the user's words as `said`.
