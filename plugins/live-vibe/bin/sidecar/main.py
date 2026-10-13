@@ -109,6 +109,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--front-server-bin", default="", help="managed front: an existing llama-server (no download)")
     ap.add_argument("--front-server-model", default="", help="managed front: an existing GGUF (no download)")
     ap.add_argument("--front-server-log", default="", help="managed front: its log; empty: <cache>/front-server.log")
+    ap.add_argument("--front-server-lora", default="", help="managed front: a GGUF LoRA adapter (the timing LoRA)")
     ap.add_argument("--front-model", default="", help="empty: the server's model, or claude-haiku-4-5 for anthropic")
     ap.add_argument("--switch-pattern", default="", help="regex whose group 1 is a model a spoken switch names")
     ap.add_argument("--log-file", default="", help="persistent sidecar log; empty: <cache dir>/sidecar.log")

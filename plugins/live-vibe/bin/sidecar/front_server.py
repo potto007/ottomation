@@ -121,6 +121,7 @@ class Settings:
     binary: str = ""  # frontServerBin: an existing llama-server; empty: the pinned download
     model: str = ""  # frontServerModel: an existing GGUF; empty: DEFAULT_MODEL, downloaded
     log: str = ""  # frontServerLog: where the server's stdout and stderr go; empty: <cache>/front-server.log
+    lora: str = ""  # frontServerLora: a GGUF LoRA adapter applied to the model (the timing LoRA); empty: none
     ctx: int = CTX
 
 
@@ -132,7 +133,8 @@ def managed(args: Any) -> bool:
 def settings(args: Any) -> Settings:
     return Settings(str(getattr(args, "front_server_bin", "") or "").strip(),
                     str(getattr(args, "front_server_model", "") or "").strip(),
-                    str(getattr(args, "front_server_log", "") or "").strip())
+                    str(getattr(args, "front_server_log", "") or "").strip(),
+                    str(getattr(args, "front_server_lora", "") or "").strip())
 
 
 def build_key(system: str | None = None, machine: str | None = None, nvidia: bool | None = None,
@@ -434,9 +436,11 @@ def free_port(host: str = "127.0.0.1") -> int:
         return int(s.getsockname()[1])
 
 
-def command(binary: Path, model: Path, port: int, ctx: int, on_gpu: bool) -> list[str]:
+def command(binary: Path, model: Path, port: int, ctx: int, on_gpu: bool, lora: str = "") -> list[str]:
     cmd = [str(binary), "-m", str(model), "--host", "127.0.0.1", "--port", str(port), "--jinja",
            "-c", str(ctx), "-np", str(PARALLEL), "--no-webui"]
+    if lora:
+        cmd += ["--lora", lora]  # a GGUF adapter, applied at scale 1 to every request
     return cmd + (["-ngl", "99"] if on_gpu else ["-ngl", "0", "--device", "none"])
 
 
@@ -597,7 +601,7 @@ class FrontServer:
 
     def _spawn(self) -> None:
         assert self.binary is not None and self.model is not None
-        self.cmd = command(self.binary, self.model, self.port, self.s.ctx, bool(self.on_gpu))
+        self.cmd = command(self.binary, self.model, self.port, self.s.ctx, bool(self.on_gpu), self.s.lora)
         env = {**os.environ, "LLAMA_API_KEY": self.api_key}
         _, pinned = binary_path(self.s)
         if pinned and sys.platform.startswith("linux"):  # the CUDA runtime libraries unpacked beside the binary

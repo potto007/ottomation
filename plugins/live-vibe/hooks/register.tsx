@@ -329,6 +329,7 @@ function frontServerArgv(options: PluginOptions) {
   const argv: string[] = []
   if (options.frontServerBin) argv.push('--front-server-bin', String(options.frontServerBin))
   if (options.frontServerModel) argv.push('--front-server-model', String(options.frontServerModel))
+  if (options.frontServerLora) argv.push('--front-server-lora', String(options.frontServerLora))
   if (options.frontServerLog) argv.push('--front-server-log', String(options.frontServerLog))
   return argv
 }

@@ -101,6 +101,12 @@
       "description": "With frontUrl empty: the file the server's output is appended to. Empty means ~/.cache/duplex_voice/front-server.log (LIVE_VIBE_CACHE or XDG_CACHE_HOME move it).",
       "default": ""
     },
+    "frontServerLora": {
+      "type": "string",
+      "title": "Live vibe: managed server LoRA",
+      "description": "With frontUrl empty: a GGUF LoRA adapter applied to the front model, such as the timing LoRA for the micro-turn loop (training/README.md). Empty means none.",
+      "default": ""
+    },
     "frontModel": {
       "type": "string",
       "title": "Live vibe: front model",
