@@ -20,6 +20,7 @@ const PANE = 'diagrams'
 const TOOL_GET = 'mcp__diagram-pane__diagram_get'
 const TOOL_SET = 'mcp__diagram-pane__diagram_set'
 const HOME = { root: 'map', path: [] }
+const NOTE = 'The map is drawn after a few turns, or now with /diagram'
 
 // Everything the pane shows. Pins are rebuilt from the transcript; the map, the
 // edited pins and the view are also saved in $.store.
@@ -38,8 +39,24 @@ const S = {
   caughtUp: false,   // the one early map draw for a session with work but no map was tried
   maxPins: 5,
   every: 3,          // turns between map checks (everyTurns, or DIAGRAM_PANE_EVERY)
-  note: 'The map is drawn after a few turns, or now with /diagram',
+  note: NOTE,
   busy: false,       // a gate or fork is running
+  sessionId: null,   // the session the state above belongs to
+  gen: 0,            // bumped when a new session starts, so late forks drop their reply
+}
+
+// /clear keeps the process (session.start does not fire) but starts a new
+// session id: drop the old session's map, pins and view
+function startSession(id) {
+  if (S.sessionId !== null && S.sessionId !== id) {
+    Object.assign(S, {
+      pins: [], seen: new Set(), scanned: 0, sinceMap: 0, map: null, mapAt: 0,
+      edits: {}, view: HOME, loaded: false, caughtUp: false, note: NOTE, gen: S.gen + 1,
+    })
+  }
+  const changed = S.sessionId !== id
+  S.sessionId = id
+  return changed
 }
 
 export function register(on, options) {
@@ -70,8 +87,8 @@ export function register(on, options) {
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
     if (e.agentId || e.isAborted) return result
-    S.sinceMap += 1
     const messages = await sync($)
+    S.sinceMap += 1
     if (S.pins.length && !(await $.ui.panes()).some(p => p.id === PANE)) await $.ui.open({ id: PANE, title: 'Diagrams' })
     S.every = Number(await $.env.get('DIAGRAM_PANE_EVERY')) || every
     if (S.sinceMap >= S.every || overdue()) {
@@ -152,10 +169,12 @@ function catchUp($, messages) {
 
 // Read the saved map once, then pin what the transcript has that is new
 async function sync($) {
+  const fresh = startSession(await $.session.id())
   const messages = await $.session.messages()
   S.turn = turnsIn(messages)
   await loadSaved($)
   pinNewDiagrams(messages, S.maxPins)
+  if (fresh) await redraw($)
   return messages
 }
 
@@ -217,6 +236,7 @@ async function refreshMap($, messages, force) {
   if (S.busy) return
   S.busy = true
   S.sinceMap = 0
+  const gen = S.gen
   try {
     // 1. The cheap gate: skipped only when there is no map yet, or on /diagram force
     if (S.map && !force) {
@@ -233,6 +253,7 @@ async function refreshMap($, messages, force) {
         maxTokens: 5,
         timeoutMs: 20000,
       })
+      if (gen !== S.gen) return
       const yes = gate.isAnswered && /^\s*yes/i.test(gate.text)
       if (!yes) {
         S.note = `gate said same shape at turn ${S.turn}, map kept` + (gate.isAnswered ? '' : ` (${gate.reason})`)
@@ -245,6 +266,7 @@ async function refreshMap($, messages, force) {
     S.note = 'fork: drawing the work map...'
     await redraw($)
     const r = await $.model.fork({ prompt: FORK_PROMPT + (base ? basePrompt(base) : '') })
+    if (gen !== S.gen) return // /clear ran meanwhile: this map is the old session's
     if (!r.isAnswered) {
       S.note = r.reason === 'nothing-to-fork' ? 'nothing to map yet: send a prompt first' : 'fork failed: ' + r.reason
       return
@@ -261,7 +283,7 @@ async function refreshMap($, messages, force) {
     S.note = `map drawn at turn ${S.turn}`
     await saveSaved($)
   } catch (err) {
-    S.note = 'map error: ' + err.message
+    if (gen === S.gen) S.note = 'map error: ' + err.message
   } finally {
     S.busy = false
     await redraw($)
@@ -290,7 +312,7 @@ export function parseMap(text) {
 async function loadSaved($) {
   if (S.loaded) return
   S.loaded = true
-  const saved = ((await $.store.get('maps')) || {})[await $.session.id()]
+  const saved = ((await $.store.get('maps')) || {})[S.sessionId]
   if (!saved) return
   if (saved.map) Object.assign(S, { map: saved.map, mapAt: saved.mapAt || 0, note: `map from turn ${saved.map.turn}` })
   if (saved.edits) S.edits = saved.edits
@@ -298,10 +320,11 @@ async function loadSaved($) {
 }
 
 async function saveSaved($) {
+  if (S.sessionId === null) return
   const maps = (await $.store.get('maps')) || {}
   // Edits of pins that fell off the pane are no longer needed
   const edits = Object.fromEntries(Object.entries(S.edits).filter(([code]) => pinOf(code)))
-  maps[await $.session.id()] = { map: S.map, mapAt: S.mapAt, edits, view: S.view, at: await $.clock.now() }
+  maps[S.sessionId] = { map: S.map, mapAt: S.mapAt, edits, view: S.view, at: await $.clock.now() }
   // Keep the 20 newest sessions only
   const keep = Object.entries(maps).sort((a, b) => b[1].at - a[1].at).slice(0, 20)
   await $.store.set('maps', Object.fromEntries(keep))
@@ -422,8 +445,10 @@ async function expand($, view) {
   S.loading.add(key)
   S.note = `fork: drawing the inside of ${short(node.label, 24)}...`
   await redraw($)
+  const gen = S.gen
   try {
     const r = await $.model.fork({ prompt: DETAIL_PROMPT(crumbs(parentView).join(' › '), parent, node) })
+    if (gen !== S.gen) return
     if (!r.isAnswered) {
       S.note = r.reason === 'nothing-to-fork' ? 'nothing to fork yet: send a prompt first' : 'fork failed: ' + r.reason
       return
@@ -442,7 +467,7 @@ async function expand($, view) {
     S.note = `drew the inside of ${short(node.label, 24)}`
     await saveSaved($)
   } catch (err) {
-    S.note = 'detail error: ' + err.message
+    if (gen === S.gen) S.note = 'detail error: ' + err.message
   } finally {
     S.loading.delete(key)
     await redraw($)
@@ -618,8 +643,10 @@ async function editByFork($, text) {
   }
   S.note = `fork: changing it: "${short(text, 30)}"...`
   await redraw($)
+  const gen = S.gen
   try {
     const r = await $.model.fork({ prompt: EDIT_PROMPT(crumbs(view).join(' › '), source, text) })
+    if (gen !== S.gen) return
     if (!r.isAnswered) {
       S.note = r.reason === 'nothing-to-fork' ? 'nothing to fork yet: send a prompt first' : 'fork failed: ' + r.reason
       return
@@ -630,7 +657,7 @@ async function editByFork($, text) {
     S.note = `changed: ${short(text, 40)}`
     await saveSaved($)
   } catch (err) {
-    S.note = 'change failed: ' + err.message
+    if (gen === S.gen) S.note = 'change failed: ' + err.message
   } finally {
     await redraw($)
   }
