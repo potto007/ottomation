@@ -38,16 +38,16 @@ What a window is labelled:
 ## 2. Train (GPU)
 
 ```sh
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True ~/src/rlm-trainer/.venv/bin/python \
-    plugins/live-vibe/training/train_lora.py --data /tmp/lora-data/train.jsonl --eval /tmp/lora-data/heldout.jsonl \
-    --out /tmp/lora-data/adapter --batch 1 --accum 16
+~/src/rlm-trainer/.venv/bin/python plugins/live-vibe/training/train_lora.py \
+    --data /tmp/lora-data/train.jsonl --eval /tmp/lora-data/heldout.jsonl --out /tmp/lora-data/adapter
 ```
 
 TRL `SFTTrainer` with PEFT: bf16 base (`Qwen/Qwen3-4B-Instruct-2507`, 8 GB download), LoRA r=16 on every attention and
 MLP projection, loss on the assistant JSON only, one epoch, lr 2e-4 cosine, eval loss on 400 held-out rows once at the
-end. Run it through the work band with a `DONE` / `FAILED` sentinel; `--limit 160` is a smoke run. On the 32 GB card
-batch 1 with 16 accumulation steps holds about 30 GB reserved (batch 4 spilled to system RAM, and so did an eval pass
-in the middle of the epoch); watch power and step time, a drop from about 400 W and a rising s/it is the spill.
+end. Run it through the work band with a `DONE` / `FAILED` sentinel; `--limit 160` is a smoke run. The defaults are
+batch 1 with 16 accumulation steps and `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`: about 12 GiB reserved on
+the 32 GB card (`--batch 4` reserved 48 GiB and spilled to system RAM, and so did an eval pass in the middle of the
+epoch); watch power and step time, a drop from about 400 W and a rising s/it is the spill.
 
 ## 3. Convert and score
 
@@ -66,8 +66,9 @@ bin/sidecar/eval/relay_eval.sh http://127.0.0.1:8092 lora 3 worktree
 ```
 
 The scorer drives the loop's own stepper (the same two requests the sidecar makes) and reports, by window kind, the
-decision accuracy, whether a delegation was present when expected and absent when not, and whether the say makes a
-claim about work, echoes the user, or runs long. The relay eval (`bin/sidecar/eval/`) scores the front's full JSON
+decision accuracy and, over the windows where both the label and the model speak (`spoke`), whether a delegation was
+present when expected and absent when not, and whether the say makes a claim about work, echoes the user (a hand-off
+is exempt, as in the loop), or runs long. The relay eval (`bin/sidecar/eval/`) scores the front's full JSON
 turns, which the same server answers. Accept when every kind's decision accuracy is above the base, the speak
 windows' claim and echo rates are near zero, and the relay score is no worse than the base.
 
@@ -93,7 +94,10 @@ Held-out windows, all 2529, decision accuracy by kind (Q4_K_M front, b11146):
 | all | 2529 | 64% | 96% |
 
 On the speak windows: delegation right 70% to 75%, delegation close to the label 22% to 52%, claims 4% to 0%, echoes
-13% to 11%, long says 7% to 0%.
+13% to 11%, long says 7% to 0%. These are from the scorer as it then was, over every labelled speak window, so a
+window the LoRA listened on (most of the backchannel ones) counted as a missing delegation, and a hand-off that
+named the task in the user's words counted as an echo; the scorer now divides by the windows where both spoke and
+exempts hand-offs, so the next run's numbers are higher on the same model.
 
 The backchannel row is not a regression. Its label is "Mm-hm." on about one dictation pause in four, drawn at random,
 so no model can tell those windows from the listen ones. The base "won" them by speaking task lines into the middle of
