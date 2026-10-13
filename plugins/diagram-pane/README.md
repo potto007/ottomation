@@ -28,7 +28,7 @@ claude plugin install diagram-pane@ottomation
 Or inside Claude Code: `/plugin marketplace add potto007/ottomation`, then `/plugin install diagram-pane@ottomation`.
 
 This copy is vendored from [potto007/claude-code-mods](https://github.com/potto007/claude-code-mods) at commit
-fe2cb40, a fork of Ray Amjad's [claude-code-mods](https://github.com/ray-amjad/claude-code-mods). The navigation
+b8c071e, a fork of Ray Amjad's [claude-code-mods](https://github.com/ray-amjad/claude-code-mods). The navigation
 and editing features in 0.2.0 come from that fork. MIT licensed; see [LICENSE](LICENSE).
 
 The pane opens on its own in a terminal 144 columns or wider. Narrower than that, type `/diagram` once and it opens at any width. With fullscreen rendering it docks beside the transcript; in the classic renderer it sits above the prompt.
@@ -71,6 +71,7 @@ The pane opens on its own in a terminal 144 columns or wider. Narrower than that
 - ASCII diagrams are only picked up from plain code blocks (no language, or `text`), and shown as written.
 - The map check runs after a turn ends, not while Claude is working. Before the first reply there is nothing to fork, and `/diagram` says so.
 - The map, edits and view are saved per install: moving the plugin to another marketplace or reinstalling it starts with no saved maps. A session that already has `everyTurns` turns of work gets a fresh map at its next turn or `diagram_get`, without waiting.
+- `/clear` starts the pane fresh: the old session's map, pins and view are dropped (its saved map stays under its own id for `--resume`), and a map or detail fork still running from before `/clear` is discarded.
 - The map is the model's own summary of the work, so it can include a step such as "run tests" beside the files.
 
 ## Develop

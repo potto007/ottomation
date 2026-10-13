@@ -20,7 +20,7 @@
       "name": "diagram-pane",
       "source": "./plugins/diagram-pane",
       "description": "A side pane that pins every diagram Claude draws, keeps a live map of the work, and lets you go into boxes and change them. Vendored from Ray Amjad's claude-code-mods (MIT) with navigation and editing added.",
-      "version": "0.2.1",
+      "version": "0.2.2",
       "author": {
         "name": "Ray Amjad",
         "url": "https://github.com/ray-amjad"
