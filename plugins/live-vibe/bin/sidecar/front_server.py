@@ -440,7 +440,8 @@ def command(binary: Path, model: Path, port: int, ctx: int, on_gpu: bool, lora: 
     cmd = [str(binary), "-m", str(model), "--host", "127.0.0.1", "--port", str(port), "--jinja",
            "-c", str(ctx), "-np", str(PARALLEL), "--no-webui"]
     if lora:
-        cmd += ["--lora", lora]  # a GGUF adapter, applied at scale 1 to every request
+        # a GGUF adapter, loaded at scale 0: the micro-turn loop applies it to its own requests (MicroStepper.lora)
+        cmd += ["--lora", lora, "--lora-init-without-apply"]
     return cmd + (["-ngl", "99"] if on_gpu else ["-ngl", "0", "--device", "none"])
 
 

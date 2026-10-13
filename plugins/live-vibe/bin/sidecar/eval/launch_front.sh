@@ -13,7 +13,7 @@ LORA=${2:-}
 BIN=${LIVE_VIBE_LLAMA_SERVER:-$HOME/.cache/duplex_voice/llama.cpp/b11146-linux-x64-cuda/llama-server}
 OUT=${LIVE_VIBE_EVAL_OUT:-/tmp/live-vibe-relay-eval}
 mkdir -p "$OUT"
-"$BIN" -m "$GGUF" --host 127.0.0.1 --port 8092 --jinja -c 16384 -np 1 -ngl 99 ${LORA:+--lora "$LORA"} > >(tee -a /tmp/llama-server.log) 2>&1 &
+"$BIN" -m "$GGUF" --host 127.0.0.1 --port 8092 --jinja -c 16384 -np 1 -ngl 99 ${LORA:+--lora "$LORA" --lora-init-without-apply} > >(tee -a /tmp/llama-server.log) 2>&1 &
 echo $! > "$OUT/launch_front.pid"
 echo "llama-server pid $! serving $(basename "$GGUF")${LORA:+ with $(basename "$LORA")} on 127.0.0.1:8092 (pid in $OUT/launch_front.pid)"
 wait
