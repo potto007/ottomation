@@ -155,6 +155,9 @@ def microturn_units(check: Any) -> None:
           "microturn: say made of the user's words is an echo")
     check(not is_echo("Sure, on it.", "can you add a unit test for the parser"), "microturn: a reply is not an echo")
     check(not is_echo("", "anything"), "microturn: empty say is not an echo")
+    for say, heard in (("Hello.", "hello"), ("Hi.", "hi there"), ("Great.", "okay great"), ("Good morning.", "good morning")):
+        check(not is_echo(say, heard), f"microturn: a greeting is a reply, not an echo ({say!r})")
+    check(is_echo("Okay.", "okay", min_words=1), "microturn: the repeat check still catches a one-word say")
 
     from . import timing_lora
 
@@ -301,6 +304,15 @@ async def loop_units(check: Any) -> None:
     check(s is not None and s.action == LISTEN and not w.spoken, "microloop: an empty say is not spoken")
     s = await loop.tick()
     check(s is not None and s.action == SPEAK and w.spoken == ["Okay, running it."], "microloop: a reply is spoken")
+
+    # 3b. A greeting made of the user's own words is a reply, not an echo: "Hello." to "hello" is spoken.
+    st = ScriptedStepper([(SPEAK, "Hello.", "")])
+    w = World()
+    loop = MicroLoop(st, [], w.deps(), step_ms=300)
+    loop.on_piece("hello", 0.9)
+    loop.on_utterance_end("hello")
+    s = await loop.tick()
+    check(s is not None and s.action == SPEAK and w.spoken == ["Hello."], "microloop: a greeting back is spoken")
 
     # 4. Barge-in by the model: the user speaks over the voice and the model answers listen: the voice is cut.
     w.playing = True

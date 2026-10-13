@@ -213,13 +213,15 @@ class MicroStepper:
 EOT = 0.6  # the recognizer's end-of-turn probability at or above which the user is taken to have finished
 IDLE_SKIP = 3  # silent windows after the last words or speech that still ask the model; then the loop idles
 ECHO_RATIO = 0.8  # a say whose words are this much inside the user's utterance is an echo, not a reply
+ECHO_MIN_WORDS = 3  # shorter says ("Hello.", "Good morning.") are replies even when every word was the user's
 
 
-def is_echo(say: str, utterance: str) -> bool:
+def is_echo(say: str, utterance: str, min_words: int = ECHO_MIN_WORDS) -> bool:
     """The front repeating the user's words back ("add a unit test for the parser." to "add a unit test for the
-    parser"): most of say's words are in the utterance."""
+    parser"): most of say's words are in the utterance. A say under `min_words` is never one: "Hello." to "hello" is
+    the reply, not an echo."""
     s = [w for w in _words(say)]
-    if not s:
+    if len(s) < min_words:
         return False
     u = set(_words(utterance))
     return sum(1 for w in s if w in u) / len(s) >= ECHO_RATIO
@@ -411,7 +413,7 @@ class MicroLoop:
         reference = self.utterance_text or self.last_utterance
         if say and reference and not handing and is_echo(say, reference):  # a hand-off names the task
             return LISTEN, "echo"
-        if say and self.run and is_echo(say, " ".join(self.run)):  # the run said this already: it is over
+        if say and self.run and is_echo(say, " ".join(self.run), min_words=1):  # the run said this already: it is over
             return LISTEN, "repeat"
         if not say and not handing:
             return LISTEN, "empty"
