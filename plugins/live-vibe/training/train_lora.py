@@ -2,11 +2,12 @@
 
 Runs in a venv that has trl, peft, transformers and torch (rlm-trainer's: `~/src/rlm-trainer/.venv/bin/python`):
 
-  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True <venv>/bin/python plugins/live-vibe/training/train_lora.py \\
-      --data <dir>/train.jsonl --eval <dir>/heldout.jsonl --out <dir>/adapter --batch 1 --accum 16
+  <venv>/bin/python plugins/live-vibe/training/train_lora.py \\
+      --data <dir>/train.jsonl --eval <dir>/heldout.jsonl --out <dir>/adapter
 
-Batch 1 with 16 accumulation steps holds about 30 GB reserved on the 32 GB card (batch 4 spills); expandable segments
-keep the pool from fragmenting upward over the epoch.
+The defaults are batch 1 with 16 accumulation steps, about 12 GiB reserved on the 32 GB card over the epoch (batch 4
+reserved 48 GiB and spilled to system RAM), and PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True unless the
+environment sets it, so the pool does not fragment upward over the epoch.
 
 Prompt-completion rows: the loss is on the assistant JSON only (TRL's completion_only_loss), never on the long
 system prompt or the history. One epoch, LoRA r=16 on every attention and MLP projection: about 30M trainable
@@ -17,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -32,12 +34,13 @@ def main() -> int:
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--rank", type=int, default=16)
     ap.add_argument("--max-length", type=int, default=2048)
-    ap.add_argument("--batch", type=int, default=4)
-    ap.add_argument("--accum", type=int, default=4)
+    ap.add_argument("--batch", type=int, default=1, help="4 spilled to system RAM on the 32 GB card")
+    ap.add_argument("--accum", type=int, default=16)
     ap.add_argument("--limit", type=int, default=0, help="rows to use (0 = all); a smoke run uses a few hundred")
     ap.add_argument("--eval-rows", type=int, default=400, help="held-out rows for the eval loss, once at the end")
     args = ap.parse_args()
 
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # before torch initialises CUDA
     import torch
     from datasets import load_dataset
     from peft import LoraConfig
