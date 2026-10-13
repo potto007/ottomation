@@ -343,10 +343,20 @@ class MicroLoop:
         return (not self.new_words and self.final is None and (self.user_done or not self.utterance)
                 and not self.deps.speaking() and not self.run and self.silent >= IDLE_SKIP)
 
+    def context(self) -> list[dict[str, Any]]:
+        """The history the model sees: the committed messages, plus the speaking run in progress as a provisional
+        assistant message, so a step continues what is being said instead of starting the answer again (the first
+        live session looped on one sentence 192 times for want of this)."""
+        if not self.run:
+            return self.history
+        return [*self.history, {"role": "assistant", "content": json_turn(SPEAK, self.run_delegate, " ".join(self.run))}]
+
     def floor(self, step: MicroStep) -> tuple[str, str]:
         """The action after the floor rules, and why."""
         if step.action != SPEAK:
             return LISTEN, "model"
+        if step.say and self.run and is_echo(step.say, " ".join(self.run)):  # the run said this already: it is over
+            return LISTEN, "repeat"
         if self.user_talking():
             if step.say and self.deps.is_backchannel(step.say):
                 return SPEAK, "backchannel"
@@ -369,19 +379,20 @@ class MicroLoop:
             return None
         window = self.window()
         asked_final = self.final is not None and not (self.utterance and not self.user_done)
+        history = self.context()
         self.new_words = False
         self.in_flight = True
         t = time.monotonic()
         try:
             if self.user_talking():  # the decision alone: a speak here could only be a backchannel, and the model's
-                step = await self.stepper.decide(self.history, window)  # say is not known without the full turn
+                step = await self.stepper.decide(history, window)  # say is not known without the full turn
                 if step.action == SPEAK:  # the model wants in while the user talks: hold it (no backchannel yet)
                     step.action = LISTEN
                     reason = "floor"
                 else:
                     reason = "model"
             else:
-                step = await self.stepper.step(self.history, window)
+                step = await self.stepper.step(history, window)
                 step.action, reason = self.floor(step)
         finally:
             self.in_flight = False
@@ -417,7 +428,7 @@ class MicroLoop:
             self.resolve_note(False)
         if self.deps.speaking() and self.utterance and not self.user_done:  # the user talks over the voice
             await self.deps.cut()
-        elif self.run and (not self.deps.speaking() or reason == "model"):  # the run is over, or the model ends it
+        elif self.run and (not self.deps.speaking() or reason in ("model", "repeat")):  # the run is over, or ends here
             await self.deps.end_run()
 
 

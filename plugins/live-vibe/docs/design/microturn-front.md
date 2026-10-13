@@ -119,6 +119,11 @@ it good.
      called it, every reading was `n/a`, and the rule's fallback for no reading is listen.)
    - A hand-off is never silent: the prompt asks for a few words that name the task, the echo rule does not apply to
      a delegating step's `say`, and a delegation with no `say` speaks `HANDOFF_SAY` ("On it.").
+   - While a run plays, the model's context ends with the run so far as a provisional assistant message, so a step
+     continues the answer instead of starting it again; a `say` that repeats the run (the echo test against the
+     run's text) is not spoken and ends the run. (Second live session, 2026-10-12: with the run invisible until it
+     ended, the model restarted its one-sentence answer on every `[no voice] [speaking]` window, 192 times, and
+     every copy was queued on the voice.)
    - Floor rules, in the sidecar: while the user talks (p below 0.6, utterance open) only the decision request runs
      and a `speak` is held (backchannels from the model come with the LoRA); a `say` that echoes the user's words is
      dropped; a delegation is taken once per utterance, after it ends, with the user's words as `said`.

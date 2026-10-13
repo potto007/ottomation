@@ -150,20 +150,22 @@ class ScriptedStepper:
     def __init__(self, script: list[tuple[str, str, str]]):
         self.script = list(script)
         self.windows: list[str] = []
+        self.contexts: list[list] = []  # the history each call saw
 
-    def _next(self, window: str) -> MicroStep:
+    def _next(self, window: str, history: list | None = None) -> MicroStep:
         self.windows.append(window)
+        self.contexts.append(list(history or []))
         action, say, delegate = self.script.pop(0) if self.script else (LISTEN, "", "")
         return MicroStep(window=window, action=action, p_listen=0.9 if action == LISTEN else 0.1, say=say,
                          delegate=delegate)
 
     async def decide(self, history: list, window: str) -> MicroStep:
-        s = self._next(window)
+        s = self._next(window, history)
         s.say, s.delegate = "", ""  # the decision alone knows no fields
         return s
 
     async def step(self, history: list, window: str) -> MicroStep:
-        return self._next(window)
+        return self._next(window, history)
 
 
 class World:
@@ -231,13 +233,14 @@ async def loop_units(check: Any) -> None:
           and w.delegated == [("add a unit test for the parser", "Can you add a unit test for the parser?")] and not w.notes,
           f"microloop: after the utterance the front speaks and delegates with the user's words; no note ({w.delegated})")
     s = await loop.tick()
-    check(len(w.delegated) == 1 and w.spoken == ["Sure, on it.", "Sure, on it."], "microloop: one delegation per utterance; the run goes on")
+    check(len(w.delegated) == 1 and w.spoken == ["Sure, on it."] and s is not None and s.action == LISTEN and w.ended == 1,
+          f"microloop: one delegation per utterance; a repeated say ends the run instead of playing again ({w.spoken})")
     w.playing = False  # the voice finished the queued words
+    loop.run_ended(["Sure, on it."], cut=False)
     s = await loop.tick()
-    check(s is not None and s.action == LISTEN and w.ended == 1, "microloop: listen after the voice finished ends the run")
-    loop.run_ended(["Sure, on it.", "Sure, on it."], cut=False)
+    check(s is not None and s.action == LISTEN and w.ended == 1 and not loop.run, "microloop: listen after the run is over is quiet")
     check(hist[-1]["role"] == "assistant" and '"action": "speak"' in hist[-1]["content"]
-          and '"delegate": "add a unit test for the parser"' in hist[-1]["content"] and w.shown == [("Sure, on it. Sure, on it.", "reply")],
+          and '"delegate": "add a unit test for the parser"' in hist[-1]["content"] and w.shown == [("Sure, on it.", "reply")],
           f"microloop: the run is one assistant message with its delegation {hist[-1]['content'][:80]!r}")
     check(loop.pending_note is None and loop.utterance == [] and not w.notes, "microloop: a handed-off utterance leaves no note")
     # a confirmation the front only listens to reaches Claude as a note on the next step
@@ -310,6 +313,32 @@ async def loop_units(check: Any) -> None:
           f"microloop: a hand-off's say is not dropped as an echo ({w.spoken[-1]!r})")
     check(st.windows[-1].endswith("[p=0.8]") and not st.windows[-1].startswith(NO_VOICE),
           f"microloop: an ended utterance is asked with its own p when above EOT {st.windows[-1]!r}")
+
+    # 9. A run in progress is in the model's context, and a say that repeats the run ends it instead of playing again.
+    st = ScriptedStepper([(SPEAK, "The branch exists only locally.", ""),
+                          (SPEAK, "The `branch` exists only locally.", ""),
+                          (SPEAK, "It has no remote.", "")])
+    w = World()
+    hist = []
+    loop = MicroLoop(st, hist, w.deps(), step_ms=200)
+    loop.on_piece("tell me about the stale branch", 0.9)
+    loop.on_utterance_end("tell me about the stale branch")
+    await loop.tick()
+    check(w.spoken == ["The branch exists only locally."] and len(st.contexts[-1]) == 0,
+          f"microloop: the first words of a run are spoken on the committed history alone ({w.spoken})")
+    s = await loop.tick()
+    check(st.contexts[-1][-1]["role"] == "assistant" and "exists only locally" in st.contexts[-1][-1]["content"]
+          and len(st.contexts[-1]) == len(hist) + 1 and hist[-1]["role"] == "user",
+          "microloop: a step during a run sees the run so far as a provisional assistant message")
+    check(s is not None and s.action == LISTEN and len(w.spoken) == 1 and w.ended == 1,
+          f"microloop: a say that repeats the run is not spoken and ends the run ({s and s.action}, ended={w.ended})")
+    w.playing = False
+    loop.run_ended(w.spoken, cut=False)
+    loop.on_piece("and the remote", 0.9)
+    loop.on_utterance_end("and the remote?")
+    await loop.tick()
+    check(w.spoken[-1] == "It has no remote." and st.contexts[-1] == hist[:-1] and st.contexts[-1][-1]["role"] == "assistant",
+          f"microloop: after the run is committed the context is the history again ({w.spoken[-1]!r})")
 
     # 8. The user moves on before the ended utterance got its window: it still joins the history, in order.
     st = ScriptedStepper([])
