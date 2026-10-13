@@ -203,6 +203,11 @@ def settings_units(check: Callable[[Any, str], bool], root: Path) -> None:
     except fs.FrontServerError as e:
         msg = str(e)
     check("is not a file" in msg, f"settings: a frontServerLora path that is not there fails clearly ({msg!r})")
+    with captured() as out:
+        got = fs.FrontServer(fs.Settings(lora=str(root / "none.gguf")))._get_lora()
+    said = " ".join(str(m.get("text", "")) for m in out)
+    check(got is None and "no LoRA adapter, running the base model" in said,
+          f"settings: an adapter that cannot be had warns and the front starts without it ({said[:120]!r})")
     with_lora = fs.command(Path("/b/llama-server"), Path("/m.gguf"), 4000, fs.CTX, True, "/a/l.gguf")
     check(with_lora[with_lora.index("--lora") + 1] == "/a/l.gguf" and "--lora-init-without-apply" not in with_lora,
           "command: --lora names the adapter (scoped to the loop after start, not by a flag)")
