@@ -34,16 +34,19 @@ Option 3. ottomation is the only home of live-vibe; the private copy is removed 
 
 A plugin installed from a marketplace that was added as a folder, with a relative `source`, is read from that folder
 itself, not from an installed copy: an edit followed by `/reload-plugins` runs in the session, with no version bump
-and no reinstall. So a branch is tried like this:
+and no reinstall. A marketplace is named by its `marketplace.json`, so adding a worktree of this repo re-points the
+one `ottomation` marketplace from GitHub to the folder (the command reports the switch), and the installed
+`live-vibe@ottomation` updates from it. So a branch is tried like this:
 
 ```sh
 git worktree add .claude/worktrees/<topic> -b <branch>
-claude plugin marketplace add /path/to/.claude/worktrees/<topic>     # once per worktree; name it ottomation-dev
-claude plugin install live-vibe@ottomation-dev
+claude plugin marketplace add /path/to/.claude/worktrees/<topic>     # ottomation now points at the worktree
+claude plugin update live-vibe@ottomation                            # read from the folder; /reload-plugins after edits
 ```
 
-with `live-vibe@ottomation` set to `false` in `enabledPlugins` for the duration, so the two do not both register
-`/live`. The public install is untouched and comes back by flipping the flag.
+and the public source comes back with `claude plugin marketplace add potto007/ottomation` followed by another
+`claude plugin update`. One plugin identity, so `/live` is registered once; `claude plugin list` shows `Read from:`
+the worktree while the switch is on.
 
 `--plugin-dir` (option 2) is kept for a one-off session, but it does not disable the installed plugin and so loads
 both; the folder marketplace is the documented route.

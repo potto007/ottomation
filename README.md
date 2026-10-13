@@ -35,14 +35,19 @@ merged, without a release and without touching the installed plugin:
 
 ```sh
 git worktree add .claude/worktrees/<topic> -b <branch>
-claude plugin marketplace add /abs/path/to/.claude/worktrees/<topic>   # once per worktree; call it ottomation-dev
-claude plugin install live-vibe@ottomation-dev
+claude plugin marketplace add /abs/path/to/.claude/worktrees/<topic>   # the ottomation marketplace now points here
+claude plugin update live-vibe@ottomation
 ```
 
-Claude Code reads a plugin installed from a folder marketplace straight from that folder: edit, then `/reload-plugins`.
-Set `"live-vibe@ottomation": false` in `enabledPlugins` (`~/.claude/settings.json`) while the dev install is on, so
-the two do not both register `/live`; flip it back when done, and `claude plugin marketplace remove ottomation-dev`
-when the worktree goes.
+A marketplace is named by its `marketplace.json`, so adding the worktree re-points `ottomation` from GitHub to that
+folder (the command says so), and the installed `live-vibe@ottomation` updates from it. A plugin installed from a
+folder marketplace is read straight from the folder: edit, then `/reload-plugins`. `claude plugin list` shows
+`Read from:` the worktree while this is on. Point it back when done:
+
+```sh
+claude plugin marketplace add potto007/ottomation
+claude plugin update live-vibe@ottomation
+```
 
 Checks, from `plugins/live-vibe/`:
 
