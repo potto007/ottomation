@@ -8,7 +8,6 @@ import json
 import logging
 import logging.handlers
 import os
-import platform
 import signal
 import sys
 import threading
@@ -24,7 +23,13 @@ QUIT_GRACE_S = 5.0  # after a quit request, the process ends within this even if
 _out: IO[str] | None = None
 _out_lock = threading.RLock()  # RLock: a signal handler on the main thread may emit while it holds the lock
 _capture: list[dict[str, Any]] | None = None  # the self-test reads emits here
-_on_broken: Callable[[str], None] = lambda _: None
+
+
+def _ignore_broken(_: str) -> None:
+    return None
+
+
+_on_broken: Callable[[str], None] = _ignore_broken
 
 
 def encode(obj: dict[str, Any]) -> str:
