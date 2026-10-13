@@ -35,13 +35,16 @@ const S = {
   view: HOME,        // what the pane shows: { root: 'map' | 'pin', code?, path: [node ids gone into] }
   loading: new Set(),// views whose detail a fork is drawing
   loaded: false,     // the saved map has been read
+  caughtUp: false,   // the one early map draw for a session with work but no map was tried
   maxPins: 5,
+  every: 3,          // turns between map checks (everyTurns, or DIAGRAM_PANE_EVERY)
   note: 'The map is drawn after a few turns, or now with /diagram',
   busy: false,       // a gate or fork is running
 }
 
 export function register(on, options) {
   const every = Number(options?.everyTurns) || 3
+  S.every = every
   S.maxPins = Number(options?.maxPins) || 5
 
   on('session.start', async ($, e, next) => {
@@ -70,9 +73,9 @@ export function register(on, options) {
     S.sinceMap += 1
     const messages = await sync($)
     if (S.pins.length && !(await $.ui.panes()).some(p => p.id === PANE)) await $.ui.open({ id: PANE, title: 'Diagrams' })
-    const n = Number(await $.env.get('DIAGRAM_PANE_EVERY')) || every
-    if (S.sinceMap >= n) {
-      const work = refreshMap($, messages, false)
+    S.every = Number(await $.env.get('DIAGRAM_PANE_EVERY')) || every
+    if (S.sinceMap >= S.every || overdue()) {
+      const work = overdue() ? catchUp($, messages) : refreshMap($, messages, false)
       // Headless runs exit when the hook returns, so tests can ask us to wait
       if (await $.env.get('DIAGRAM_PANE_SYNC')) await work
     }
@@ -97,7 +100,10 @@ export function register(on, options) {
 
   // Claude's way into the pane
   on('tool.call', { tool: TOOL_GET }, async $ => {
-    await sync($)
+    const messages = await sync($)
+    // A session with work but no saved map (a reinstall, a new marketplace,
+    // --resume into a session never mapped): draw it now, so Claude gets a map
+    if (overdue()) await catchUp($, messages)
     return { result: describe() }
   }).catch(() => ({ deny: 'diagram_get failed; the pane is unchanged.' }))
 
@@ -131,6 +137,17 @@ export function register(on, options) {
       return h(Text, { color: it.color, bold: it.bold, dimColor: it.dim, wrap: 'truncate-end' }, it.text || ' ')
     }))
   })
+}
+
+// No map, yet the transcript already holds a map's worth of turns. The map is
+// saved per install, so this is a session mapped by another install (or never):
+// waiting `every` more turns would leave the pane empty for no reason.
+// One catch-up try per load; after that the usual cadence takes over.
+const overdue = () => !S.map && !S.busy && !S.caughtUp && S.turn >= S.every
+
+function catchUp($, messages) {
+  S.caughtUp = true
+  return refreshMap($, messages, false)
 }
 
 // Read the saved map once, then pin what the transcript has that is new
@@ -491,7 +508,13 @@ export function describe() {
   const out = [`The pane shows: ${crumbs().join(' › ')}` +
     (S.view.path.length ? `  (path ${JSON.stringify(S.view.path)} in ${S.view.root === 'map' ? '"map"' : `"pin:${S.pins.indexOf(pinOf(S.view.code)) + 1}"`})` : '')]
   if (S.map) out.push(`\n## map: "${S.map.title}" (turn ${S.map.turn}${S.map.edited ? ', edited' : ''})\n\`\`\`mermaid\n${toMermaid(S.map.graph)}\n\`\`\``)
-  else out.push('\n## map: not drawn yet (diagram_set with target "map" and mermaid draws one)')
+  else {
+    const left = Math.max(1, S.every - S.sinceMap)
+    out.push(`\n## map: not drawn yet. Last status: ${S.note}.\n` +
+      'This install has no saved map for this session (maps are kept per install, so a reinstall or a new marketplace starts empty). ' +
+      `The next check runs after ${left} more turn${left > 1 ? 's' : ''}. The user can run /diagram to draw it now, ` +
+      'or diagram_set with target "map" and mermaid draws one by hand.')
+  }
   S.pins.forEach((p, i) => {
     out.push(`\n## pin:${i + 1}: "${p.title || 'untitled'}" (turn ${p.turn}${p.edited ? ', edited' : ''})`)
     if (p.graph) out.push(`\`\`\`mermaid\n${toMermaid(p.graph)}\n\`\`\``)
