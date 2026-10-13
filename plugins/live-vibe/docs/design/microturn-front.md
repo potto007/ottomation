@@ -142,6 +142,11 @@ it good.
      turn is running, and a delegation is attempted once per utterance whatever the delegator answers.
    - A micro-path utterance without closing punctuation is held for its rest like an unfinished one (6 of 45 Kyutai
      turn ends across the live sessions were unpunctuated; "What were the other" / "PRs?" went to Claude as two).
+   - A withheld answer is owed by Claude: whenever the trim rule holds the front's answer ("Let me check."), the note
+     goes to Claude as an `ask` whether or not the sentence had a question mark (sixth session: "tell me about five"
+     and "what about a" got "Let me check." and a quiet note, and nothing followed until the user asked again). Small
+     talk that is short and claim-free ("Hello.") is spoken as is; the hold applies to questions and to answers that
+     make a claim.
    - While a run plays, the model's context ends with the run so far as a provisional assistant message, so a step
      continues the answer instead of starting it again; a `say` that repeats the run (the echo test against the
      run's text) is not spoken and ends the run. (Second live session, 2026-10-12: with the run invisible until it

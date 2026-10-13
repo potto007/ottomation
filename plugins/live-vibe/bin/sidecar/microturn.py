@@ -272,6 +272,8 @@ class MicroLoop:
             if self.user_done:  # a new utterance begins: the last one's note, if still pending, goes now
                 self.flush_note()
                 self.commit_final()
+                self.replied = False  # the one-reply rule is per utterance (sixth session: the first step on a new
+                # question was dropped as the last one's second reply)
             self.utterance.append(piece.strip())
             self.new_words = True
             self.user_done = False
