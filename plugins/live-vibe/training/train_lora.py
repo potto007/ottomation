@@ -19,6 +19,7 @@ import argparse
 import json
 import sys
 import time
+from pathlib import Path
 
 
 def main() -> int:
@@ -83,6 +84,9 @@ def main() -> int:
         print(f"eval: {json.dumps(trainer.evaluate())}", flush=True)
     trainer.model.save_pretrained(args.out)
     tok.save_pretrained(args.out)
+    meta = Path(args.data).with_name("meta.json")  # make_windows.py's prompt fingerprint goes with the adapter
+    if meta.is_file():
+        (Path(args.out) / "training.json").write_text(meta.read_text())
     peak = torch.cuda.max_memory_reserved() / 2**30 if torch.cuda.is_available() else 0.0
     print(f"saved adapter to {args.out}; peak reserved VRAM {peak:.1f} GiB; {time.monotonic() - t0:.0f} s", flush=True)
     return 0

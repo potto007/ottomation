@@ -36,6 +36,7 @@ from sidecar.front import (  # noqa: E402
     notes_message,
 )
 from sidecar.microturn import LISTEN, SPEAK, MICRO_PROTOCOL, json_turn, window_message  # noqa: E402
+from sidecar.timing_lora import fingerprint  # noqa: E402
 
 WORKSPACES = ["/home/dev/src/local-ai", "/Users/ana/code/shop-api", "/home/potto/src/knowledge-base", "/srv/work/billing",
               "/home/dev/projects/relay", "C:\\Users\\sam\\dev\\inventory"]
@@ -450,7 +451,9 @@ def main() -> int:
     (out / "train.jsonl").write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in train_b))
     (out / "heldout.jsonl").write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in held))
     (out / "heldout_windows.jsonl").write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in held_windows))
-    speak = sum('"action": "speak"' in r["completion"][0]["content"] for r in train_b)
+    # the prompt this data teaches; train_lora.py copies it beside the adapter, and it becomes timing_lora.TRAINED
+    (out / "meta.json").write_text(json.dumps({"fingerprint": fingerprint(), "calls": args.calls}, indent=2) + "\n")
+    speak =sum('"action": "speak"' in r["completion"][0]["content"] for r in train_b)
     print(f"calls {args.calls}: windows {len(train) + len(held)} ({kinds}); train {len(train_b)} rows "
           f"({speak} speak, {len(train_b) - speak} listen); held-out {len(held)} rows, {len(held_windows)} windows")
     return 0
