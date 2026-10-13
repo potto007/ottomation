@@ -1,0 +1,12 @@
+{
+  "name": "diagram-pane",
+  "version": "0.2.0",
+  "description": "A side pane that pins every diagram Claude draws, keeps a live map of the work, and lets you go into boxes and change them",
+  "author": { "name": "Ray Amjad", "url": "https://github.com/ray-amjad" },
+  "repository": "https://github.com/ray-amjad/claude-code-mods/tree/main/plugins/diagram-pane",
+  "license": "MIT",
+  "userConfig": {
+    "everyTurns": { "type": "number", "title": "Map every N turns", "description": "How many turns between work-map checks (the Haiku gate runs, then a fork only if the work changed shape)", "default": 3 },
+    "maxPins": { "type": "number", "title": "Pinned diagrams kept", "description": "How many pinned diagrams the pane keeps, newest first", "default": 5 }
+  }
+}
