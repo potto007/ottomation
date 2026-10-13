@@ -57,18 +57,57 @@ in the middle of the epoch); watch power and step time, a drop from about 400 W 
 
 bin/sidecar/eval/launch_front.sh <Qwen3-4B Q4_K_M gguf>                              # the base, then
 uv run --python 3.12 --with numpy --with httpx python plugins/live-vibe/training/score_heldout.py \
-    --url http://127.0.0.1:8092 --windows /tmp/lora-data/heldout_windows.jsonl --limit 400 --label base
+    --url http://127.0.0.1:8092 --windows /tmp/lora-data/heldout_windows.jsonl --label base
+bin/sidecar/eval/relay_eval.sh http://127.0.0.1:8092 base 3 worktree
 kill "$(cat /tmp/live-vibe-relay-eval/launch_front.pid)"
 bin/sidecar/eval/launch_front.sh <gguf> /tmp/lora-data/timing-lora.gguf                # with the adapter
-uv run ... score_heldout.py --url http://127.0.0.1:8092 --windows ... --limit 400 --label lora
+uv run ... score_heldout.py --url http://127.0.0.1:8092 --windows ... --label lora
+bin/sidecar/eval/relay_eval.sh http://127.0.0.1:8092 lora 3 worktree
 ```
 
 The scorer drives the loop's own stepper (the same two requests the sidecar makes) and reports, by window kind, the
 decision accuracy, whether a delegation was present when expected and absent when not, and whether the say makes a
-claim about work, echoes the user, or runs long. Accept when every kind's decision accuracy is above the base and the
-speak windows' claim and echo rates are near zero.
+claim about work, echoes the user, or runs long. The relay eval (`bin/sidecar/eval/`) scores the front's full JSON
+turns, which the same server answers. Accept when every kind's decision accuracy is above the base, the speak
+windows' claim and echo rates are near zero, and the relay score is no worse than the base.
+
+## Results (2026-10-12)
+
+Data from `make_windows.py --calls 600`: 5397 train rows (2159 speak, 3238 listen), 2529 held-out windows. One epoch,
+338 steps, 33 min on the RTX 5090, 12.3 GiB peak reserved; train loss 0.056, held-out eval loss 0.0116 (token
+accuracy 99.2%). Adapter: 33.0M parameters, 66 MB as f16 GGUF.
+
+Held-out windows, all 2529, decision accuracy by kind (Q4_K_M front, b11146):
+
+| kind | n | base | LoRA |
+| --- | --- | --- | --- |
+| mid (user still talking) | 1244 | 39% | 97% |
+| silent | 481 | 100% | 100% |
+| silent-speaking | 345 | 99% | 100% |
+| final | 120 | 87% | 100% |
+| over-voice | 96 | 55% | 100% |
+| final-raw | 85 | 91% | 99% |
+| after-answer | 79 | 3% | 100% |
+| backchannel | 70 | 91% | 11% |
+| stop | 9 | 56% | 100% |
+| all | 2529 | 64% | 96% |
+
+On the speak windows: delegation right 70% to 75%, delegation close to the label 22% to 52%, claims 4% to 0%, echoes
+13% to 11%, long says 7% to 0%.
+
+The backchannel row is not a regression. Its label is "Mm-hm." on about one dictation pause in four, drawn at random,
+so no model can tell those windows from the listen ones. The base "won" them by speaking task lines into the middle of
+the user's sentence ("Fixing the CSV import date format issue."); the LoRA listens, and every time it speaks there it
+says "Mm-hm.".
+
+Relay eval, 17 fixtures by 3 runs: base 45/51; the adapter on every request 39/51 (it delegated "Mark the item as
+verified" for a plain "it works", and said "Deleted the branch." before any delegation ran); the adapter on the loop's
+requests only 46/51. No invented actions and no double asks in any arm. Hence the scoping below.
 
 ## 4. Use it
 
-Set `frontServerLora` to the adapter's path (`/plugin configure live-vibe@ottomation`); the managed llama-server
-starts with `--lora`. With `microturnMs` on, the loop runs on the trained model.
+Set `frontServerLora` to the adapter's path (`/plugin configure live-vibe@ottomation`), with `microturnMs` on. The
+managed llama-server loads it with `--lora`, then sets its server-wide scale to 0 once healthy; the micro-turn
+loop's two requests name it at scale 1 (`MicroStepper.lora`, found from `GET /lora-adapters`). The front's full turns
+(relay, retell, status) run on the base model. In b11146 `--lora-init-without-apply` does not do this: a request that
+names no adapter still gets it at scale 1, so the POST is what scopes it.

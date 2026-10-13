@@ -1,7 +1,7 @@
 {
   "name": "live-vibe",
   "displayName": "Live Vibe",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "/live: full-duplex voice (Kyutai streaming STT with semantic end of turn, or Silero and Whisper; Kokoro TTS) through a sidecar; /vibe: director mode that delegates all work to subagents; /livevibe: talk with a fast voice front that hands the work to Claude as director.",
   "author": {
     "name": "Paul Otto",
@@ -104,7 +104,7 @@
     "frontServerLora": {
       "type": "string",
       "title": "Live vibe: managed server LoRA",
-      "description": "With frontUrl empty: a GGUF LoRA adapter applied to the front model, such as the timing LoRA for the micro-turn loop (training/README.md). Empty means none.",
+      "description": "With frontUrl empty: a GGUF LoRA adapter for the micro-turn loop (the timing LoRA, training/README.md); only the loop's requests use it. Empty means none.",
       "default": ""
     },
     "frontModel": {
