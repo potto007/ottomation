@@ -250,6 +250,7 @@ class MicroLoop:
         self.utterance: list[str] = []  # the user's words since the last utterance end
         self.last_utterance = ""  # the recognizer's text of the utterance that just ended (the echo check's reference)
         self.final: tuple[str, float] | None = None  # an ended utterance and its p, asked once as a whole before it joins the history
+        self.holding = False  # the session holds an unfinished utterance for its rest: the user is still talking
         self.pending_note: str | None = None  # an ended utterance not yet handed off or passed on
         self.new_words = False  # words arrived since the last tick
         self.p: float | None = None
@@ -289,8 +290,16 @@ class MicroLoop:
         self.utterance = []
         self.new_words = False
         self.user_done = True
+        self.holding = False
         self.handed_this_utterance = False
         self.silent = 0
+
+    def hold_open(self) -> None:
+        """The recognizer ended an utterance that stops mid-sentence and the session waits for its rest: the words
+        stay in the window and the user counts as still talking (decision only, no speak) until the whole sentence
+        ends or the wait runs out."""
+        self.holding = True
+        self.user_done = False
 
     def commit_final(self) -> None:
         """The ended utterance joins the history once: after the window that asked on it, or when the user moves on
@@ -329,6 +338,8 @@ class MicroLoop:
         return " ".join(self.utterance)
 
     def user_talking(self) -> bool:
+        if self.holding:
+            return True
         return bool(self.utterance) and not self.user_done and (self.p is None or self.p < self.eot)
 
     def window(self) -> str:
@@ -359,6 +370,8 @@ class MicroLoop:
             return LISTEN, "model"
         if step.say and self.run and is_echo(step.say, " ".join(self.run)):  # the run said this already: it is over
             return LISTEN, "repeat"
+        if self.handed_this_utterance:  # one line per hand-off; what follows is Claude's to say
+            return LISTEN, "handed"
         if self.user_talking():
             if step.say and self.deps.is_backchannel(step.say):
                 return SPEAK, "backchannel"
@@ -431,7 +444,7 @@ class MicroLoop:
             self.resolve_note(False)
         if self.deps.speaking() and self.utterance and not self.user_done:  # the user talks over the voice
             await self.deps.cut()
-        elif self.run and (not self.deps.speaking() or reason in ("model", "repeat")):  # the run is over, or ends here
+        elif self.run and (not self.deps.speaking() or reason in ("model", "repeat", "handed")):  # over, or ends here
             await self.deps.end_run()
 
 

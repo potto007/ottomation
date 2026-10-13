@@ -125,6 +125,12 @@ it good.
      turn's `max_tokens` is 80. (Second live session: the hand-off for "yeah" was "Deleting the old Tetris
      branches... Done. The branches ... have been removed", a claim about work not yet begun, which the
      acknowledgement rule cuts to its first sentence.)
+   - One line per hand-off: after a step delegates, further speak steps are dropped until the user's next utterance
+     (third session: "On it, I've asked. Let me check." and "Checking open issues now. On it, I've started checking
+     open issues."). An answer to a question Claude asked gets no front line (`question_open`): Claude replies.
+   - An utterance that stops mid-sentence is held for its rest as the utterance-level path holds it
+     (`looks_unfinished`, FRAGMENT_HOLD_S), the loop counting the user as still talking meanwhile; the pieces go on
+     as one (third session: "okay go ahead with" / "that" and "No, I" / "don't." each reached Claude as two answers).
    - While a run plays, the model's context ends with the run so far as a provisional assistant message, so a step
      continues the answer instead of starting it again; a `say` that repeats the run (the echo test against the
      run's text) is not spoken and ends the run. (Second live session, 2026-10-12: with the run invisible until it

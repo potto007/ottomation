@@ -1265,10 +1265,13 @@ class FrontSession(Duplex):
     def micro_trim(self, say: str, handing: bool) -> str:
         """What a step speaks, by the utterance-level turn's rules: a hand-off is an acknowledgement (a short "on it"
         with no claim about the work; the second live session had the front announce "Done, the branches have been
-        removed" in its hand-off); a reply rests on a fresh Status report when there is one, and is held for Claude
-        otherwise while work is in session."""
+        removed" in its hand-off); an answer to a question Claude asked gets no front line at all (Claude answers;
+        the third session had "Got it, no further action needed" before Claude's own reply); otherwise a reply rests
+        on a fresh Status report when there is one, and is held for Claude while work is in session."""
         if handing:
             return acknowledgement(say)
+        if self.question_open:  # the user is answering Claude's question: Claude replies, the front adds nothing
+            return ""
         if self.tools.status_fresh:
             return status_reply(say)
         return held_answer(say, self.tools.work_in_session)
@@ -1314,7 +1317,30 @@ class FrontSession(Duplex):
         return (await self.tools.call("delegate", {"request": request}, said=said)).startswith(HANDED_OFF)
 
     async def micro_utterance(self, text: str) -> None:
-        """The recognizer ended the user's utterance: on screen, a model switch or goodbye as before, and the loop
+        """The recognizer ended the user's utterance. One that stops mid-sentence ("okay go ahead with") is held up
+        to FRAGMENT_HOLD_S for its rest, as on_utterance holds it, and the loop keeps the user talking meanwhile;
+        the pieces then go on as one (the second live session sent "okay go ahead with" and "that" to Claude as two
+        answers). Otherwise micro_dispatch takes it."""
+        assert self.micro is not None
+        pieces = [*self.fragment, text]
+        self.fragment = []
+        if self.fragment_due is not None:
+            self.fragment_due.cancel()
+            self.fragment_due = None
+        text = " ".join(p.strip() for p in pieces if p.strip())
+        if len(pieces) < FRAGMENT_PIECES and looks_unfinished(text) and not spoken_model(self.switch, text):
+            self.fragment = [p for p in pieces if p.strip()]
+            self.micro.hold_open()
+            self.arm_fragment()
+            log(f"front: holding an unfinished utterance up to {FRAGMENT_HOLD_S:.1f} s for its rest: {text[:80]!r}")
+            self.settle()
+            return
+        if len(pieces) > 1:
+            log(f"front: {len(pieces)} pieces of one sentence go on as one utterance")
+        await self.micro_dispatch(text)
+
+    async def micro_dispatch(self, text: str) -> None:
+        """The user's whole utterance on the micro path: on screen, a model switch or goodbye as before, and the loop
         takes it (its history, and Claude's note unless the next step hands it off)."""
         assert self.micro is not None
         emit(type="transcript", role="user", text=text)
@@ -1417,7 +1443,10 @@ class FrontSession(Duplex):
         elif kind == "fragment_due" and payload == self.fragment_gen and self.fragment and not self.user_talking:
             text, self.fragment = " ".join(self.fragment), []
             log(f"front: nothing followed the unfinished utterance; sending it as it is: {text[:80]!r}")
-            await self.dispatch(text)
+            if self.micro is not None:
+                await self.micro_dispatch(text)
+            else:
+                await self.dispatch(text)
 
     def arm_fragment(self) -> None:
         """(Re)starts the wait for a held utterance's rest; when it runs out, the held words go on as they are."""

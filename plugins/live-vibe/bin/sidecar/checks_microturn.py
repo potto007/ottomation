@@ -363,6 +363,38 @@ async def loop_units(check: Any) -> None:
     await loop.tick()
     check(w.spoken[-1] == "The branch exists only locally.", f"microloop: a reply goes through the reply rule ({w.spoken[-1]!r})")
 
+    # 11. One line per hand-off: after it, speak steps are dropped until the user's next utterance; and a held
+    #     fragment keeps the user talking (decision only), its rest joining the same utterance.
+    st = ScriptedStepper([(SPEAK, "Checking open issues now.", "list the open issues"),
+                          (SPEAK, "On it, I've started checking open issues.", ""),
+                          (SPEAK, "Let me check.", "list the open issues again"),
+                          (SPEAK, "Go ahead with what?", ""),  # the decision while the fragment is held
+                          (SPEAK, "Sure.", "close issue 4")])
+    w = World()
+    loop = MicroLoop(st, [], w.deps(), step_ms=200)
+    loop.on_piece("check open issues", 0.9)
+    loop.on_utterance_end("check open issues")
+    await loop.tick()
+    s = await loop.tick()
+    check(w.spoken == ["Checking open issues now."] and s is not None and s.action == LISTEN and w.ended == 1,
+          f"microloop: after a hand-off a further say is dropped and the run ends ({w.spoken}, {s and s.action})")
+    s = await loop.tick()
+    check(w.spoken == ["Checking open issues now."] and len(w.delegated) == 1, "microloop: nor is a second delegation taken")
+    w.playing = False
+    loop.run_ended(w.spoken, cut=False)
+    loop.on_piece("okay go ahead with", 0.8)
+    loop.hold_open()  # the recognizer ended it mid-sentence; the session holds it for its rest, not an utterance end
+    check(loop.user_talking(), "microloop: a held fragment keeps the user talking")
+    s = await loop.tick()
+    check(s is not None and s.action == LISTEN and w.spoken == ["Checking open issues now."]
+          and st.windows[-1].startswith("[voice] okay go ahead with"),
+          f"microloop: only the decision runs while a fragment is held ({s and s.action}, {st.windows[-1]!r})")
+    loop.on_piece("that", 0.9)
+    loop.on_utterance_end("okay go ahead with that")
+    s = await loop.tick()
+    check(s is not None and s.action == SPEAK and w.spoken[-1] == "Sure." and w.delegated[-1][1] == "okay go ahead with that",
+          f"microloop: the whole sentence is handed off once its rest arrives ({w.delegated[-1]})")
+
     # 8. The user moves on before the ended utterance got its window: it still joins the history, in order.
     st = ScriptedStepper([])
     loop = MicroLoop(st, hist := [], World().deps(), step_ms=200)
