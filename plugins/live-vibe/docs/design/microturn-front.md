@@ -136,6 +136,12 @@ it good.
      silence is dropped until the user speaks again (same session: the issue 8 answer played twice as two runs). The
      note to Claude carries what the front said, and a question answered from a fresh Status report is a quiet note,
      not an `ask` (same session: the front answered "number eight" from the report and Claude was asked anyway).
+   - The delegator's `announcing` guard (a result never acts on itself) is set when an announcement starts and was
+     cleared only by the next utterance-level user turn, which the micro path never runs: after Claude's first report
+     every hand-off was refused and the loop re-tried on every step (fifth session). The micro path clears it when no
+     turn is running, and a delegation is attempted once per utterance whatever the delegator answers.
+   - A micro-path utterance without closing punctuation is held for its rest like an unfinished one (6 of 45 Kyutai
+     turn ends across the live sessions were unpunctuated; "What were the other" / "PRs?" went to Claude as two).
    - While a run plays, the model's context ends with the run so far as a provisional assistant message, so a step
      continues the answer instead of starting it again; a `say` that repeats the run (the echo test against the
      run's text) is not spoken and ends the run. (Second live session, 2026-10-12: with the run invisible until it

@@ -429,7 +429,8 @@ class MicroLoop:
         self.last = step
         await self.act(step, reason)
         self.deps.log(f"micro step: {step.action} p_listen={'n/a' if step.p_listen is None else f'{step.p_listen:.2f}'} "
-                      f"why={reason} ms={ms:.0f} window={window[:60]!r}" + (f" say={step.say[:60]!r}" if step.say else ""))
+                      f"why={reason} ms={ms:.0f} window={window[:60]!r}" + (f" say={step.say[:60]!r}" if step.say else "")
+                      + (f" spoken={step.spoken[:60]!r}" if step.spoken != step.say.strip() else ""))
         return step
 
     async def act(self, step: MicroStep, reason: str) -> None:
@@ -438,8 +439,10 @@ class MicroLoop:
             handed = False
             if step.delegate.strip() and not self.handed_this_utterance and not self.user_talking():
                 said = self.utterance_text or self.last_utterance
+                self.handed_this_utterance = True  # one attempt per utterance, whatever the delegator says (a
+                # refused duplicate had the loop re-delegate and re-announce on every step of the fifth session)
                 if await self.deps.delegate(step.delegate.strip(), said):
-                    self.handed_this_utterance = handed = True
+                    handed = True
                     self.run_delegate = self.run_delegate or step.delegate.strip()
             say = step.spoken or (HANDOFF_SAY if handed else "")  # a hand-off is never silent
             if say:

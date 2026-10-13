@@ -1322,6 +1322,10 @@ class FrontSession(Duplex):
         await cancel_and_wait(self.run_task)
 
     async def micro_delegate(self, request: str, said: str) -> bool:
+        if not self.turn_running():  # `announcing` is set when an announcement starts and cleared by the next
+            self.tools.announcing = False  # utterance-level turn, which the micro path never runs: no announcement
+        # is running now, so this is the user's request, not a result acting on itself (the fifth session had every
+        # hand-off after the first report refused as "the turn announces a result")
         return (await self.tools.call("delegate", {"request": request}, said=said)).startswith(HANDED_OFF)
 
     async def micro_utterance(self, text: str) -> None:
@@ -1336,7 +1340,9 @@ class FrontSession(Duplex):
             self.fragment_due.cancel()
             self.fragment_due = None
         text = " ".join(p.strip() for p in pieces if p.strip())
-        if len(pieces) < FRAGMENT_PIECES and looks_unfinished(text) and not spoken_model(self.switch, text):
+        unfinished = looks_unfinished(text) or text[-1:] not in ".!?\"')"  # Kyutai punctuates a finished sentence;
+        # "What were the other" / "PRs?" (fifth session) ends on a content word and the old test let it through
+        if len(pieces) < FRAGMENT_PIECES and unfinished and not spoken_model(self.switch, text):
             self.fragment = [p for p in pieces if p.strip()]
             self.micro.hold_open()
             self.arm_fragment()
