@@ -113,8 +113,8 @@ DEFAULT_MODEL = Gguf("unsloth/Qwen3-4B-Instruct-2507-GGUF", "Qwen3-4B-Instruct-2
 # The published timing LoRA for DEFAULT_MODEL (training/README.md), frontServerLora "timing": 66 MB, f16. It is
 # coupled to the prompt it learned (timing_lora.TRAINED): a retrain gets a new revision and sha256 here and a new
 # TRAINED there, in one commit.
-TIMING_LORA = Gguf("potto007/live-vibe-timing-lora", "timing-lora.gguf", "b623743fdf90101c5ccf53844e298fbd7098cd00",
-                   "c6dd594aa6dcdae4813f865ba9357f08110c425c490eade286e932a073298816")
+TIMING_LORA = Gguf("potto007/live-vibe-timing-lora", "timing-lora.gguf", "99fb41dbd7915f44832e205eb2b0beca879122e4",
+                   "9faba23d9907617de9b67a63f7b53ec50d22bfcebd21f7bcb930693d817c86be")
 LORAS = {"timing": TIMING_LORA}  # frontServerLora names; anything else is a path to a GGUF adapter
 
 
