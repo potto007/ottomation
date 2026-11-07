@@ -71,7 +71,9 @@ Client to server: JSON `start {threadId, options}`, `played {seq, sample}`, `mut
 Binary frames are mic PCM.
 Server to client: JSON `ready`, `caption {who: "you"|"voice", committed, tentative}`, `state`
 (`listening|thinking|speaking|delegated`), `speak {seq, text, sampleRate}`, `cut {seq}` (barge-in),
-`delegated {runId, text}`, `error`. Binary frames are `[seq u32][Float32 PCM]`.
+`delegated {runId, text}`, `error`. Binary frames are `[seq u32 LE][Float32 PCM]`, at most 0.5 s each.
+`cut {seq}` drops that seq and every earlier one. A synthesis failure also sends `cut`. Nothing marks
+the end of a `speak`, so `state` carries "done speaking".
 
 ### Turn taking (`TurnDetector`, pure, table-tested)
 
@@ -117,9 +119,15 @@ Port live-vibe's rules. Parakeet has no semantic end-of-turn score like Kyutai's
 ### TTS
 
 - A worker child process running `kokoro-js` 1.2.1: ONNX through onnxruntime-node, and a WASM phonemizer,
-  so there is no espeak-ng to install.
-- The model is in the same store and catalog. It runs on CPU by default, since Kokoro is faster than
-  real time on CPU.
+  so there is no espeak-ng to install. transformers.js runs local-only, with `sharp` and
+  `onnxruntime-web` overridden out.
+- The model is `onnx-community/Kokoro-82M-v1.0-ONNX@1939ad2a8e`, fp32 (326 MB), stored as a multi-file
+  `directory` entry in the same store and catalog. fp32, not q8: q8 was 4.7x slower on CPU at the same
+  WER, and fp16 is broken.
+- CPU only. Measured 2026-11-07 on the Ryzen 7 9700X: warm first sentence about 315 ms, RTF 0.13, cold
+  start 1.43 s, about 0.9 GiB RAM. CUDA gave a 61-74 ms first sentence, but it needs a 343 MB CUDA
+  provider `.so` plus cuDNN 9 and CUDA 12 libraries that don't ship.
+- The worker unloads after 5 idle minutes. PR 4 holds it for the length of a call.
 - Text is split into sentences. The first sentence is rendered and sent while the rest render.
 - The voice is a client setting (`voiceTtsVoice`).
 
@@ -164,12 +172,15 @@ Port live-vibe's rules. Parakeet has no semantic end-of-turn score like Kyutai's
 
 ## Open risks
 
-- `node-llama-cpp` and `onnxruntime-node` under Node SEA and Electron ASAR: each ships native binaries.
-  Prove packaging in PR 2/3 with `scripts/build-desktop-artifact.ts` before building on it.
+- `node-llama-cpp` under Node SEA and Electron ASAR: it ships native binaries. Prove packaging in PR 3
+  with `scripts/build-desktop-artifact.ts` before building on it. PR 2 proved `onnxruntime-node` on
+  Linux (SEA and Electron 44) with `asarUnpack` of `onnxruntime-node/bin` and pruning of other
+  platforms' binaries (about 190 MB to 45 MB). Windows and macOS are unverified.
 - Does Chromium AEC in Electron cancel WebAudio worklet playback from the same renderer? Measure in
   PR 5. If not, the echo guard has to carry it (live-vibe's 3-word fallback).
-- Parakeet streaming latency per 0.5 s chunk on GPU vs CPU, and Kokoro first-sentence latency on CPU.
-  Target: under 1.2 s from end of speech to first audio.
+- Latency from end of speech to first audio, target under 1.2 s. Measured on CPU: the turn pause
+  (800-1500 ms) dominates, plus a Parakeet chunk (p95 about 180 ms), the front model, and Kokoro's first
+  sentence (about 315 ms). The front model's budget is what is left.
 - VRAM on this box: Parakeet Q8 about 0.7 GiB plus a front model of about 3 GiB, next to `:8080` and `:8084`.
   Default to the URL override here.
 - Upstream fit: one PR stack is large. Upstream will want the scope approved in #22091 first.
