@@ -150,7 +150,8 @@ Port live-vibe's rules. Parakeet has no semantic end-of-turn score like Kyutai's
   568 ms (long sentences 1796 to 858 ms), with no gaps after it.
 - CPU Kokoro varied 3x with load from the agent's own builds (load average 10-33). A GPU Kokoro is worth
   another look.
-- The front's speech sometimes still contains markdown (backticks); strip it before speaking.
+- Markdown is stripped at the single TTS entry point (`voice/speakable.ts`), so replies, readbacks and
+  confirmations all speak plain text.
 - The voice is a client setting (`voiceTtsVoice`).
 
 ## Surfaces
@@ -192,6 +193,21 @@ Port live-vibe's rules. Parakeet has no semantic end-of-turn score like Kyutai's
 - Utterance text comes back without its final punctuation, and Parakeet misheard "tests" as "test" on a
   synthetic voice. The front model has to tolerate both.
 
+- Parakeet's streaming text lags speech by 1.2-1.9 s, and with silence filtering the last word only
+  appears at finalize, so speculation has to finalize at the pause. Finalize also adds `.` or `?` to
+  mid-sentence pieces, so the detector reads pause text with trailing punctuation stripped.
+- Streaming Parakeet holds a short answer ("No.", "Yes, go ahead.") until more speech arrives. A voiced
+  turn now ends after the pause even with empty text, and the finalize flushes the words.
+- Where the extra ~0.5 s of endpointing went: Silero lags 100-140 ms, 0.5 s chunks quantize 0-300 ms, the
+  endpoint chunk's decode takes 171-239 ms, and a serial finalize took 175-246 ms before the front. The last
+  two are now off the critical path. PR 4's harness sent each chunk at its first sample, so its 2.08 s was
+  about 0.5 s optimistic.
+- Pause sweep over 15 fixtures (14 with mid-sentence pauses): at 0.5 s chunks, 1500 ms without speculation
+  cut 0/13 off at a 2082 ms median; 1200 ms with speculation cut 1/13 at 1521 ms; 1000 ms cut 2/13 at
+  1381 ms. 250 ms chunks save another 30-90 ms at equal cut-off.
+- The front sometimes claims in a reply to have done outward work ("I've addressed the reviewer's comment")
+  without sending anything. It needs a prompt eval.
+
 ## Open risks
 
 - Native packaging: PR 3 proved `node-llama-cpp` under the Node SEA archive and Electron 44 (a hand-packed
@@ -227,9 +243,23 @@ Port live-vibe's rules. Parakeet has no semantic end-of-turn score like Kyutai's
   The download UI credits eSpeak NG's GPL-3.0-or-later license.
 - Outward-facing delegations (PRs, pushes, comments, messages, deploys) from a call need a spoken yes.
   The front flags them and a keyword backstop catches the rest; no, silence, or barge-in cancels.
+  Built (`feat/live-voice-confirm`): either signal holds the delegation, or a note that steers a running
+  run, and the voice asks `Send "<task>" to the agent on <thread>?`. Only an explicit yes sends; "okay" and
+  "mm-hm" never confirm; no, 8 s of silence, or new words cancel, and new words become a fresh turn.
+  Measured on 40 labelled utterances with Qwen3-4B: the front's flag has precision 0.86 and recall 0.95
+  (it flags local git verbs too), and front OR backstop reaches recall 1.00 at precision 0.87.
 - Latency: start the front decision and first render speculatively once silence begins, discard them if
   speech resumes, never run side effects early, then retune the pause defaults from measurements.
+  Built (`feat/live-voice-latency`): the detector marks a pause at 300 ms of silence, and the worker's
+  `segment` op finalizes the words so far without resetting audio state. The front decision and the first
+  render run then and are committed only at the endpoint with the same words and context. The default
+  pause dropped from 1500 to 1200 ms. End of speech to first audio went from a 3351 ms median to 1734 ms
+  on the server path, and from 3338 to 2201 ms in the browser, both under load average 7-15.
 
 ## Unresolved
+
+- Follow-ups after the voice pack: a client pause setting (Short 1.0 / Normal 1.2 / Long 1.5 s), 250 ms mic
+  chunks, and starting the first render on the decision's first sentence (saves about 100-300 ms under
+  load). The floor is then the pause plus chunk quantization.
 
 - Whether a call should open from the sidebar (new thread by voice) or only on an existing thread.
