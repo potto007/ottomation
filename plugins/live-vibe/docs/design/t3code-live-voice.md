@@ -76,8 +76,10 @@ Server to client: JSON `ready`, `caption {who: "you"|"voice", committed, tentati
 ### Turn taking (`TurnDetector`, pure, table-tested)
 
 Port live-vibe's rules. Parakeet has no semantic end-of-turn score like Kyutai's s2, so:
-- An utterance ends after a VAD end plus a wait: 1000 ms after finished punctuation, 3000 ms by default, or
-  4000 ms when the text ends unfinished (a trailing comma, `and`, `so`, `the`).
+- An utterance ends after a VAD end plus a wait: 800 ms after finished punctuation, 1500 ms by default, or
+  3000 ms when the text ends unfinished (a trailing comma, `and`, `so`, `the`). Measured 2026-11-07:
+  streaming Parakeet adds a sentence's period only once the next sentence starts, so the 1500 ms
+  default ends most turns. live-vibe's 3000 ms left a 2.5 s pause unended.
 - An utterance cut off mid-sentence waits up to 2.5 s for the rest, and the pieces go to the front as one.
 - Barge-in: VAD start while speaking pauses playback (`cut`). If the words form only a listening sound
   ("mm-hm", "yeah", "okay", "got it") and end within 1.2 s, playback resumes from the cursor, and the
@@ -150,6 +152,15 @@ Port live-vibe's rules. Parakeet has no semantic end-of-turn score like Kyutai's
 5. `feat(web)`: client controller in client-runtime (platform object), AEC capture, player worklet with
    cursor acks, call strip, settings, palette, keybinding. Then one integrated pass in a real browser.
 6. `feat(mobile)`: later.
+
+## Findings from the real-model run (PR 1, 2026-11-07)
+
+- Speech recognition ran on CPU. `transcribe-cpp` 0.4.1 ships only CPU and Vulkan builds for Linux, and WSL2
+  has no Vulkan driver for the NVIDIA card (Ubuntu 24.04's Mesa lacks `dzn`), so it lists no GPU. CPU is
+  fast enough: 0.5 s chunks decode in about 150-270 ms at p95 on the Ryzen 7 9700X. CUDA itself works in
+  WSL (`/usr/lib/wsl/lib/libcuda.so`), which matters for onnxruntime (TTS) and node-llama-cpp (front).
+- Utterance text comes back without its final punctuation, and Parakeet misheard "tests" as "test" on a
+  synthetic voice. The front model has to tolerate both.
 
 ## Open risks
 
