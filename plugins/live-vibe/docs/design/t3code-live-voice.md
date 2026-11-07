@@ -94,7 +94,17 @@ Port live-vibe's rules. Parakeet has no semantic end-of-turn score like Kyutai's
 - A worker child process running `node-llama-cpp` 3.22.3, with the same packaging treatment as the speech
   worker: inline entry, SEA re-exec, ASAR unpack.
 - The model is a pinned GGUF in a catalog next to the speech catalog, downloaded by `SpeechModelStore`.
-  The default is a 2-4B instruct model at Q4.
+  The default is Qwen3-4B-Instruct-2507 Q4_K_M. On 50 voice-style prompts with CUDA it chose the right
+  action 45 times (all misses were note vs delegate), with a 150 ms median decision (p90 226 ms) and about
+  4.3 GiB of VRAM. Qwen3-1.7B scored 42/50 and also answered project questions itself. Gemma 4 E2B
+  spoke on noise. Qwen3.5 (hybrid) got no KV reuse.
+- The budget needs a GPU: on CPU a decision takes 1.3-2 s. llama.cpp spins its threads, so they are capped
+  at half the cores; uncapped, beside STT and TTS, one decision took 51 s.
+- Packaged builds ship CPU plus Vulkan on Linux and Windows x64, and Metal on macOS arm64. CUDA (200-416 MB,
+  needs a CUDA runtime) is pruned. NVIDIA users on native Linux and Windows run on Vulkan, whose speed on
+  a real GPU is unmeasured. On WSL, Vulkan is a deviceless software driver, so the worker falls back to
+  CPU. node-llama-cpp's binary probe forks with the parent's execArgv, which broke both the `-e` worker
+  and the SEA until it was cleared.
 - Output is forced through a JSON schema:
   `{action: "reply"|"delegate"|"note"|"none", speech: string, task?: string}`.
 - Prompt and history follow live-vibe's lessons:
@@ -112,7 +122,13 @@ Port live-vibe's rules. Parakeet has no semantic end-of-turn score like Kyutai's
 - Watch `run.updated` from `getThreadEventSequence(threadId)`.
 - On a terminal status, read the last non-streaming `assistant_message` for that run
   (`getProjectThreadRecords(..., {turnItemTypes: ["assistant_message"], turnItemRunIds: [runId]})`),
-  have the front summarize it, then speak it.
+  have the front summarize it, then speak it. A result is read back, never acted on.
+- Results and the user's words go to the front as separate turns. Batched into one decision, the front
+  dropped the readback.
+- A delegation runs the thread's real provider with the user's words. In testing, a spoken "open a pull
+  request and ask Julius to review it" made a real Codex thread do exactly that upstream. Outward actions
+  in voice-started runs may need a spoken confirmation (unresolved). Every test harness checks in code that
+  its thread is on Replay (dev) before delegating.
 - Delegated messages are ordinary thread messages, so they show in the timeline, and history and
   checkpoints behave the same.
 
@@ -128,7 +144,13 @@ Port live-vibe's rules. Parakeet has no semantic end-of-turn score like Kyutai's
   start 1.43 s, about 0.9 GiB RAM. CUDA gave a 61-74 ms first sentence, but it needs a 343 MB CUDA
   provider `.so` plus cuDNN 9 and CUDA 12 libraries that don't ship.
 - The worker unloads after 5 idle minutes. PR 4 holds it for the length of a call.
-- Text is split into sentences. The first sentence is rendered and sent while the rest render.
+- Text is split into sentences. The first sentence is rendered and sent while the rest render. Kokoro
+  renders a whole piece before sending, at about 0.3 RTF on a loaded CPU, so a first sentence over 40
+  characters renders its opening clause alone. That cut the median first-piece render from 829 ms to
+  568 ms (long sentences 1796 to 858 ms), with no gaps after it.
+- CPU Kokoro varied 3x with load from the agent's own builds (load average 10-33). A GPU Kokoro is worth
+  another look.
+- The front's speech sometimes still contains markdown (backticks); strip it before speaking.
 - The voice is a client setting (`voiceTtsVoice`).
 
 ## Surfaces
@@ -161,7 +183,7 @@ Port live-vibe's rules. Parakeet has no semantic end-of-turn score like Kyutai's
    cursor acks, call strip, settings, palette, keybinding. Then one integrated pass in a real browser.
 6. `feat(mobile)`: later.
 
-## Findings from the real-model run (PR 1, 2026-11-07)
+## Findings from the real-model runs (2026-11-07)
 
 - Speech recognition ran on CPU. `transcribe-cpp` 0.4.1 ships only CPU and Vulkan builds for Linux, and WSL2
   has no Vulkan driver for the NVIDIA card (Ubuntu 24.04's Mesa lacks `dzn`), so it lists no GPU. CPU is
@@ -172,20 +194,33 @@ Port live-vibe's rules. Parakeet has no semantic end-of-turn score like Kyutai's
 
 ## Open risks
 
-- `node-llama-cpp` under Node SEA and Electron ASAR: it ships native binaries. Prove packaging in PR 3
-  with `scripts/build-desktop-artifact.ts` before building on it. PR 2 proved `onnxruntime-node` on
+- Native packaging: PR 3 proved `node-llama-cpp` under the Node SEA archive and Electron 44 (a hand-packed
+  `app.asar`; a full desktop build needs `libsecret-1-dev`). PR 2 proved `onnxruntime-node` on
   Linux (SEA and Electron 44) with `asarUnpack` of `onnxruntime-node/bin` and pruning of other
   platforms' binaries (about 190 MB to 45 MB). Windows and macOS are unverified.
-- Does Chromium AEC in Electron cancel WebAudio worklet playback from the same renderer? Measure in
-  PR 5. If not, the echo guard has to carry it (live-vibe's 3-word fallback).
-- Latency from end of speech to first audio, target under 1.2 s. Measured on CPU: the turn pause
-  (800-1500 ms) dominates, plus a Parakeet chunk (p95 about 180 ms), the front model, and Kokoro's first
-  sentence (about 315 ms). The front model's budget is what is left.
+- Does Chromium AEC in Electron cancel WebAudio worklet playback from the same renderer? PR 5 could not
+  measure it (fake mic only); it needs a real test on speakers. If not, the echo guard has to carry it (live-vibe's 3-word fallback).
+- Latency from end of speech to first audio, target under 1.2 s, measured 2.08 s end to end (PR 4, idle
+  box, front on CUDA): endpoint 1.43-1.80 s after speech ends (the 1.5 s default pause plus 0.5 s mic
+  chunks; the 800 ms finished-sentence pause rarely applies), front decision 330-530 ms, then first audio
+  320 ms for "On it." and 460-710 ms for readbacks. The pause is the floor, not inference. Options: start
+  the front decision and first render speculatively once silence begins and discard them if speech
+  resumes, shorten the default pause or the chunk, or let the client set `endSilenceMs`.
+- Package size: the CLI archive is 342 MB compressed (864 MB extracted). node-llama-cpp adds 146 MB and
+  onnxruntime-node 208 MB. Candidate fix: a voice runtime pack downloaded on demand like the models,
+  which would also allow a CUDA build per machine.
+- Licensing: `phonemizer` 1.2.1 declares Apache-2.0 but embeds a WASM build of eSpeak NG (GPL-3.0-or-later).
+  It cannot ship inside MIT builds as is. Candidate fixes: download it on demand into the store, outside
+  the shipped artifact, or replace it with a permissive G2P (CMUdict plus a small model), which risks
+  pronunciation because Kokoro was trained on eSpeak-style phonemes.
+- On the first, cold call the web page's React tree stopped committing at delegation (SyncLane pending,
+  nothing scheduled, no errors). It did not recur in 4 more calls.
 - VRAM on this box: Parakeet Q8 about 0.7 GiB plus a front model of about 3 GiB, next to `:8080` and `:8084`.
   Default to the URL override here.
 - Upstream fit: one PR stack is large. Upstream will want the scope approved in #22091 first.
 
 ## Unresolved
 
-- Default front GGUF (2B vs 4B) and its catalog pin.
+- Licensing route for eSpeak NG, and whether to move the voice runtime into an on-demand pack.
+- Whether outward actions in voice-started runs need a spoken confirmation.
 - Whether a call should open from the sidebar (new thread by voice) or only on an existing thread.
