@@ -1,0 +1,169 @@
+# live-vibe in T3 Code: a voice conversation on the environment's speech stack
+
+Status: proposal, 2026-11-07. Fork-first: `potto007/t3code`, worktree `~/src/oss/t3code-live-voice`,
+branch `feat/live-voice` from `upstream/main` e455200077. After a working demo, post the design to
+upstream discussion #22091 for scope approval (their rule: no PR without prior approval).
+
+Line references are against upstream e455200077.
+
+## Goal
+
+Press **Start voice** on a thread and talk. A small local "front" model answers small talk itself,
+hands real work to the thread's agent, and reads back the result in a sentence or two. You can talk
+over it. Setup should feel the same as dictation: the first press offers one download for any missing
+model, then the call starts. You don't need an API key, a URL, or a server to manage.
+
+## What upstream already gives us
+
+| live-vibe piece | Upstream |
+|---|---|
+| Mic capture | Web worklet, 16 kHz mono Float32 in 0.5 s chunks (`apps/web/src/speech/pcmWorklet.ts`) |
+| Audio transport to the environment | `/ws/voice`: media ticket, `AuthOrchestrationOperateScope`, binary PCM frames (`apps/server/src/speech/stream.ts:92-113`) |
+| STT (Kyutai/Whisper) | `transcribe-cpp` 0.4.1 in a killable child process; streaming Parakeet/Nemotron with committed and tentative text (`native.ts:81-98`) |
+| Silero VAD | Loaded in the worker; `audio.ts:98-124` tracks `inSpeech` but never emits it |
+| Model store | `SpeechModelStore`: pinned catalog, Range resume, sha256, `.verified` |
+| Consent | Per-environment audio grant (`apps/web/src/speech/voiceConsent.ts`) |
+| Hardware, unload | `speechAcceleration` (Auto GPU then CPU once), `speechModelUnloadTimeout` |
+| Send to a thread | `ThreadManagementService.sendToThread` (`ThreadManagementService.ts:815-903`), the path `t3_thread_send` uses |
+| Watch a run | `waitForThread`, `Orchestrator.streamStoredEventsFrom({threadId, eventType: "run.updated"})` |
+
+## What the dictation stream cannot do (and the fix)
+
+1. One stream per socket. `finish` closes it, and a second `start` fails (`stream.ts:45`, `:50-54`). **Fix:** a
+   separate route, `/ws/voice/conversation`. Dictation stays untouched.
+2. 10-minute socket cap (`stream.ts:83`), 5-minute audio cap per stream, and an unbounded `received[]` replay
+   buffer (`SpeechService.ts:769`, `:816-823`). **Fix:** reset the worker after each utterance (the worker
+   already has `reset`, `native.ts:168-172`) and clear the buffer. The 5-minute cap then applies per
+   utterance. The session closes after a configurable idle period, default 10 minutes.
+3. VAD events never leave the worker. **Fix:** add `speech` (`start|end`, sample offset) to the feed reply.
+   The conversation always loads VAD for events, whatever `speechSilenceFiltering` is set to.
+4. Only one native operation at a time (`SpeechService.ts:198-200`). **Decision:** a call holds the STT slot,
+   as a dictation stream does. Dictation elsewhere on the environment gets `speech_busy` with
+   reason `voice_call`. The front and TTS run in their own workers, outside this slot.
+5. JSON-only replies to the client. **Fix:** the conversation socket also carries binary TTS frames.
+6. Lockstep flow control, with at most 2 chunks in flight. This is fine for 0.5 s chunks if the worker keeps
+   up. We log the lag, and if it falls behind, the server drops tentative decoding rather than stalling capture.
+
+## Architecture
+
+```
+client (web)                              environment
+ mic --AEC--> worklet 16k --PCM-->  /ws/voice/conversation
+                                      VoiceConversationService (one per call, bound to a thread)
+                                        +- STT worker (existing) -> text + VAD events
+                                        +- TurnDetector (pure)   -> utterance-end / barge-in
+                                        +- Front worker (node-llama-cpp, GGUF, JSON schema)
+                                        |     reply | delegate | note | none
+                                        +- ThreadManagementService.sendToThread (delegate)
+                                        +- run.updated watcher -> last assistant_message -> front summary
+                                        +- TTS worker (kokoro-js, sentence chunks)
+ player worklet 24k <--PCM frames-----+
+ playback cursor ----acks------------->  (words actually played; echo guard)
+```
+
+All three models live on the environment, so remote, relay and tunnel clients behave the same as local
+ones. Audio is about 256 kbps up and 384 kbps down as raw Float32. That is fine on a LAN or tailnet. Opus is
+a later optimization.
+
+### Wire protocol (`packages/contracts/src/voiceConversation.ts`)
+
+Client to server: JSON `start {threadId, options}`, `played {seq, sample}`, `mute`, `unmute`, `stop`.
+Binary frames are mic PCM.
+Server to client: JSON `ready`, `caption {who: "you"|"voice", committed, tentative}`, `state`
+(`listening|thinking|speaking|delegated`), `speak {seq, text, sampleRate}`, `cut {seq}` (barge-in),
+`delegated {runId, text}`, `error`. Binary frames are `[seq u32][Float32 PCM]`.
+
+### Turn taking (`TurnDetector`, pure, table-tested)
+
+Port live-vibe's rules. Parakeet has no semantic end-of-turn score like Kyutai's s2, so:
+- An utterance ends after a VAD end plus a wait: 1000 ms after finished punctuation, 3000 ms by default, or
+  4000 ms when the text ends unfinished (a trailing comma, `and`, `so`, `the`).
+- An utterance cut off mid-sentence waits up to 2.5 s for the rest, and the pieces go to the front as one.
+- Barge-in: VAD start while speaking pauses playback (`cut`). If the words form only a listening sound
+  ("mm-hm", "yeah", "okay", "got it") and end within 1.2 s, playback resumes from the cursor, and the
+  words reach the agent as a note.
+- Echo guard: words found in what was played in the last 2.5 s (taken from `played` acks) don't
+  barge in. The browser AEC removes most echo, and this catches the rest.
+
+### Front model
+
+- A worker child process running `node-llama-cpp` 3.22.3, with the same packaging treatment as the speech
+  worker: inline entry, SEA re-exec, ASAR unpack.
+- The model is a pinned GGUF in a catalog next to the speech catalog, downloaded by `SpeechModelStore`.
+  The default is a 2-4B instruct model at Q4.
+- Output is forced through a JSON schema:
+  `{action: "reply"|"delegate"|"note"|"none", speech: string, task?: string}`.
+- Prompt and history follow live-vibe's lessons:
+  - Keep a stable prefix. Trim once, from 40 messages to 20, after a turn ends, so the KV cache survives.
+  - Cap relayed results at 500 tokens.
+  - Summaries are at most two sentences and a question.
+- Advanced override (server setting `voiceFrontModel`): an OpenAI-compatible URL and a model name. On the
+  shared 32 GB box, point it at the `:8080` router instead of loading a second LLM.
+
+### Delegation
+
+- `sendToThread({mode: "auto", createdBy: "user", creationSource: "web"|"mobile", text})`:
+  - `auto` steers an active run or starts one.
+  - The text is the user's words plus the front's reading.
+- Watch `run.updated` from `getThreadEventSequence(threadId)`.
+- On a terminal status, read the last non-streaming `assistant_message` for that run
+  (`getProjectThreadRecords(..., {turnItemTypes: ["assistant_message"], turnItemRunIds: [runId]})`),
+  have the front summarize it, then speak it.
+- Delegated messages are ordinary thread messages, so they show in the timeline, and history and
+  checkpoints behave the same.
+
+### TTS
+
+- A worker child process running `kokoro-js` 1.2.1: ONNX through onnxruntime-node, and a WASM phonemizer,
+  so there is no espeak-ng to install.
+- The model is in the same store and catalog. It runs on CPU by default, since Kokoro is faster than
+  real time on CPU.
+- Text is split into sentences. The first sentence is rendered and sent while the rest render.
+- The voice is a client setting (`voiceTtsVoice`).
+
+## Surfaces
+
+- Web and desktop: composer **Start voice** button, a command palette entry, and a keybinding (unbound by
+  default; open PR #29394 proposes F8 for its Codex call). A call strip shows state, captions, and
+  Mute/Stop. Capture uses
+  `getUserMedia` with `echoCancellation`, `noiseSuppression` and `autoGainControl` set to true. Today's
+  capture sets no constraints (`browserPcmCapture.ts:65-67`).
+- Settings > Voice: a **Conversation** section with voice, front model (download/use, or URL),
+  idle timeout. It reuses the `CleanupModelRow` and model-browser patterns.
+- Mobile: not in the first cut. It needs a PCM event surface in `t3-voice-transcription`,
+  `VOICE_COMMUNICATION` capture for AEC, and a play-and-record audio session; `audioSession.ts:50`
+  refuses playback while recording. Until then, the button is hidden with "Voice calls are available
+  on web and desktop."
+- Providers: provider-agnostic. Delegation sends an ordinary message, so it works on every adapter.
+- Agents/MCP: none. A call needs a human at a mic.
+- Reverse states: Stop ends the call. Closing the tab, losing the connection, revoking the grant, or
+  idling out ends the call and frees the STT slot.
+
+## Fork PR stack
+
+1. `feat(speech)`: conversation socket with per-utterance reset, VAD events, `TurnDetector`, idle close.
+   Tests: TurnDetector table, socket lifecycle with a fake worker.
+2. `feat(speech)`: Kokoro TTS worker, catalog entry, model store, binary downlink framing.
+3. `feat(speech)`: front-model worker (node-llama-cpp), catalog, schema output, URL override setting.
+4. `feat(voice)`: `VoiceConversationService` (delegation, run watching, summaries, barge-in and echo
+   guard, notes). Test with the Replay (dev) provider, not real turns.
+5. `feat(web)`: client controller in client-runtime (platform object), AEC capture, player worklet with
+   cursor acks, call strip, settings, palette, keybinding. Then one integrated pass in a real browser.
+6. `feat(mobile)`: later.
+
+## Open risks
+
+- `node-llama-cpp` and `onnxruntime-node` under Node SEA and Electron ASAR: each ships native binaries.
+  Prove packaging in PR 2/3 with `scripts/build-desktop-artifact.ts` before building on it.
+- Does Chromium AEC in Electron cancel WebAudio worklet playback from the same renderer? Measure in
+  PR 5. If not, the echo guard has to carry it (live-vibe's 3-word fallback).
+- Parakeet streaming latency per 0.5 s chunk on GPU vs CPU, and Kokoro first-sentence latency on CPU.
+  Target: under 1.2 s from end of speech to first audio.
+- VRAM on this box: Parakeet Q8 about 0.7 GiB plus a front model of about 3 GiB, next to `:8080` and `:8084`.
+  Default to the URL override here.
+- Upstream fit: one PR stack is large. Upstream will want the scope approved in #22091 first.
+
+## Unresolved
+
+- Default front GGUF (2B vs 4B) and its catalog pin.
+- Whether a call should open from the sidebar (new thread by voice) or only on an existing thread.
