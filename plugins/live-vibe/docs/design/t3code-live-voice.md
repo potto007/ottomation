@@ -219,8 +219,17 @@ Port live-vibe's rules. Parakeet has no semantic end-of-turn score like Kyutai's
   Default to the URL override here.
 - Upstream fit: one PR stack is large. Upstream will want the scope approved in #22091 first.
 
+## Decisions (Paul, 2026-11-07)
+
+- The voice runtime (onnxruntime-node, kokoro-js with phonemizer and eSpeak NG, node-llama-cpp and its
+  binaries) moves into a voice pack downloaded on demand, like the models. Shipped builds carry none of it,
+  which settles the eSpeak NG GPL question and the size, and lets the download pick CUDA per machine.
+  The download UI credits eSpeak NG's GPL-3.0-or-later license.
+- Outward-facing delegations (PRs, pushes, comments, messages, deploys) from a call need a spoken yes.
+  The front flags them and a keyword backstop catches the rest; no, silence, or barge-in cancels.
+- Latency: start the front decision and first render speculatively once silence begins, discard them if
+  speech resumes, never run side effects early, then retune the pause defaults from measurements.
+
 ## Unresolved
 
-- Licensing route for eSpeak NG, and whether to move the voice runtime into an on-demand pack.
-- Whether outward actions in voice-started runs need a spoken confirmation.
 - Whether a call should open from the sidebar (new thread by voice) or only on an existing thread.
