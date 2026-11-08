@@ -68,7 +68,7 @@ a later optimization.
 ### Wire protocol (`packages/contracts/src/voiceConversation.ts`)
 
 Client to server: JSON `start {threadId, options}`, `played {seq, sample}`, `mute`, `unmute`, `stop`.
-Binary frames are mic PCM.
+Binary frames are mic PCM, 250 ms per frame in calls (dictation keeps 0.5 s).
 Server to client: JSON `ready`, `caption {who: "you"|"voice", committed, tentative}`, `state`
 (`listening|thinking|speaking|delegated`), `speak {seq, text, sampleRate}`, `cut {seq}` (barge-in),
 `delegated {runId, text}`, `error`. Binary frames are `[seq u32 LE][Float32 PCM]`, at most 0.5 s each.
@@ -96,13 +96,16 @@ Port live-vibe's rules. Parakeet has no semantic end-of-turn score like Kyutai's
 - The model is a pinned GGUF in a catalog next to the speech catalog, downloaded by `SpeechModelStore`.
   The default is Qwen3-4B-Instruct-2507 Q4_K_M. On 50 voice-style prompts with CUDA it chose the right
   action 45 times (all misses were note vs delegate), with a 150 ms median decision (p90 226 ms) and about
-  4.3 GiB of VRAM. Qwen3-1.7B scored 42/50 and also answered project questions itself. Gemma 4 E2B
+  4.3 GiB of VRAM. That bench used an early prompt: the shipped prompt scores 41/50 on the same cases, and
+  40/50 after the false-claim fix (`evals/voice-front/` now holds the cases). Qwen3-1.7B scored 42/50 and also answered project questions itself. Gemma 4 E2B
   spoke on noise. Qwen3.5 (hybrid) got no KV reuse.
 - The budget needs a GPU: on CPU a decision takes 1.3-2 s. llama.cpp spins its threads, so they are capped
   at half the cores; uncapped, beside STT and TTS, one decision took 51 s.
 - Packaged builds ship CPU plus Vulkan on Linux and Windows x64, and Metal on macOS arm64. CUDA (200-416 MB,
-  needs a CUDA runtime) is pruned. NVIDIA users on native Linux and Windows run on Vulkan, whose speed on
-  a real GPU is unmeasured. On WSL, Vulkan is a deviceless software driver, so the worker falls back to
+  needs a CUDA runtime) is pruned. With the voice pack, NVIDIA machines with driver 580 or newer get CUDA.
+  On an RTX 5090 under native Windows, Vulkan matches CUDA once warm (median decision 227-236 ms vs
+  205-227 ms), but each first use of a new shape compiles pipelines: 7.9 s on the first decision and 2.4 s
+  mid-call. On WSL, Vulkan is a deviceless software driver, so the worker falls back to
   CPU. node-llama-cpp's binary probe forks with the parent's execArgv, which broke both the `-e` worker
   and the SEA until it was cleared.
 - Output is forced through a JSON schema:
@@ -204,18 +207,24 @@ Port live-vibe's rules. Parakeet has no semantic end-of-turn score like Kyutai's
   about 0.5 s optimistic.
 - Pause sweep over 15 fixtures (14 with mid-sentence pauses): at 0.5 s chunks, 1500 ms without speculation
   cut 0/13 off at a 2082 ms median; 1200 ms with speculation cut 1/13 at 1521 ms; 1000 ms cut 2/13 at
-  1381 ms. 250 ms chunks save another 30-90 ms at equal cut-off.
-- The front sometimes claims in a reply to have done outward work ("I've addressed the reviewer's comment")
-  without sending anything. It needs a prompt eval.
+  1381 ms. With 250 ms chunks (tune thread, 26 cut-off checks): 1.0/1.2/1.5 s cut 6/4/0 at a 1246/1491/1811 ms
+  median, against 4/2/0 at 500 ms chunks. Every extra cut-off is one fixture with a 1.3 s mid-sentence pause,
+  which a 1.2 s pause should cut; 500 ms chunks only escaped it by quantization. Normal stays 1.2 s, and
+  Long is the answer for people who pause mid-thought.
+- The front sometimes claimed in a reply to have done outward work without sending anything (3/41 turns
+  that send nothing: "The reply has been posted" after a draft-only readback). Addressed on
+  `feat/live-voice-claims`, see Decisions.
 
 ## Open risks
 
 - Native packaging: PR 3 proved `node-llama-cpp` under the Node SEA archive and Electron 44 (a hand-packed
   `app.asar`; a full desktop build needs `libsecret-1-dev`). PR 2 proved `onnxruntime-node` on
   Linux (SEA and Electron 44) with `asarUnpack` of `onnxruntime-node/bin` and pruning of other
-  platforms' binaries (about 190 MB to 45 MB). Windows and macOS are unverified.
+  platforms' binaries (about 190 MB to 45 MB). The voice pack has since been proven on native Windows 11
+  (CLI and NSIS desktop) and on macOS arm64 (dev web and an unsigned packaged app), see Decisions.
 - Does Chromium AEC in Electron cancel WebAudio worklet playback from the same renderer? PR 5 could not
-  measure it (fake mic only); it needs a real test on speakers. If not, the echo guard has to carry it (live-vibe's 3-word fallback).
+  measure it (fake mic only); it needs a real test on speakers. The Windows thread built an automated
+  speakers-on harness, but the box had no capture device, so it is still unmeasured. If not, the echo guard has to carry it (live-vibe's 3-word fallback).
 - Latency from end of speech to first audio, target under 1.2 s, measured 2.08 s end to end (PR 4, idle
   box, front on CUDA): endpoint 1.43-1.80 s after speech ends (the 1.5 s default pause plus 0.5 s mic
   chunks; the 800 ms finished-sentence pause rarely applies), front decision 330-530 ms, then first audio
@@ -266,14 +275,43 @@ Port live-vibe's rules. Parakeet has no semantic end-of-turn score like Kyutai's
   pause dropped from 1500 to 1200 ms. End of speech to first audio went from a 3351 ms median to 1734 ms
   on the server path, and from 3338 to 2201 ms in the browser, both under load average 7-15.
 
+- Round 3 (2026-11-07), stacked on the pack in this order:
+  - `feat/live-voice-model-dl`: the Kokoro model is a Settings row (download with progress, cancel,
+    remove, last failure) through a `TextToSpeech` service method, shared with a call's first acquire. A call
+    without it points to Settings with the live percent rather than adding pre-call states to the strip.
+  - `feat/live-voice-tune`: a client pause setting (Short 1.0 / Normal 1.2 / Long 1.5 s) sent as the existing
+    `endSilenceMs`, 250 ms mic chunks for calls, and the llama worker streams tokens so the first complete
+    sentence renders while the rest generates (rendering never speaks; a held outward request is never
+    spoken). End of speech to first audio, server path, n=16: 1709 ms median before, 1457 ms after; a
+    delegated readback 846 to 789 ms. The floor is now the pause plus up to 250 ms of chunk quantization.
+  - `feat/live-voice-claims`: `evals/voice-front/` merges the decision and outward benches (115 cases, prompt,
+    schema and worker imported from source). One prompt paragraph plus `holdOutwardRequest` (a reply or none
+    to words the outward check flags becomes a held delegation) took false claims from 3/41 to 0/34, with
+    decisions 41/50 to 40/50, outward recall 0.95 to 1.00, precision 0.87 to 0.83.
+  - `feat/live-voice-mac`: on an M4 Pro the pack is the Metal variant (164.6 MB, 12.7 s from a fresh home in
+    the packaged app, which is 472 MB with no runtime inside). Warm calls reach first audio in 1.69-1.85 s;
+    the cold first call takes 2.4-2.7 s. Fix: no CPU pack is offered on Apple Silicon, where it is the same
+    Metal pack.
+  - `feat/live-voice-win`: on native Windows 11 (RTX 5090) pack downloads are cuda 322.7 MB, cuda driver-only
+    752.8 MB (cuBLAS loaded from the pack), vulkan 194.9 MB, cpu 170.6 MB. Warm first audio is 1.6-1.7 s on
+    cuda, vulkan and the desktop app, 3.3-3.5 s on cpu; cold first calls take 5.4-13.3 s. Fixes: the front
+    worker lost the Windows `Path` (case-variant env keys), and Kokoro failed every Windows call on a
+    drive-less file URL.
+
 ## Unresolved
 
-- The Kokoro model (326 MB) still downloads silently on the first call rather than from a settings row.
-- Windows and macOS pack paths are covered by tests only, not run on real hardware. Vulkan speed on a real
-  GPU is unmeasured.
+- Echo cancellation on real speakers: needs a non-headset mic on Windows and Paul for one call (harness ready).
+- Cold first call is 5.4-13.3 s on every platform, and Vulkan compiles pipelines on first use. A warmup
+  decision and render at pack load or call start would hide most of it.
+- The URL-override front (`openai.ts`) does not stream yet, so the setup recommended for this box gets no
+  early first-sentence render.
+- "ok merge it" after a readback still comes back as none on some phrasings (2/19 delegate controls): a
+  drop, not a false claim.
+- Upstream fit: the desktop payload validator caps at 80 files and a Windows build has 83; Windows builds
+  need Rust 1.95 for edition 2024 and the MSVC Spectre libs for the resource monitor.
+- Polish found by round 3 (`feat/live-voice-polish`, in progress): caption spacing, Settings deep links
+  that miss their row, no toast for transcription Off, old pack markers with a stack trace, a temp path in
+  the model download error, and the palette's Cancel during confirm.
 
-- Follow-ups after the voice pack: a client pause setting (Short 1.0 / Normal 1.2 / Long 1.5 s), 250 ms mic
-  chunks, and starting the first render on the decision's first sentence (saves about 100-300 ms under
-  load). The floor is then the pause plus chunk quantization.
 
 - Whether a call should open from the sidebar (new thread by voice) or only on an existing thread.
