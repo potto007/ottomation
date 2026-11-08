@@ -241,6 +241,16 @@ Port live-vibe's rules. Parakeet has no semantic end-of-turn score like Kyutai's
   binaries) moves into a voice pack downloaded on demand, like the models. Shipped builds carry none of it,
   which settles the eSpeak NG GPL question and the size, and lets the download pick CUDA per machine.
   The download UI credits eSpeak NG's GPL-3.0-or-later license.
+  Built (`feat/live-voice-pack`): the pack is exact npm tarballs plus, on driver-only NVIDIA machines,
+  NVIDIA's CUDA 13 runtime wheels from PyPI, all pinned by hash in a committed manifest and extracted
+  in npm's layout so Node resolution works unchanged. A `forbiddenPackages` license-check list fails any
+  build that ships the runtime. Linux x64 sizes went from AppImage 320 to 210 MB, deb 277 to 171 MB, and
+  CLI archive 342 to 149 MB. Pack downloads: cpu 171 MB, vulkan 195 MB, cuda 328 MB, cuda plus wheels
+  775 MB. node-llama-cpp's `cuda-ext` is a CUDA 12 build that bundles no runtime, and its CUDA 13 build
+  needs driver 580 or newer. Lifecycle scripts never run, and none is needed. Proven from a fresh home in
+  the SEA CLI and the AppImage: download in about 10 s, first audio 1.6-1.7 s after speech, native
+  libraries mapped from the pack. Kokoro CUDA stays out (ORT gpu is 225-308 MB and needs CUDA 12 plus
+  cuDNN 9).
 - Outward-facing delegations (PRs, pushes, comments, messages, deploys) from a call need a spoken yes.
   The front flags them and a keyword backstop catches the rest; no, silence, or barge-in cancels.
   Built (`feat/live-voice-confirm`): either signal holds the delegation, or a note that steers a running
@@ -257,6 +267,10 @@ Port live-vibe's rules. Parakeet has no semantic end-of-turn score like Kyutai's
   on the server path, and from 3338 to 2201 ms in the browser, both under load average 7-15.
 
 ## Unresolved
+
+- The Kokoro model (326 MB) still downloads silently on the first call rather than from a settings row.
+- Windows and macOS pack paths are covered by tests only, not run on real hardware. Vulkan speed on a real
+  GPU is unmeasured.
 
 - Follow-ups after the voice pack: a client pause setting (Short 1.0 / Normal 1.2 / Long 1.5 s), 250 ms mic
   chunks, and starting the first render on the decision's first sentence (saves about 100-300 ms under
