@@ -12,12 +12,16 @@ It needs a model, so it is not part of `--unit` or `--selftest`. Results are wri
 
 ## Rules for the GPU and the logs
 
-- Check the GPU on its own first, and launch only with 8 GiB or more free:
-  `nvidia-smi --query-gpu=memory.used,memory.free --format=csv`. Never chain the check and the launch.
+- GPU: if `gpu-policy` is installed, run `gpu-policy check --need 8192` (or launch with
+  `gpu-policy run --need 8192 -- ./launch_front.sh`) and obey it: GO (exit 0) use the GPU without asking; OFF, BUSY or
+  NO-GPU (exit 1-3) take the CPU path (`CUDA_VISIBLE_DEVICES=` empty), or tell the user if the job has no CPU path.
+  If `gpu-policy` is not installed (command not found), this machine has no shared-GPU policy: launch only with 8 GiB
+  or more free, checked on its own first (`nvidia-smi --query-gpu=memory.used,memory.free --format=csv`), never
+  chained with the launch; with no answer from `nvidia-smi`, take the CPU path. Never ask for GPU permission per task.
 - `launch_front.sh` starts the managed llama.cpp build (b11146) on `127.0.0.1:8092` with `--jinja -c 16384 -np 1
   -ngl 99`, and appends its stdout and stderr to the canonical `/tmp/llama-server.log` (the file promtail reads).
   Run it as a background process. It writes the server's exact PID to `$LIVE_VIBE_EVAL_OUT/launch_front.pid`.
-- Stop it with `kill <that pid>` and confirm with `ps -p <pid>`; never `pkill -f`. Then check `nvidia-smi` again.
+- Stop it with `kill <that pid>` and confirm with `ps -p <pid>`; never `pkill -f` (it matches your own shells).
 - A server someone else runs (a URL) is only read: nothing is started, stopped or restarted.
 - The eval takes a few minutes: run it with a `DONE` / `FAILED` last line, through the work band.
 
@@ -26,7 +30,8 @@ It needs a model, so it is not part of `--unit` or `--selftest`. Results are wri
 From `plugins/live-vibe/bin/sidecar/eval/`:
 
 ```sh
-nvidia-smi --query-gpu=memory.used,memory.free --format=csv          # on its own; 8 GiB or more free
+gpu-policy check --need 8192                                          # if installed: exit 0 = GO
+nvidia-smi --query-gpu=memory.used,memory.free --format=csv          # else, on its own; 8 GiB or more free
 
 ./launch_front.sh ~/.cache/duplex_voice/models/unsloth__Qwen3-4B-Instruct-2507-GGUF/Qwen3-4B-Instruct-2507-Q4_K_M.gguf
 # a second argument is a GGUF LoRA adapter (`--lora`), for the timing LoRA (training/README.md)
