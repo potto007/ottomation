@@ -374,6 +374,23 @@ def gpu_budget(check: Checker) -> None:
     check(full is not None and "only 2.5 GiB" in full and roomy is None and shared is not None
           and "claimed by the other" in shared and unknown is not None and not gpu.claimed(),
           f"gpu budget: room after the need and the others' claims, else why {[full, shared, unknown]}")
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        policy = Path(d) / "gpu-policy"
+        verdicts: list[str | None] = []
+        for text in ("GPU_ALLOWED=no\n", "# c\nGPU_ALLOWED=yes\nGPU_NOTE=\n", 'GPU_ALLOWED="On"\n', "GPU_ALLOWED=off\n",
+                     "GPU_NOTE=x\n", "GPU_ALLOWED=\n"):
+            policy.write_text(text, encoding="utf-8")
+            with patched((gpu, "POLICY_FILE", str(policy)), (gpu, "read_free_gib", lambda: 20.0)):
+                verdicts.append(gpu.admit("tts", gpu.NEED_GIB["kokoro"]))
+                gpu.release("tts")
+        with patched((gpu, "POLICY_FILE", str(Path(d) / "missing")), (gpu, "read_free_gib", lambda: 20.0)):
+            verdicts.append(gpu.admit("tts", gpu.NEED_GIB["kokoro"]))
+            gpu.release("tts")
+    off = [v is not None and "turned off" in v for v in verdicts]
+    check(off == [True, False, False, True, False, True, False] and verdicts[-1] is None and not gpu.claimed(),
+          f"gpu policy: GPU_ALLOWED other than yes/y/on/true/1 means CPU; absent line or file changes nothing {verdicts}")
     gpu.hold("stt", 3.2)
     with patched((gpu, "read_free_gib", lambda: 20.0)):
         took = gpu.admit("tts", 1.4) is None and gpu.claimed(exclude="stt") == 1.4
@@ -812,6 +829,7 @@ def barge_units(check: Checker) -> None:
 
 def units() -> int:
     check = Checker()
+    gpu.POLICY_FILE = "/nonexistent/gpu-policy"  # the machine's own switch must not decide these checks
 
     line = protocol.encode({"type": "log", "text": 'two\nlines "quoted" é'})
     check(line.endswith("\n") and line.count("\n") == 1 and json.loads(line)["text"] == 'two\nlines "quoted" é',

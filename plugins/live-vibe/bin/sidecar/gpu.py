@@ -40,6 +40,26 @@ def nvidia_smi_free_gib() -> float | None:
         return None
 
 
+POLICY_FILE = "~/.config/local-ai/gpu-policy"  # machine-wide switch some machines keep: GPU_ALLOWED=no means CPU only
+
+
+def policy_off() -> str | None:
+    """Why the GPU is off limits, when POLICY_FILE exists and sets GPU_ALLOWED to anything but yes/y/on/true/1;
+    None when it allows the GPU, has no such line, or is missing or unreadable (no change in behaviour)."""
+    try:
+        with open(os.path.expanduser(POLICY_FILE), encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except (OSError, UnicodeError):
+        return None
+    for line in reversed(lines):
+        key, sep, value = line.partition("=")
+        if sep and key.strip() == "GPU_ALLOWED":
+            if value.strip().strip("\"'").lower() in ("yes", "y", "on", "true", "1"):
+                return None
+            return f"GPU use is turned off in {POLICY_FILE} (GPU_ALLOWED)"
+    return None
+
+
 read_free_gib: Callable[[], float | None] = nvidia_smi_free_gib  # replaced in the unit checks
 
 
@@ -62,6 +82,9 @@ def claimed(exclude: str = "") -> float:
 def admit(name: str, need_gib: float, floor_gib: float = FLOOR_GIB, free_gib: float | None = None) -> str | None:
     """None, and `name` holds `need_gib`, when the GPU keeps `floor_gib` free after it and after the others' claims;
     else why not. `free_gib` is the caller's own reading (torch's); otherwise nvidia-smi is asked."""
+    off = policy_off()
+    if off:
+        return off
     free = read_free_gib() if free_gib is None else free_gib
     if free is None:
         return "free GPU memory is unknown (no nvidia-smi)"
